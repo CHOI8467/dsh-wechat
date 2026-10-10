@@ -473,6 +473,35 @@ function isPendingNotification(raw: unknown): raw is PendingNotification {
 }
 
 /**
+ * One validator per setting, keyed the way the state file stores it.
+ *
+ * A mapped type over every setting rather than a hand-copied list, because the hand-copied list is
+ * what broke: it kept four numbers and three booleans, so `permissionPreset`,
+ * `allowCrossSessionNotify` and `workspacePath` were all discarded on load. A saved setting
+ * survived until the next write, then vanished — every write reloads and re-normalizes — which is
+ * why the page appeared to forget everything across a restart. Adding a setting without a validator
+ * here is now a compile error, so the same omission cannot happen again.
+ *
+ * @param raw - The stored value for one setting.
+ * @returns The usable value, or undefined when it is the wrong shape.
+ */
+const SETTING_VALIDATORS: {
+  [K in keyof Required<ChannelSettings>]: (raw: unknown) => ChannelSettings[K] | undefined
+} = {
+  mergeWindowMs: (raw) => (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 ? raw : undefined),
+  maxReplyChars: (raw) => (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 ? raw : undefined),
+  settleMs: (raw) => (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 ? raw : undefined),
+  quoteHistory: (raw) => (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 ? raw : undefined),
+  autoReplyAttachments: (raw) => (typeof raw === 'boolean' ? raw : undefined),
+  requireConfirmation: (raw) => (typeof raw === 'boolean' ? raw : undefined),
+  presenceNote: (raw) => (typeof raw === 'string' ? raw : undefined),
+  permissionPreset: (raw) =>
+    raw === 'danger-full-access' || raw === 'auto' || raw === 'default' ? raw : undefined,
+  allowCrossSessionNotify: (raw) => (typeof raw === 'boolean' ? raw : undefined),
+  workspacePath: (raw) => (typeof raw === 'string' ? raw : undefined),
+}
+
+/**
  * Keep only settings of the expected type.
  *
  * The file is user-editable and survives upgrades, so a hand-written string where a number
@@ -482,19 +511,13 @@ function isPendingNotification(raw: unknown): raw is PendingNotification {
  * @returns The usable subset.
  */
 function normalizeSettings(raw: Record<string, unknown>): ChannelSettings {
-  const settings: ChannelSettings = {}
-  for (const key of ['mergeWindowMs', 'maxReplyChars', 'settleMs', 'quoteHistory'] as const) {
-    const value = raw[key]
-    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) settings[key] = value
+  const settings: Record<string, unknown> = {}
+  for (const key of Object.keys(SETTING_VALIDATORS)) {
+    const validate = SETTING_VALIDATORS[key as keyof typeof SETTING_VALIDATORS]
+    const value = validate(raw[key])
+    if (value !== undefined) settings[key] = value
   }
-  if (typeof raw.autoReplyAttachments === 'boolean') {
-    settings.autoReplyAttachments = raw.autoReplyAttachments
-  }
-  if (typeof raw.requireConfirmation === 'boolean') {
-    settings.requireConfirmation = raw.requireConfirmation
-  }
-  if (typeof raw.presenceNote === 'string') settings.presenceNote = raw.presenceNote
-  return settings
+  return settings as ChannelSettings
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

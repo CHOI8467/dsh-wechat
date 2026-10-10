@@ -14,7 +14,7 @@ import { test } from 'node:test'
 
 import { parseWireJson, extractRawIds, baseInfo, buildHeaders, assertSendAccepted, SendRefusedError } from '../src/http.ts'
 import { conversationKey, extractText, toInbound, sendText } from '../src/channel.ts'
-import { StateStore, expirePendingNotifications, queuePendingNotification } from '../src/state.ts'
+import { DEFAULT_SETTINGS, StateStore, expirePendingNotifications, queuePendingNotification, type ChannelSettings } from '../src/state.ts'
 import {
   SessionRouter,
   mintSessionId,
@@ -517,6 +517,50 @@ test('a store seeds from an existing file without losing its contents', async ()
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+test('every setting survives a save and a reload', async () => {
+  /*
+   * The reload is the step that used to eat them. `StateStore.update` re-reads and re-normalizes
+   * before persisting, and the normalizer kept a hand-copied list of seven settings — so anything
+   * added after it was written (`permissionPreset`, `allowCrossSessionNotify`, `workspacePath`) was
+   * dropped on the very next write and gone by the next restart.
+   *
+   * The count check below is the part that keeps this honest: a setting added to the defaults
+   * without a line here would leave the test passing while covering less than it claims.
+   */
+  const wanted: ChannelSettings = {
+    mergeWindowMs: 4_321,
+    maxReplyChars: 1_234,
+    settleMs: 987,
+    quoteHistory: 7,
+    autoReplyAttachments: false,
+    requireConfirmation: false,
+    permissionPreset: 'auto',
+    allowCrossSessionNotify: false,
+    workspacePath: 'C:\\chosen-workspace',
+    presenceNote: 'round-trip note',
+  }
+  assert.equal(
+    Object.keys(wanted).length,
+    Object.keys(DEFAULT_SETTINGS).length,
+    'this test names every setting in DEFAULT_SETTINGS',
+  )
+
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-state-'))
+  try {
+    const file = join(home, 'state.json')
+    const store = new StateStore(file)
+    await store.update((state) => {
+      state.settings = wanted
+    })
+    // Forces the read-normalize-write cycle that dropped them.
+    await store.update(() => {})
+    const stored = (await new StateStore(file).read()).settings ?? {}
+    assert.deepEqual(stored, wanted)
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
 
 test('splitCommand tolerates a missing separator, as typed on a phone', () => {
   assert.deepEqual(splitCommand('/list'), { command: '/list', args: '' })
