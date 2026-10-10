@@ -1870,6 +1870,68 @@ test('the workspace override is honoured and stays constant', async () => {
   }
 })
 
+test('a workspace chosen in Settings is used, and beats the loader-patch override', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
+  const chosen = join(home, 'picked-ws')
+  const fromConfig = join(home, 'from-config')
+  /*
+   * Seeded by hand rather than through `seedAccount`: that helper writes the whole state file, which
+   * would land on top of the setting before the plugin ever reads it.
+   */
+  await mkdir(join(home, 'wechat'), { recursive: true })
+  await writeFile(
+    join(home, 'wechat', 'state.json'),
+    JSON.stringify({
+      version: 1,
+      accounts: {},
+      syncBufs: {},
+      contextTokens: {},
+      bindings: {},
+      settings: { workspacePath: chosen },
+    }),
+    'utf8',
+  )
+  const harness = await mount({ home, seedAccount: false, config: { workspace: fromConfig } })
+  try {
+    assert.ok(existsSync(chosen), 'the chosen directory is created at startup')
+    assert.ok(!existsSync(fromConfig), 'the patch override is not created when a choice exists')
+    const status = await harness.runtime.status()
+    // Reported as the resolved directory, not the default: this used to be computed from the home
+    // rather than read back, so a moved workspace was displayed at its old path.
+    assert.equal(status.diagnostics?.workspace, chosen, 'diagnostics report the chosen directory')
+  } finally {
+    harness.dispose()
+    await removeHome(home)
+  }
+})
+
+test('an empty workspace setting falls back to the default under the DSH home', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
+  await mkdir(join(home, 'wechat'), { recursive: true })
+  await writeFile(
+    join(home, 'wechat', 'state.json'),
+    JSON.stringify({
+      version: 1,
+      accounts: {},
+      syncBufs: {},
+      contextTokens: {},
+      bindings: {},
+      settings: { workspacePath: '' },
+    }),
+    'utf8',
+  )
+  const harness = await mount({ home, seedAccount: false })
+  try {
+    const status = await harness.runtime.status()
+    const fallback = join(home, 'dsh_wechat')
+    assert.equal(status.diagnostics?.workspace, fallback, 'empty means the default')
+    assert.ok(existsSync(fallback), 'the default directory is created')
+  } finally {
+    harness.dispose()
+    await removeHome(home)
+  }
+})
+
 test('a quote of a message this channel sent reaches the agent as its content', async () => {
   await withHarness(async (harness) => {
     // Bind the session and make the channel send one reply, whose id is then recorded.
@@ -2811,122 +2873,6 @@ function captureSentItems(): { items: Record<string, unknown>[][]; restore: () =
   }
 }
 
-test('a tool call in the stream produces a tool card', async () => {
-  await withHarness(async (harness) => {
-    await harness.runtime.ingest(inbound('读一下文件'))
-    const sessionId = harness.prompted[0].sessionId
-    const listener = harness.listeners.get('agent/assistant-stream')
-    assert.ok(listener)
-
-    const capture = captureSentItems()
-    try {
-      // The tool announces itself through the model chunk, which is the only tool signal that
-      // reliably reaches a host-scope plugin.
-      listener({
-        agent: { session: { id: sessionId } },
-        frame: {
-          type: 'chunk',
-          revision: 3,
-          chunk: { type: 'tool-call-delta', index: 0, id: 'call-9', name: 'read', argumentsDelta: '{' },
-        },
-      })
-      await new Promise((resolve) => setTimeout(resolve, 50))
-    } finally {
-      capture.restore()
-    }
-
-    assert.equal(capture.items.length, 1, 'one card request')
-    const item = capture.items[0][0]
-    assert.equal(item.type, 11, 'TOOL_CALL_START')
-    assert.deepEqual(item.tool_call_start_item, { tool_name: 'read', tool_call_id: 'call-9' })
-  })
-})
-
-test('a repeated tool-call delta for one call sends the card only once', async () => {
-  await withHarness(async (harness) => {
-    await harness.runtime.ingest(inbound('读一下'))
-    const sessionId = harness.prompted[0].sessionId
-    const listener = harness.listeners.get('agent/assistant-stream')
-    assert.ok(listener)
-
-    const capture = captureSentItems()
-    try {
-      // Only the first delta carries the name; a second frame for the same call — or a repeat
-      // of the first — must not produce a duplicate card in the chat.
-      for (let i = 0; i < 3; i += 1) {
-        listener({
-          agent: { session: { id: sessionId } },
-          frame: {
-            type: 'chunk',
-            revision: 4 + i,
-            chunk: { type: 'tool-call-delta', index: 0, id: 'call-9', name: 'read', argumentsDelta: 'x' },
-          },
-        })
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50))
-    } finally {
-      capture.restore()
-    }
-
-    assert.equal(capture.items.length, 1, 'one card, not one per fragment')
-  })
-})
-
-test('an argument-only tool-call delta is not mistaken for a new call', async () => {
-  await withHarness(async (harness) => {
-    await harness.runtime.ingest(inbound('读一下'))
-    const sessionId = harness.prompted[0].sessionId
-    const listener = harness.listeners.get('agent/assistant-stream')
-    assert.ok(listener)
-
-    const capture = captureSentItems()
-    try {
-      // Later deltas of the same call arrive with no name; treating one as a call would put a
-      // nameless card in the chat.
-      listener({
-        agent: { session: { id: sessionId } },
-        frame: { type: 'chunk', revision: 5, chunk: { type: 'tool-call-delta', index: 0, id: 'call-9', argumentsDelta: '}' } },
-      })
-      await new Promise((resolve) => setTimeout(resolve, 50))
-    } finally {
-      capture.restore()
-    }
-
-    assert.equal(capture.items.length, 0, 'no card without a name')
-  })
-})
-
-test('an unusable tool-call frame is logged with its field names', async () => {
-  await withHarness(async (harness) => {
-    await harness.runtime.ingest(inbound('读一下'))
-    const sessionId = harness.prompted[0].sessionId
-    const listener = harness.listeners.get('agent/assistant-stream')
-    assert.ok(listener)
-
-    // Whether a tool-call frame carries `name` is an assumption about a host-owned shape. If it
-    // does not, every card silently disappears and no test notices — so the field set is
-    // recorded, and this pins that it is.
-    for (const revision of [5, 6]) {
-      listener({
-        agent: { session: { id: sessionId } },
-        frame: {
-          type: 'chunk',
-          revision,
-          chunk: { type: 'tool-call-delta', index: 0, call_id: 'call-9', tool_name: 'read' },
-        },
-      })
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50))
-
-    const log = await readFile(join(harness.bundleHome, 'wechat', 'boot.log'), 'utf8')
-    assert.match(log, /tool-call frame fields \(no call made\): type,index,call_id,tool_name/)
-    assert.equal(
-      log.split('no call made').length - 1,
-      1,
-      'the same shape is reported once, not once per fragment',
-    )
-  })
-})
 
 test('every distinct stream chunk kind is written to the log once', async () => {
   await withHarness(async (harness) => {
@@ -2967,35 +2913,3 @@ test('every distinct stream chunk kind is written to the log once', async () => 
   })
 })
 
-test('turn end closes a tool card the harness never reported on', async () => {
-  await withHarness(async (harness) => {
-    await harness.runtime.ingest(inbound('读一下'))
-    const sessionId = harness.prompted[0].sessionId
-    const listener = harness.listeners.get('agent/assistant-stream')
-    assert.ok(listener)
-
-    const capture = captureSentItems()
-    try {
-      listener({
-        agent: { session: { id: sessionId } },
-        frame: { type: 'chunk', revision: 3, chunk: { type: 'tool-call-delta', index: 0, id: 'call-9', name: 'read' } },
-      })
-      // The turn ends without a tools/result ever arriving.
-      listener({
-        agent: { session: { id: sessionId } },
-        frame: { type: 'chunk', revision: 4, chunk: { type: 'text-delta', index: 0, text: '好了' } },
-      })
-      listener({ agent: { session: { id: sessionId } }, frame: { type: 'end', revision: 5 } })
-
-      // The grace window lets a real result overtake this closure.
-      await new Promise((resolve) => setTimeout(resolve, 1_800))
-    } finally {
-      capture.restore()
-    }
-
-    const types = capture.items.map((list) => list[0].type)
-    assert.deepEqual(types, [11, 12], 'the card is opened and then closed')
-    const end = capture.items[1][0] as { tool_call_result_item?: { tool_call_id?: string } }
-    assert.equal(end.tool_call_result_item?.tool_call_id, 'call-9', 'closed with the matching id')
-  })
-})

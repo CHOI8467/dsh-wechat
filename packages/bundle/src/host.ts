@@ -30,7 +30,6 @@ import {
   sendFile,
   sendImage,
   sendText,
-  sendToolCard,
   sendVideo,
   renderSessionRow,
   toDataUrl,
@@ -99,15 +98,6 @@ export const inject = ['sessionController', 'sessions', 'workspaceRegistry', 'to
 
 /** How long the assistant may stay quiet before its reply is sent to WeChat. */
 const REPLY_SETTLE_MS = 1_200
-
-/**
- * How long a finished turn waits for the harness's tool results before closing its cards.
- *
- * `tools/result` is dispatched against the calling agent's scope, so it may not reach this
- * host-scope plugin at all. Waiting briefly costs nothing and lets a real status — including
- * a failure — be reported instead of an assumed success.
- */
-const TOOL_CARD_GRACE_MS = 1_500
 
 /** Upper bound on one outbound WeChat message. The service rejects very long bodies. */
 const MAX_REPLY_CHARS = 4_000
@@ -515,15 +505,6 @@ class WechatRuntime {
    * answer on their behalf: the prompt goes out over WeChat and the next reply settles it.
    */
   readonly #interactions = new Map<string, PendingInteraction>()
-  /**
-   * Tool calls already announced, keyed `sessionId\u0000callId`.
-   *
-   * A tool-call-delta arrives once per argument fragment, so without this the card would be
-   * re-sent for every fragment of the same call.
-   */
-  readonly #announcedTools = new Set<string>()
-  /** Running tool calls, keyed the same way, so the result card can name the tool. */
-  readonly #runningTools = new Map<string, { sessionId: string; toolName: string }>()
   /** Observations already written to the log, bucketed so each distinct value logs once. */
   readonly #seenShapes = new Map<string, Set<string>>()
   /**
@@ -597,7 +578,10 @@ class WechatRuntime {
       diagnostics: {
         logPath: join(this.#home, 'wechat', BOOT_LOG_NAME),
         statePath: this.#store.file,
-        workspace: join(this.#home, WORKSPACE_DIR_NAME),
+        // The resolved workspace, not the default: reporting `join(home, WORKSPACE_DIR_NAME)` here
+        // showed the default even when the config pointed somewhere else, so a user who moved the
+        // workspace was told the old path was in use.
+        workspace: this.#workspace,
         logTail: this.#bootLogTail(),
       },
     }
@@ -2782,17 +2766,6 @@ class WechatRuntime {
   }
 
   /**
-   * Record the field set of a tool-call frame that could not be used.
-   *
-   * Written once per distinct shape. This is the only way to tell "the harness names tool calls
-   * somewhere other than `name`" apart from "cards are broken", which look identical from the
-   * phone and from a passing test suite.
-   */
-  #recordToolShape(shape: string): void {
-    this.#recordOnce('#toolCallShapes', `tool-call frame fields (no call made): ${shape}`)
-  }
-
-  /**
    * Write a line to the boot log the first time a given value is seen.
    *
    * Keeps an observational log bounded: a chunk kind or frame shape repeats thousands of times
@@ -2810,102 +2783,6 @@ class WechatRuntime {
   }
 
   /**
-   * Show that a tool call started, using the chat client's own tool card.
-   *
-   * Failure is recorded and swallowed: a card is decoration beside the reply, and losing one
-   * must never cost the answer that follows it.
-   */
-  async #announceTool(sessionId: string, callId: string, toolName: string): Promise<void> {
-    const key = `${sessionId}\u0000${callId}`
-    if (this.#announcedTools.has(key)) return
-    this.#announcedTools.add(key)
-    this.#runningTools.set(key, { sessionId, toolName })
-
-    try {
-      const target = await this.#conversationForSession(sessionId)
-      if (target === undefined) return
-      await sendToolCard({
-        account: target.account,
-        to: target.peerId,
-        phase: 'start',
-        toolName,
-        toolCallId: callId,
-        runId: sessionId,
-        ...(target.contextToken === undefined ? {} : { contextToken: target.contextToken }),
-      })
-      // Recorded on success as well as failure: without this, a card the service accepted and
-      // a card that was never sent leave identical evidence.
-      this.#recordBoot(`tool card: start ${toolName} (${callId})`)
-    } catch (error) {
-      this.#recordError(`工具卡片发送失败: ${error instanceof Error ? error.message : String(error)}`)
-    }
-  }
-
-  /**
-   * Build the `tools/result` listener that closes each tool card.
-   *
-   * Every running call is closed when a turn ends rather than only the ones the harness
-   * reports: the result event is dispatched against the calling agent's scope, which this
-   * host-scope plugin may not be inside, and a card left open would sit in the transcript
-   * forever. The harness's own status is used when it arrives, so a failed call is not
-   * reported as a success.
-   *
-   * @returns The listener to hand to `ctx.on('tools/result', ...)`.
-   */
-  toolResultListener(): (exec: unknown, result: unknown) => void {
-    return (exec, result) => {
-      const record = (exec ?? {}) as { name?: unknown; callId?: unknown; agent?: unknown }
-      const toolName = typeof record.name === 'string' ? record.name : undefined
-      const callId = typeof record.callId === 'string' ? record.callId : undefined
-      const sessionId = sessionIdOf(record.agent)
-      if (toolName === undefined || callId === undefined || sessionId === undefined) return
-      const key = `${sessionId}\u0000${callId}`
-      if (!this.#runningTools.has(key)) return
-      void this.#closeToolCard(key, result instanceof Error)
-    }
-  }
-
-  /** Send the result card for one running tool call and forget it. */
-  async #closeToolCard(key: string, failed: boolean): Promise<void> {
-    const running = this.#runningTools.get(key)
-    if (running === undefined) return
-    this.#runningTools.delete(key)
-    const callId = key.slice(key.indexOf('\u0000') + 1)
-
-    try {
-      const target = await this.#conversationForSession(running.sessionId)
-      if (target === undefined) return
-      await sendToolCard({
-        account: target.account,
-        to: target.peerId,
-        phase: 'end',
-        toolName: running.toolName,
-        toolCallId: callId,
-        failed,
-        runId: running.sessionId,
-        ...(target.contextToken === undefined ? {} : { contextToken: target.contextToken }),
-      })
-      this.#recordBoot(`tool card: end ${running.toolName} (${callId}) failed=${String(failed)}`)
-    } catch (error) {
-      this.#recordError(`工具卡片发送失败: ${error instanceof Error ? error.message : String(error)}`)
-    }
-  }
-
-  /**
-   * Close every tool card still open for a session.
-   *
-   * Called when a turn ends, so a card cannot outlive the work it describes regardless of
-   * whether the harness's result event reached this plugin.
-   *
-   * @param sessionId - Session whose turn just finished.
-   */
-  async closeOpenToolCards(sessionId: string): Promise<void> {
-    const prefix = `${sessionId}\u0000`
-    const open = [...this.#runningTools.keys()].filter((key) => key.startsWith(prefix))
-    for (const key of open) await this.#closeToolCard(key, false)
-  }
-
-  /**
    * Feed one assistant stream frame into the reply buffer.
    *
    * DSH emits deltas as the model generates. Batching them behind a short quiet
@@ -2914,8 +2791,7 @@ class WechatRuntime {
    * flushes immediately rather than waiting out the window.
    */
   onAssistantFrame(payload: AssistantStreamPayload): void {
-    const { sessionId, text, completed, toolCall, toolCallShape, chunkType, frameShape, blockShape } =
-      readStreamFrame(payload)
+    const { sessionId, text, completed, chunkType, frameShape } = readStreamFrame(payload)
     if (sessionId === undefined) return
 
     // Learn the stream's vocabulary. Each distinct value is logged once, so a long turn cannot
@@ -2923,16 +2799,6 @@ class WechatRuntime {
     // of from a second guess about field names.
     if (chunkType !== undefined) this.#recordOnce('#chunkTypes', `stream chunk kind: ${chunkType}`)
     if (frameShape !== undefined) this.#recordOnce('#frameShapes', `stream frame shape: ${frameShape}`)
-    if (blockShape !== undefined) this.#recordOnce('#blockShapes', `stream block fields: ${blockShape}`)
-
-    if (toolCallShape !== undefined) {
-      this.#recordToolShape(toolCallShape)
-      return
-    }
-    if (toolCall !== undefined) {
-      void this.#announceTool(sessionId, toolCall.id, toolCall.name)
-      return
-    }
     if ((text === undefined || text === '') && completed !== true) return
 
     void (async () => {
@@ -2953,13 +2819,6 @@ class WechatRuntime {
         // The turn ended: send now, so the reply is not held behind the settle window.
         this.#replies.set(sessionId, entry)
         await this.#flushReply(sessionId)
-        // Close any tool card the harness has not reported on. A short delay first, so a
-        // `tools/result` still in flight can carry the real status — closing immediately
-        // would report a failed call as completed.
-        const closeTimer = setTimeout(() => {
-          void this.closeOpenToolCards(sessionId)
-        }, TOOL_CARD_GRACE_MS)
-        closeTimer.unref?.()
         return
       }
 
@@ -3295,14 +3154,37 @@ function resolveHome(ctx: WechatContext): string {
  * Both live under the same directory so a user can find, back up, or delete the
  * channel's footprint in one place.
  */
+/**
+ * The workspace directory chosen in the settings page, if one has been.
+ *
+ * @param stateFile - Channel state file to read.
+ * @returns The chosen directory, or undefined when unset or unreadable.
+ */
+function storedWorkspacePath(stateFile: string): string | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(stateFile, 'utf-8')) as {
+      settings?: { workspacePath?: unknown }
+    }
+    const chosen = parsed.settings?.workspacePath
+    return typeof chosen === 'string' && chosen.trim() !== '' ? chosen.trim() : undefined
+  } catch {
+    return undefined
+  }
+}
+
 function resolvePaths(
   ctx: WechatContext,
   config: WechatConfig,
 ): { stateFile: string; workspace: string } {
   const home = resolveHome(ctx)
   const stateFile = config.stateFile ?? join(home, 'wechat', 'state.json')
-  // Deliberately constant: see WORKSPACE_DIR_NAME.
-  const workspace = config.workspace ?? join(home, WORKSPACE_DIR_NAME)
+  /*
+   * The directory chosen in Settings wins over the loader patch: it is the one the user can
+   * see and change, and the patch stays beneath it as the operator-level override. Read
+   * straight off disk, because `apply` is synchronous and the store is not open yet.
+   */
+  const chosen = storedWorkspacePath(stateFile)
+  const workspace = chosen ?? config.workspace ?? join(home, WORKSPACE_DIR_NAME)
 
   /*
    * The session workspace has to exist before a session can be created in it.
@@ -3375,13 +3257,6 @@ export function apply(
       // Registered inside the effect so disposal unregisters the tool rather than
       // leaving a handler that points at a torn-down runtime.
       const detachTool = runtime.registerTools()
-      // Optional: `tools/result` is dispatched against the calling agent's scope, so this
-      // host-scope listener may never fire. It is a status improvement, not the mechanism —
-      // the start cards come from the assistant stream, and turn end closes anything left
-      // open — so its absence changes accuracy, never whether a card appears.
-      const detachToolResults = ctx.on('tools/result', runtime.toolResultListener(), {
-        global: true,
-      })
       // Both are scoped waterfalls: returning an outcome claims the request, calling `next()`
       // delegates. Unbound conversations delegate, so desktop behaviour is untouched.
       //
@@ -3416,7 +3291,6 @@ export function apply(
       return () => {
         try {
           if (typeof detachStream === 'function') detachStream()
-          if (typeof detachToolResults === 'function') detachToolResults()
           if (typeof detachApproval === 'function') detachApproval()
           if (typeof detachQuestions === 'function') detachQuestions()
           detachRoutes()
@@ -3616,6 +3490,13 @@ function readSettingsPatch(body: Record<string, unknown>): ChannelSettings {
   }
   if (typeof body.allowCrossSessionNotify === 'boolean') {
     patch.allowCrossSessionNotify = body.allowCrossSessionNotify
+  }
+  /*
+   * An empty string is the reset rather than a rejected value: it is how the page clears a
+   * chosen directory and goes back to the default under the DSH home.
+   */
+  if (typeof body.workspacePath === 'string') {
+    patch.workspacePath = body.workspacePath.trim()
   }
   return patch
 }

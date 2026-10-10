@@ -386,65 +386,6 @@ export async function sendItem(params: {
   }
 }
 
-/**
- * Send one tool-call item as the WeChat client's own tool card.
- *
- * The start and result cards are the same request with different payloads: the client keys
- * them together by `tool_call_id`, so a result with no matching start is a card the user
- * never sees. `status` is normalised to the four values the reference client sends.
- *
- * @param params.phase - `start` announces the call; `end` reports its outcome.
- * @param params.toolName - Tool being run, shown on the card.
- * @param params.toolCallId - Identity pairing the start and result cards.
- * @param params.failed - Set when the call did not succeed.
- */
-export async function sendToolCard(params: {
-  account: WeixinAccount
-  to: string
-  phase: 'start' | 'end'
-  toolName: string
-  toolCallId?: string
-  failed?: boolean
-  contextToken?: string
-  /**
-   * The agent run this card belongs to.
-   *
-   * The reference client passes the run id on every progress item, which is how the receiving
-   * client groups a run's cards. A card without one has no run to attach to.
-   */
-  runId?: string
-  signal?: AbortSignal
-}): Promise<{ clientId: string; serverMessageId?: string }> {
-  const now = Date.now()
-  const item: MessageItem = {
-    type: params.phase === 'start' ? MessageItemType.TOOL_CALL_START : MessageItemType.TOOL_CALL_RESULT,
-    create_time_ms: now,
-    is_completed: params.phase === 'end',
-    ...(params.phase === 'start'
-      ? {
-          tool_call_start_item: {
-            tool_name: params.toolName,
-            ...(params.toolCallId === undefined ? {} : { tool_call_id: params.toolCallId }),
-          },
-        }
-      : {
-          tool_call_result_item: {
-            tool_name: params.toolName,
-            ...(params.toolCallId === undefined ? {} : { tool_call_id: params.toolCallId }),
-            // The reference client normalises to exactly these four values.
-            status: params.failed === true ? 'failed' : 'completed',
-          },
-        }),
-  }
-  return await sendItem({
-    account: params.account,
-    to: params.to,
-    item,
-    ...(params.contextToken === undefined ? {} : { contextToken: params.contextToken }),
-    ...(params.runId === undefined ? {} : { runId: params.runId }),
-    ...(params.signal === undefined ? {} : { signal: params.signal }),
-  })
-}
 
 /** One attachment recovered from an inbound message. */
 export interface DownloadedMedia {

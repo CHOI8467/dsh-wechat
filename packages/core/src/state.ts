@@ -133,6 +133,14 @@ export interface ChannelSettings {
    * currently in. Turn it off to restore the stricter rule, where only the bound session may send.
    */
   allowCrossSessionNotify?: boolean
+  /**
+   * Directory the channel's sessions run in, or empty for the default under the DSH home.
+   *
+   * Read once, during `apply`: a session's `cwd` is pinned when it is created. Changing it
+   * therefore moves the sessions created afterwards and leaves the existing ones on the old
+   * directory, which is why the settings page says a restart is needed.
+   */
+  workspacePath?: string
 }
 
 /** Permission presets this channel will apply to its own sessions. */
@@ -148,6 +156,7 @@ export const DEFAULT_SETTINGS = {
   requireConfirmation: true,
   permissionPreset: 'danger-full-access',
   allowCrossSessionNotify: true,
+  workspacePath: '',
   presenceNote:
     '[渠道：微信] 你在和微信上的用户对话，对方在手机上，看不到这台电脑的屏幕和文件系统。' +
     '不要让他去"打开某个路径"或"看某个文件"。需要给他看东西时，直接发送：' +
@@ -174,7 +183,8 @@ export function resolveSettings(state: ChannelState): Required<ChannelSettings> 
     permissionPreset: stored.permissionPreset ?? DEFAULT_SETTINGS.permissionPreset,
     allowCrossSessionNotify:
       stored.allowCrossSessionNotify ?? DEFAULT_SETTINGS.allowCrossSessionNotify,
-    presenceNote: stored.presenceNote ?? DEFAULT_SETTINGS.presenceNote,
+    workspacePath: stored.workspacePath ?? DEFAULT_SETTINGS.workspacePath,
+  presenceNote: stored.presenceNote ?? DEFAULT_SETTINGS.presenceNote,
   }
 }
 

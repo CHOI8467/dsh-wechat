@@ -143,6 +143,11 @@ window.__ModuleLoader__.load({
         permissionFull: '完全访问：不询问，直接执行',
         permissionAuto: '自动审核：电脑上判断',
         permissionProfile: '跟随 DSH 设置：和桌面端一样',
+        workspacePath: '会话工作目录',
+        workspacePathHint:
+          'DSH 在这个目录里读写文件。留空则用默认位置。改完要重启 DSH 才生效，因为已经建好的对话不会搬家。',
+        workspacePathPlaceholder: '留空 = 默认位置',
+        workspacePathBrowse: '选择文件夹',
         allowCrossSessionNotify: '允许其他会话推送到微信',
         allowCrossSessionNotifyHint:
           '开启后，任何会话都能主动发消息或文件到你微信——包括你正在电脑上干活、它做完后通知你的情况。关掉则只有微信对话自己那个会话能发。',
@@ -236,6 +241,11 @@ window.__ModuleLoader__.load({
         permissionFull: 'Full access: run without asking',
         permissionAuto: 'Automatic review: decided on this computer',
         permissionProfile: 'Follow the DSH setting, same as the desktop',
+        workspacePath: 'Session workspace',
+        workspacePathHint:
+          'Where DSH reads and writes files. Leave empty for the default location. Needs a DSH restart, because conversations that already exist do not move.',
+        workspacePathPlaceholder: 'Empty = default location',
+        workspacePathBrowse: 'Choose folder',
         allowCrossSessionNotify: 'Let other sessions push to WeChat',
         allowCrossSessionNotifyHint:
           'On, any session may send you a message or a file — which is how a task that finishes while you are away can still reach you. Off, only the session the WeChat conversation is bound to may send.',
@@ -679,7 +689,34 @@ a.dsh-wechat-button { text-decoration: none; }
       }
 
       /** One editable field, with its label and explanation. */
-      function field(label, hint, control) {
+      /**
+ * Open DSH's own folder dialog.
+ *
+ * Two routes, because the desktop app and the web client expose it differently: the Electron
+ * preload publishes `__DSH_DIRECTORY_PICKER__`, and everything else goes through the workspace
+ * service. Both are tried in that order, and any failure returns undefined so the field keeps
+ * whatever it already held rather than being cleared by a dialog that never opened.
+ *
+ * @param {object} ctx - Client plugin context.
+ * @returns {Promise<string | undefined>} The chosen directory, or undefined when cancelled.
+ */
+async function pickDirectory(ctx) {
+  try {
+    const desktop = globalThis.__DSH_DIRECTORY_PICKER__
+    if (desktop !== undefined && typeof desktop.pick === 'function') {
+      return (await desktop.pick()) ?? undefined
+    }
+    const workspace = ctx?.uiWorkspace
+    if (workspace !== undefined && typeof workspace.pickDirectory === 'function') {
+      return (await workspace.pickDirectory()) ?? undefined
+    }
+  } catch {
+    // No picker, or the user dismissed it: leave the typed path as it is.
+  }
+  return undefined
+}
+
+function field(label, hint, control) {
         return h(
           'div',
           { className: 'dsh-wechat-field' },
@@ -943,6 +980,42 @@ a.dsh-wechat-button { text-decoration: none; }
                   h('option', { value: 'danger-full-access' }, t.permissionFull),
                   h('option', { value: 'auto' }, t.permissionAuto),
                   h('option', { value: 'default' }, t.permissionProfile),
+                ),
+              ),
+
+              /*
+               * Where the conversations work.
+               *
+               * Editable as well as pickable: the dialog is the fast route, but a path copied from
+               * somewhere else has to be accepted too, and an empty box is how the default comes back.
+               * The button only writes what the dialog returned, so cancelling leaves the field alone.
+               */
+              field(
+                t.workspacePath,
+                t.workspacePathHint,
+                h(
+                  'div',
+                  { className: 'dsh-wechat-row' },
+                  h('input', {
+                    className: 'dsh-wechat-input',
+                    type: 'text',
+                    value: state.draft.workspacePath ?? '',
+                    placeholder: t.workspacePathPlaceholder,
+                    onChange: (event) => edit('workspacePath', event.target.value),
+                  }),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-wechat-button',
+                      onClick: () => {
+                        void pickDirectory(ctx).then((picked) => {
+                          if (picked !== undefined) edit('workspacePath', picked)
+                        })
+                      },
+                    },
+                    t.workspacePathBrowse,
+                  ),
                 ),
               ),
 

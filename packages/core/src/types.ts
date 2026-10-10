@@ -69,9 +69,6 @@ export const MessageType = {
 
 /**
  * Content element kinds.
- *
- * `TOOL_CALL_START` / `TOOL_CALL_RESULT` are rendered natively by the WeChat
- * client, which is what makes in-chat tool activity possible without any custom UI.
  */
 export const MessageItemType = {
   NONE: 0,
@@ -80,8 +77,6 @@ export const MessageItemType = {
   VOICE: 3,
   FILE: 4,
   VIDEO: 5,
-  TOOL_CALL_START: 11,
-  TOOL_CALL_RESULT: 12,
 } as const
 
 /**
@@ -159,17 +154,6 @@ export interface VideoItem {
   thumb_width?: number
 }
 
-export interface ToolCallStartItem {
-  tool_name?: string
-  tool_call_id?: string
-}
-
-export interface ToolCallResultItem {
-  tool_name?: string
-  tool_call_id?: string
-  status?: string
-}
-
 export interface PartialText {
   start: string
   end: string
@@ -198,8 +182,6 @@ export interface MessageItem {
   voice_item?: VoiceItem
   file_item?: FileItem
   video_item?: VideoItem
-  tool_call_start_item?: ToolCallStartItem
-  tool_call_result_item?: ToolCallResultItem
 }
 
 /** One inbound or outbound message. */

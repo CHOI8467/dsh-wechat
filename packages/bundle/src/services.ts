@@ -237,22 +237,6 @@ export interface StreamFrame {
   /** Set on a frame that ends the assistant's output, so the reply can be flushed. */
   completed?: boolean
   /**
-   * A tool call starting, when this frame announces one.
-   *
-   * Read from the model chunk's own `tool-call-delta`, which is the only tool signal that
-   * reliably reaches this plugin: the harness's `tools/result` event is dispatched against
-   * the calling agent's scope, while a channel plugin sits at host scope owning no agent.
-   */
-  toolCall?: { id: string; name: string }
-  /**
-   * Field names seen on a `tool-call-delta` that could not be turned into a call.
-   *
-   * Diagnostics only: a frame missing `id` or `name` is currently discarded, and without this
-   * the discard is invisible — which is exactly how a tool card fails to appear while every
-   * test still passes.
-   */
-  toolCallShape?: string
-  /**
    * Every chunk kind this reader has seen, e.g. `text-delta`.
    *
    * Chunk types are a closed set, so a caller can log each one once and learn the stream's
@@ -266,13 +250,6 @@ export interface StreamFrame {
    * Same purpose as {@link chunkType}, for frames that carry no chunk at all.
    */
   frameShape?: string
-  /**
-   * The field set of a `block-start` / `block-end` chunk, e.g. `block-start:type,index,name`.
-   *
-   * A tool block's opening frame is where the tool name is expected to live, since the delta
-   * frames carry only an id. Reported rather than assumed.
-   */
-  blockShape?: string
 }
 
 /**
@@ -317,26 +294,6 @@ export function readStreamFrame(payload: AssistantStreamPayload): StreamFrame {
     case 'text-delta':
       // The model's actual output.
       return typeof item.text === 'string' ? { ...withId, text: item.text, ...observed } : observed
-    case 'tool-call-delta': {
-      // Observed: this frame carries `type,index,id,argumentsDelta` and **no tool name**. The
-      // name has to come from elsewhere, which is why the block boundaries report their own
-      // fields below rather than this reader guessing a second time.
-      const id = typeof item.id === 'string' ? item.id : undefined
-      const name = typeof item.name === 'string' ? item.name : undefined
-      if (id === undefined || name === undefined || name === '') {
-        return { ...withId, toolCallShape: Object.keys(item).join(','), ...observed }
-      }
-      return { ...withId, toolCall: { id, name }, ...observed }
-    }
-    case 'block-start':
-    case 'block-end':
-      // A tool block's opening frame is the likely carrier of the tool name, since the delta
-      // frames carry only an id and argument fragments.
-      return {
-        ...withId,
-        blockShape: `${String(item.type)}:${Object.keys(item).join(',')}`,
-        ...observed,
-      }
     default:
       // `reasoning-delta`, `block-start`, `block-end`, `usage`, `finish`, and anything added
       // later: not user-visible text.

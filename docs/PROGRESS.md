@@ -38,17 +38,10 @@
     - `file_item` 也对齐官方：只有 `media` / `file_name` / `len`，**移除** `md5`。
     - 媒体引用取**上传响应的 `x-encrypted-param` 头**（官方做法）。此前一轮曾误改为 `upload_full_url` 里的参数，那是上传授权、只读会被拒（403）。
     - `thumbnail.ts`（用应用自带 `sharp`）保留：它对入站/后续视频路径仍有用，但官方图片条目并不发送缩略图引用。
-  - 🔍 **工具调用卡片（结构已对齐，可见性待定位）**：用微信客户端**原生渲染**的工具卡片显示 agent 正在做什么（`type=11` 开始 / `type=12` 结果）。
-    - **实机测试显示卡片没有出现**（2026-10-06 12:22 的截图里全是普通文字气泡）。单元测试全绿，说明问题在真实链路，不在结构。
-    - **首要嫌疑**：`tool-call-delta` 帧里**是否真有 `name` 字段**。这是我从未观测过的假设——如果实际用的是别的字段名（如 `tool_name`），代码会静默丢弃每一帧，**卡片全部消失且无任何错误**。
-    - 因此 0.9.1 加入诊断：无法转成调用的帧会把**字段名列表**写进 `boot.log`（`tool-call frame fields (no call made): …`），并且**成功发送也会记录**（`tool card: start/end …`）——此前只记失败，导致"发了但看不到"与"没发"在日志里无法区分
-    - 照官方 `reply-progress-sender.ts`：卡片带 `tool_call_id` **配对**、`create_time_ms` 定序、结果是四态之一（`completed` / `failed` / `blocked` / `unknown`）
-    - **两个事件源的可靠性不同，这是设计的核心**：
-      | 来源 | 拿到什么 | 可靠性 |
-      |---|---|---|
-      | `tool-call-delta` 帧（助手流） | 工具名 + 调用 ID | **确定**——插件在宿主作用域必然收到 |
-      | `tools/result` 事件 | 真实状态（含失败） | **可能收不到**——它按调用者 agent 作用域分发 |
-    - 所以**开始卡片**从流里发（必然出现）；**结果卡片**在真收到 `tools/result` 时发；若收不到，**回合结束时补发**，且**留 1.5 秒宽限**让真实状态先到，避免把失败的调用报成完成
+  - ❌ **工具调用卡片：已彻底删除（0.37.0）**。曾经用微信客户端原生渲染的工具卡片来显示 agent 在做什么（`type=11` 开始 / `type=12` 结果），结构对齐了官方 `reply-progress-sender.ts`，单元测试全绿，但**实机上卡片从来没出现过**（2026-10-06 12:22 的截图里全是普通文字气泡）。
+    - 更糟的是**它开始报错**：发送接口返回的不是 JSON，每条都记一句 `工具卡片发送失败: Unexpected end of JSON input`，堆在设置页的「最近错误」里。功能没生效，噪音却留了下来。
+    - **2026-10-09 彻底砍掉**，连接口一起：`sendItem` 之上的 `sendToolCard()`、`type=11/12` 两个枚举值、`ToolCallStartItem` / `ToolCallResultItem`、`StreamFrame` 里只为驱动它而存在的 `toolCall` / `toolCallShape` / `blockShape`、host 里的 `#announceTool` / `#closeToolCard` / `closeOpenToolCards` / `toolResultListener` / `TOOL_CARD_GRACE_MS` / `#announcedTools` / `#runningTools` / `#recordToolShape`、`tools/result` 的注册与解绑，以及 **8 个断言它的测试**。
+    - **教训**：**一个"没生效但不报错"的功能会一直活着**。它当初的诊断设计（把帧字段名写进日志）本身没问题，问题是没人据此做决定——直到它开始报错才被处理。**要么让它工作，要么让它消失，不要让它悬着。**
     - **宁可少一张卡片，也不谎报成功**——这是这条设计的取舍
   - ✅ **引用消息缓存**：用户长按引用 DSH 的某条消息再追问时，把被引用的内容还原给 agent。
     - **协议事实（实测样本）**：引用到达时 `ref_msg.message_item` 只有 `type: 0` + `msg_id` + 时间戳，**正文完全不在里面**（样本 188 字节）。所以被引用内容除非自己存，否则无处可寻。
