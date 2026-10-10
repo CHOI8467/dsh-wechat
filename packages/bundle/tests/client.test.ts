@@ -576,7 +576,7 @@ test('the command reference lists every command with what it does', async () => 
     // here — a command missing from the list is one nobody will use.
     assert.deepEqual(
       commands.map((node) => collectText(collectByType(node, 'dt')[0]).join('')),
-      ['/help', '/new [标题]', '/list', '/switch <编号>', '/current', '/cancel'],
+      ['/help', '/new [标题]', '/list', '/switch <编号>', '/model [编号或名字]', '/current', '/cancel'],
     )
     const meanings = commands.map((node) => collectText(collectByType(node, 'dd')[0]).join(''))
     assert.ok(meanings.every((text) => text.length > 0), 'every command explains itself')

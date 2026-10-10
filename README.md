@@ -27,7 +27,7 @@ work, with both requests already answered in the session list.
 - **Text both ways.** Your WeChat message becomes a DSH prompt; the reply comes back to WeChat.
 - **Photos, files, voice, video** — both directions. Attachments are saved into the session workspace
   and handed to the agent; the agent can send files back with `send_to_wechat`.
-- **One WeChat chat, many DSH sessions.** `/new`, `/list`, `/switch`, `/current`, `/cancel` — or just
+- **One WeChat chat, many DSH sessions.** `/new`, `/list`, `/switch`, `/model`, `/current`, `/cancel` — or just
   say "switch to the other one".
 - **Answer permission prompts from your phone.** Approvals and multiple-choice questions are sent to
   WeChat and answered with a number, so being away from the desk does not stall the agent.
@@ -165,6 +165,8 @@ Type these to control which DSH conversation you are talking to:
 | `/list` | Conversations in the WeChat workspace, newest first |
 | `/list all` | Every conversation, including other workspaces |
 | `/switch 3` | Move to number 3 in that list |
+| `/model` | List the models, marking the one in use |
+| `/model 2` | Switch to number 2, or send a model name instead |
 | `/current` | Which conversation you are in |
 | `/cancel` | Stop the task that is running |
 | `/help` | This list |
