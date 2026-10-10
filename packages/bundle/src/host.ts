@@ -203,6 +203,45 @@ export function sessionToolDescription(requireConfirmation: boolean): string {
 }
 
 /**
+ * The model tool's description.
+ *
+ * Written the way the session tool's is, and for the same reason: the decision belongs to the agent,
+ * which is the only part of this system that understands what the user meant. A model is not a
+ * session, so the confirmation policy does not travel here — that setting is about moving work
+ * between conversations, where an inferred intent costs the user their context.
+ *
+ * @returns The description to register.
+ */
+export function modelToolDescription(): string {
+  return (
+    'Choose which model this WeChat conversation runs on, and show which models are available. Call ' +
+    'this whenever the user asks to see the models, or to change the one in use — in any wording, ' +
+    'such as "换个模型" or "切到 X". Do not merely describe these actions in a reply; call the tool. ' +
+    'The user is on a phone and cannot see the desktop model picker. ' +
+    // Switching does not move the conversation, so unlike the session tool the caller is not at
+    // risk of answering from somewhere else — but the announcement rule is the same, because the
+    // channel has already told the user what happened and a second, looser telling can only
+    // contradict it.
+    'Both listing and switching are announced to the user by the channel, including when they fail, ' +
+    'so do not repeat that outcome either way. Never tell the user a model switch succeeded; read ' +
+    'the result\'s `ok` field and, if it is false, say nothing about it because the channel has ' +
+    'already told them what went wrong. ' +
+    'A switch applies to the conversation the caller is bound to, and takes effect from the next turn.'
+  )
+}
+
+/**
+ * The openings that mean a model command changed nothing.
+ *
+ * The command answers with guidance rather than throwing, so its text has to be read to know whether
+ * a switch happened — the same technique the session tool uses, and needed more here: a false success
+ * leaves the agent telling the user about a model the next turn is not using. Anchored to the start,
+ * where the router puts its own words, so a conversation title or a model name further down a
+ * successful reply cannot be read as a failure.
+ */
+const MODEL_FAILURE_PATTERN = /^(找不到模型|当前|切换模型失败)/
+
+/**
  * The message that tells the user a session operation actually happened.
  *
  * Written by the channel rather than the agent because it is the one thing the user must see: after
@@ -761,6 +800,85 @@ class WechatRuntime {
       }
     }
     return { ok: true, detail: result.text, sessions, otherWorkspaces, otherNames }
+  }
+
+  /**
+   * Perform a model action on behalf of the agent.
+   *
+   * The natural-language half of `/model`, exactly as {@link controlSession} is the natural-language
+   * half of `/switch`: the request is recognised by the agent, and the channel only carries it out.
+   * Every action runs through the router's own command path, so a spoken request and a typed one can
+   * never diverge — one list, one numbering, one failure message.
+   *
+   * @param callerSessionId - Session the calling agent is in, which identifies the conversation.
+   * @param action - `list` or `switch`.
+   * @param target - Model to switch to, by number, name or id.
+   * @returns A result the agent can act on, or a reason it could not be done.
+   */
+  async controlModel(
+    callerSessionId: string | undefined,
+    action: string,
+    target?: string,
+  ): Promise<{ ok: boolean; detail: string }> {
+    // Validated here rather than by building `/<action>`: an action this plugin does not know must
+    // fail, not turn into a different command that happens to start with a slash.
+    if (action !== 'list' && action !== 'switch') {
+      return { ok: false, detail: `不支持的操作：${action}` }
+    }
+    if (action === 'switch' && (target === undefined || target.trim() === '')) {
+      return {
+        ok: false,
+        detail: '切换模型需要指定目标：清单里的编号、模型名字或模型 id。',
+      }
+    }
+
+    const conversationId = await this.#conversationForAgentSession(callerSessionId)
+    if (conversationId === undefined) {
+      return { ok: false, detail: '这个会话没有绑定任何微信对话，无法操作。' }
+    }
+    const binding = (await this.#store.read()).bindings[conversationId]
+    if (binding === undefined) {
+      return { ok: false, detail: '这个会话没有绑定任何微信对话，无法操作。' }
+    }
+
+    const result = await this.#router.route({
+      conversationId,
+      accountId: binding.accountId,
+      peerId: binding.peerId,
+      text: action === 'switch' ? `/model ${target ?? ''}` : '/model',
+    })
+    if (result.kind !== 'reply') {
+      return { ok: false, detail: `不支持的操作：${action}` }
+    }
+
+    /*
+     * The reply decides the outcome, because the command answers with guidance instead of throwing.
+     *
+     * A false success is the failure that matters here: the agent would tell the user a model the
+     * next turn is not using, and nothing about the chat would look wrong. The pattern is anchored to
+     * the opening of each failure message, so a conversation title or a model name appearing later in
+     * a successful reply cannot be mistaken for one.
+     */
+    const failed = MODEL_FAILURE_PATTERN.test(result.text)
+    // Sent by the channel in both cases, for the same reason the session tool does it: a tool result
+    // is only ever shown to the agent, so leaving it to the agent produced replies pointing at a
+    // message that never existed.
+    await this.#notify(conversationId, result.text)
+    if (failed) {
+      return {
+        ok: false,
+        // Stated as done, because it was: the user has been told directly, and a retelling can only
+        // contradict what they already read.
+        detail: `操作失败，已直接告诉用户。原因：${result.text.split('\n')[0] ?? ''}`,
+      }
+    }
+    return {
+      ok: true,
+      detail:
+        action === 'list'
+          ? '模型清单已直接发给用户。不要重复这份清单。'
+          : '模型已切换，已直接告诉用户。不要重复。',
+    }
   }
 
   /**
@@ -1813,6 +1931,11 @@ class WechatRuntime {
     // re-register rather than mutate. Holding the disposer here is what lets `saveSettings` do it.
     const control = tools.register(this.#sessionToolDefinition())
 
+    // The model half. Registered next to the session tool because the two are the same shape of
+    // request — something the user asks for in words that the agent has to interpret — and the
+    // description is what tells them apart.
+    const model = tools.register(this.#modelToolDefinition())
+
     /*
      * The proactive half. `send_to_wechat` only works for the session the WeChat conversation is
      * bound to, which means the session doing the work usually cannot report its own result: the user
@@ -1862,6 +1985,7 @@ class WechatRuntime {
       this.#sessionToolDisposer = undefined
       send()
       control()
+      model()
       notify()
     }
   }
@@ -2235,6 +2359,67 @@ class WechatRuntime {
           ok: result.ok,
           otherWorkspaces: result.otherWorkspaces,
         }
+      },
+    }
+  }
+
+  /**
+   * The model tool as the registry needs it.
+   *
+   * Built like the session tool, and registered for the same reason: a request phrased as a sentence
+   * ("换个模型""切到 X") cannot be recognised by rules, so the judgement is the agent's and the
+   * channel only executes it. The action set is deliberately smaller than the session tool's — a
+   * model has no equivalent of "new" or "cancel", and inventing one would give the agent a way to
+   * ask for something that does not exist.
+   *
+   * @returns The definition to register.
+   */
+  #modelToolDefinition(): ToolDefinition {
+    return {
+      name: 'model_control',
+      description: modelToolDescription(),
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'switch'],
+            description:
+              'list: show every available model with its number, and mark the one in use. switch: move this WeChat conversation to another model.',
+          },
+          target: {
+            type: 'string',
+            description:
+              'For switch, the model to move to: its number from list, its name, or its model id. Required for switch.',
+          },
+        },
+        required: ['action'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            detail: { type: 'string' },
+            ok: { type: 'boolean' },
+          },
+          required: ['detail', 'ok'],
+        },
+        render: (args) => [
+          { type: 'text', text: `model_control ${String(args.action ?? '')}` },
+        ],
+      },
+      execute: async (args, exec) => {
+        const result = await this.controlModel(
+          sessionIdOf(exec.agent),
+          String(args.action ?? ''),
+          args.target === undefined ? undefined : String(args.target),
+        )
+        this.#recordBoot(
+          `model_control: action=${String(args.action)} target=${String(args.target ?? '')} ok=${String(result.ok)}`,
+        )
+        return { detail: result.detail, ok: result.ok }
       },
     }
   }
@@ -3099,6 +3284,56 @@ class WechatRuntime {
       },
       cancel: async (sessionId: string): Promise<void> => {
         await ctx.sessionController.cancel({ sessionId })
+      },
+      /*
+       * The model catalog, flattened for a chat stream.
+       *
+       * The host groups models by provider because the desktop picker has the room for it. A WeChat
+       * message does not, and the number the user replies with has to be a number they were shown,
+       * so the grouping is dropped here and the router only ever sees one numbered list.
+       *
+       * `current` is the catalog's default rather than the session's own selection: the host does not
+       * report a per-session model through this interface. It is the right thing to mark anyway,
+       * because choosing a model also saves it as that default — so the mark follows every switch
+       * made through this channel, and only a model chosen in the desktop for one session can differ.
+       */
+      listModels: async () => {
+        const catalog = await ctx.sessionController.modelCatalog()
+        return {
+          current: catalog.default,
+          models: catalog.groups.flatMap((group) =>
+            group.models.map((model) => ({
+              provider: group.id,
+              providerName: group.name,
+              model: model.id,
+              name: model.name,
+              // The model's own default effort, because a reasoning model has to be selected at a
+              // level and leaving it out would hand that decision to a resolve step the user cannot
+              // see. This mirrors what the host does when it picks a model for itself.
+              ...(model.reasoning?.defaultEffort === undefined
+                ? {}
+                : { reasoningEffort: model.reasoning.defaultEffort }),
+            })),
+          ),
+          failures: catalog.failures.map((failure) => ({
+            name: failure.name,
+            message: failure.message,
+          })),
+        }
+      },
+      selectModel: async (
+        sessionId: string,
+        provider: string,
+        model: string,
+        reasoningEffort?: string,
+      ) => {
+        const { selected } = await ctx.sessionController.selectModel({
+          sessionId,
+          provider,
+          model,
+          ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+        })
+        return { provider: selected.provider, model: selected.model }
       },
     }
   }

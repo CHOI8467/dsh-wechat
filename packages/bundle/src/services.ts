@@ -20,6 +20,59 @@ export interface SessionSummary {
   readonly agentPreset?: string
 }
 
+/** One provider, model and reasoning effort — what a session runs on. */
+export interface ModelSelection {
+  readonly provider: string
+  readonly model: string
+  readonly reasoningEffort?: string
+}
+
+/** One reasoning effort a model accepts. */
+export interface ModelReasoningEffort {
+  readonly id: string
+  readonly name: string
+  readonly description?: string
+}
+
+/** One model a selector may offer. */
+export interface ModelCatalogModel {
+  readonly id: string
+  readonly name: string
+  readonly description?: string
+  /**
+   * Present only on models that expose reasoning levels.
+   *
+   * `defaultEffort` is what the host itself selects with, so it is what this plugin passes back
+   * rather than leaving the choice to a resolve step the user cannot see.
+   */
+  readonly reasoning?: {
+    readonly efforts: readonly ModelReasoningEffort[]
+    readonly defaultEffort?: string
+  }
+}
+
+/** Models under one provider, which is how the desktop picker groups them. */
+export interface ModelProviderGroup {
+  readonly id: string
+  readonly name: string
+  readonly models: readonly ModelCatalogModel[]
+}
+
+/** One provider whose models could not be listed, with the host's own reason. */
+export interface ModelCatalogFailure {
+  readonly id: string
+  readonly name: string
+  readonly message: string
+}
+
+/** Every model the deployment can currently route to. */
+export interface ModelCatalog {
+  readonly default: ModelSelection
+  readonly routableProviders: readonly string[]
+  readonly groups: readonly ModelProviderGroup[]
+  readonly failures: readonly ModelCatalogFailure[]
+}
+
 /** The subset of the session controller this plugin drives. */
 export interface SessionControllerService {
   /**
@@ -61,6 +114,29 @@ export interface SessionControllerService {
 
   /** Abort the session's current work. */
   cancel(request: { readonly sessionId: SessionId }): Promise<unknown>
+
+  /**
+   * Every model this deployment can route to.
+   *
+   * Read-only and host-owned: grouping, labels and the default all come from DSH, so a model the
+   * host adds or withdraws appears to the user without a plugin change. It takes no session because
+   * the catalog is deployment-wide; which entry a *session* is on is not reported here.
+   */
+  modelCatalog(): Promise<ModelCatalog>
+
+  /**
+   * Point one session at a model.
+   *
+   * Takes the session id as an argument instead of resolving the caller, because the person asking
+   * is on a phone: the session that must change is the one the conversation is bound to, which is
+   * not necessarily the session the agent runs in. Throws when the provider or model is unknown.
+   */
+  selectModel(request: {
+    readonly sessionId: SessionId
+    readonly provider: string
+    readonly model: string
+    readonly reasoningEffort?: string
+  }): Promise<{ readonly selected: ModelSelection }>
 }
 
 /** One registered Workspace, as far as this plugin needs it. */

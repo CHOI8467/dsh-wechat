@@ -47,6 +47,47 @@ export type RouteResult =
   | { kind: 'prompt'; decision: RouteDecision }
 
 /**
+ * One model a conversation can be moved to.
+ *
+ * Flattened and provider-labelled by the host, because core must not know what a provider is. What
+ * it needs is the two opaque strings `selectModel` takes back, plus enough labels to show a row and
+ * to match what the user typed.
+ */
+export interface ModelOption {
+  /** Provider id, handed straight back to the host when this model is chosen. */
+  provider: string
+  /** Provider label, shown beside the model so two providers' identical ids are told apart. */
+  providerName: string
+  /** Model id, handed straight back to the host. */
+  model: string
+  /** Model label, which is what the user reads and usually types. */
+  name: string
+  /** Reasoning effort to select the model with, when the model exposes one. */
+  reasoningEffort?: string
+}
+
+/** Which model a session runs on. Opaque to core: two ids from the host. */
+export interface ModelSelection {
+  provider: string
+  model: string
+}
+
+/** Every model on offer, plus the one the host reported as current. */
+export interface ModelListing {
+  /**
+   * The selection the host reports, when it reports one.
+   *
+   * The host exposes a deployment default rather than a per-session read, so this is what the list
+   * marks. Because choosing a model also saves it as that default, the mark follows every switch
+   * made through this channel.
+   */
+  current?: ModelSelection
+  models: readonly ModelOption[]
+  /** Providers whose models could not be listed, with the host's own reason. */
+  failures?: readonly { name: string; message: string }[]
+}
+
+/**
  * The session surface this router needs from the host.
  *
  * Keeping it narrow means the routing rules are unit-testable without booting DSH,
@@ -69,6 +110,27 @@ export interface SessionGateway {
   listOwnSessions?(): Promise<{ sessionId: string; title: string; updatedAt: number }[]>
   /** Abort whatever the session is currently doing. */
   cancel(sessionId: string): Promise<void>
+  /**
+   * Models a session may be moved to, and the one the host says is in use.
+   *
+   * Optional for the same reason as {@link SessionGateway.listOwnSessions}: only the host knows
+   * which models exist. A composition without a catalog answers that it has none, rather than
+   * throwing out of a command the user typed.
+   */
+  listModels?(): Promise<ModelListing>
+  /**
+   * Point a session at one model. Throws with the host's own reason when it cannot.
+   *
+   * The reasoning effort travels with the model rather than being left to the host to default,
+   * because leaving it out would hand a decision to a resolve step the user cannot see: the same
+   * model at a different effort is a different answer.
+   */
+  selectModel?(
+    sessionId: string,
+    provider: string,
+    model: string,
+    reasoningEffort?: string,
+  ): Promise<ModelSelection>
 }
 
 /** Everything persisted for routing, injected so the store stays pluggable. */
@@ -222,6 +284,65 @@ export class SessionRouter {
         return { kind: 'reply', text: `已切换到「${binding.title}」。\n${shortId(binding.sessionId)}` }
       }
 
+      case '/model': {
+        /*
+         * Models are listed for the *deployment*, and chosen for the *bound session*.
+         *
+         * The asymmetry is the host's: the catalog is deployment-wide, while a selection is
+         * session-local. So the list is the same wherever it is asked for, and a switch only means
+         * something once there is a conversation for it to apply to.
+         */
+        if (this.#gateway.listModels === undefined) {
+          return { kind: 'reply', text: '当前组合没有模型列表，无法查看或切换模型。' }
+        }
+        const listing = await this.#gateway.listModels()
+        const value = args.trim()
+        if (value === '') return { kind: 'reply', text: renderModelList(listing) }
+
+        const chosen = resolveModelOption(value, listing.models)
+        if (chosen === undefined) {
+          // Named back, because the user typed it and a phone keyboard makes typos normal. The next
+          // step is spelled out for the same reason `/switch` does it: the alternative is a user who
+          // does not know whether the model does not exist or the name was written differently.
+          return {
+            kind: 'reply',
+            text: `找不到模型「${value}」。回复 /model 看清单，再回复编号或模型名字。`,
+          }
+        }
+
+        const binding = bindings[params.conversationId]
+        if (binding === undefined) {
+          return { kind: 'reply', text: '当前没有对话。先发一条消息新建一个，再切模型。' }
+        }
+        if (this.#gateway.selectModel === undefined) {
+          return { kind: 'reply', text: '当前组合不支持切换模型。' }
+        }
+        try {
+          const selected = await this.#gateway.selectModel(
+            binding.sessionId,
+            chosen.provider,
+            chosen.model,
+            chosen.reasoningEffort,
+          )
+          // The model id is repeated on its own line, exactly as `/switch` repeats the session id:
+          // it is what the user has to type, and a label alone does not identify a model.
+          return {
+            kind: 'reply',
+            text: `已把「${binding.title}」切换到 ${chosen.name}（${chosen.providerName}）。\n${selected.model}`,
+          }
+        } catch (error) {
+          /*
+           * The host's own words, not a generic failure.
+           *
+           * `selectModel` is the only place that knows why a choice was refused — an unconfigured
+           * provider, a key that is missing, a model withdrawn since the list was rendered — and a
+           * message that hides that leaves the user with nothing to act on.
+           */
+          const reason = error instanceof Error ? error.message : String(error)
+          return { kind: 'reply', text: `切换模型失败：${reason}` }
+        }
+      }
+
       case '/current': {
         const binding = bindings[params.conversationId]
         if (binding === undefined) return { kind: 'reply', text: '当前没有对话，发任意消息就会新建一个。' }
@@ -274,7 +395,7 @@ export class SessionRouter {
 }
 
 /** Commands that may be written with or without an argument. */
-const COMMANDS_WITH_ARG = ['/new', '/switch'] as const
+const COMMANDS_WITH_ARG = ['/new', '/switch', '/model'] as const
 
 /** Commands that never take an argument. */
 const COMMANDS_BARE = ['/help', '/list', '/current', '/cancel'] as const
@@ -388,6 +509,55 @@ export function resolveTarget(
 }
 
 /**
+ * Resolve a `/model` argument against the catalog.
+ *
+ * Accepts a 1-based list position, a model id, or a model name — the same three shapes `/switch`
+ * accepts for a conversation, for the same reason: the number is what the listing prints, and the
+ * name is what a person remembers.
+ *
+ * Matching is deliberately strict, and every match must be unique. Two providers can expose the same
+ * model id (`deepseek-chat` from two accounts), so a loose match would silently pick one of them, and
+ * which one silently picked is not something the user could even see. Several matches return
+ * undefined: a model the user did not ask for is worse than a question.
+ *
+ * @param args - What the user typed after `/model`.
+ * @param models - Every model the host offers, in the order the listing numbered them.
+ */
+export function resolveModelOption(
+  args: string,
+  models: readonly ModelOption[],
+): ModelOption | undefined {
+  const value = args.trim()
+  if (value === '') return undefined
+
+  if (/^\d+$/.test(value)) {
+    const byIndex = models[Number(value) - 1]
+    if (byIndex !== undefined) return byIndex
+    // Fall through: a numeric string can still be part of a name or an id.
+  }
+
+  // Case-insensitive, unlike session titles: model ids are machine-written identifiers, and a user
+  // retyping `deepseek-chat` from a phone should not have to match its capitalisation.
+  const lower = value.toLowerCase()
+  const byId = models.filter((option) => option.model.toLowerCase() === lower)
+  if (byId.length === 1) return byId[0]
+
+  const byName = models.filter((option) => option.name.toLowerCase() === lower)
+  if (byName.length === 1) return byName[0]
+
+  // Last, a *core* name match in either direction — a fragment, or the name with words of its own,
+  // which is how people refer to a model in a sentence. Uniqueness is the safeguard; see above.
+  const core = (option: ModelOption): boolean => {
+    const name = option.name.toLowerCase()
+    return name !== '' && (name.includes(lower) || lower.includes(name))
+  }
+  const byCore = models.filter(core)
+  if (byCore.length === 1) return byCore[0]
+
+  return undefined
+}
+
+/**
  * Mint a session id in DSH's own format.
  *
  * The id is `session-<uuid>` because the host treats that shape as its native
@@ -478,6 +648,76 @@ export function renderSessionList(
 }
 
 /**
+ * Render the model list.
+ *
+ * Unlike sessions this is not capped. A session list grows without bound as a machine is used, so it
+ * needs a cut-off; a model catalog is a closed set the host itself offers in full, and every model
+ * has to be reachable by the number printed next to it.
+ *
+ * @param listing - Models on offer, and the selection the host reports.
+ * @returns The message body.
+ */
+export function renderModelList(listing: ModelListing): string {
+  const models = listing.models
+  if (models.length === 0) return '当前没有可用的模型。'
+
+  const current = listing.current
+  const currentName = current === undefined ? undefined : labelOfModel(current, models)
+  const header = `可用模型（共 ${String(models.length)} 个${currentName === undefined ? '' : `，当前：${currentName}`}）：`
+  const rows = models.map((option, index) => renderModelRow(option, index, current))
+  // Providers that failed are named rather than silently missing: a model that is simply absent
+  // reads as a model the deployment does not have, which is a different thing to act on.
+  const failures = listing.failures ?? []
+  const unavailable =
+    failures.length === 0
+      ? ''
+      : `\n\n另有 ${String(failures.length)} 个提供方的模型这次没取到：${failures
+          .map((failure) => `${failure.name}（${failure.message}）`)
+          .join('、')}`
+
+  return [
+    header,
+    '',
+    rows.join('\n\n'),
+    unavailable,
+    '',
+    '回复 /model 编号即可切换，也可以直接发模型名字。',
+  ].join('\n')
+}
+
+/**
+ * Render one row of the model list.
+ *
+ * The label leads because it is what a person recognises; the provider and the id follow, because
+ * two providers can offer the same id and the id is what the user may end up typing.
+ *
+ * @param option - Model to render.
+ * @param index - 0-based position, rendered as the 1-based number to reply with.
+ * @param current - Selection the host reports, marked in the list.
+ * @returns The row.
+ */
+function renderModelRow(
+  option: ModelOption,
+  index: number,
+  current: ModelSelection | undefined,
+): string {
+  const mark =
+    current !== undefined && current.provider === option.provider && current.model === option.model
+      ? '  ← 当前'
+      : ''
+  const provider = option.providerName.trim() === '' ? option.provider : option.providerName
+  return `${String(index + 1)}. ${option.name}${mark}\n   ${provider} · ${option.model}`
+}
+
+/** What to call a selection in a heading: its label when it is on offer, else its id. */
+function labelOfModel(selection: ModelSelection, models: readonly ModelOption[]): string {
+  const found = models.find(
+    (option) => option.provider === selection.provider && option.model === selection.model,
+  )
+  return found?.name ?? selection.model
+}
+
+/**
  * How long ago something happened, in the words a person would use.
  *
  * Relative rather than absolute because the question the list answers is "which one was I just
@@ -504,12 +744,13 @@ export const HELP_TEXT = [
   '/new [标题]     新建对话',
   '/list           列出最近对话',
   '/switch <编号>  切换到某个对话',
+  '/model <编号>   查看或切换模型',
   '/current        显示当前对话',
   '/cancel         中断当前任务',
   '/help           显示本帮助',
   '',
   '直接发消息即与当前对话对话。',
   '',
-  '也可以直接用大白话说，例如「查看对话列表」「换个对话」「停下」，',
+  '也可以直接用大白话说，例如「查看对话列表」「换个对话」「换个模型」「停下」，',
   '我会先问你一次确认，确认后才执行。',
 ].join('\n')

@@ -43,6 +43,46 @@ async function removeHome(home: string): Promise<void> {
   await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
 }
 
+/**
+ * The catalog the stub host reports.
+ *
+ * Two providers, one of them with a reasoning model, because that is the shape the real one has and
+ * the two-provider case is what makes the provider label load-bearing: the same model id can be
+ * offered by more than one provider, and a row that shows only the label would be ambiguous.
+ */
+const MODEL_CATALOG = {
+  default: { provider: 'deepseek-account', model: 'deepseek-chat' },
+  routableProviders: ['deepseek-account', 'openrouter'],
+  groups: [
+    {
+      id: 'deepseek-account',
+      name: 'DeepSeek 官方',
+      models: [
+        { id: 'deepseek-chat', name: 'DeepSeek V3.2' },
+        {
+          id: 'deepseek-reasoner',
+          name: 'DeepSeek Reasoner',
+          reasoning: { efforts: [{ id: 'medium', name: '中' }], defaultEffort: 'medium' },
+        },
+      ],
+    },
+    {
+      id: 'openrouter',
+      name: 'OpenRouter',
+      models: [{ id: 'qwen3-coder', name: 'Qwen3 Coder' }],
+    },
+  ],
+  failures: [],
+}
+
+/** One model selection the stub host was asked to install. */
+interface ModelRequest {
+  sessionId: string
+  provider: string
+  model: string
+  reasoningEffort?: string
+}
+
 interface Created {
   sessionId?: string
   cwd?: string
@@ -90,6 +130,8 @@ interface Harness {
   resolvedWorkspacePaths: string[]
   /** Permission presets the channel applied, in order. */
   presetApplications: { sessionId: string; preset: string }[]
+  /** Model selections the channel installed, in order. */
+  modelSelections: ModelRequest[]
   created: Created[]
   /** Messages carrying the user's own words, which is what most tests are about. */
   prompted: { sessionId: string; mode: 'queue' | 'steer'; text: string }[]
@@ -205,6 +247,8 @@ async function mountWith(options: {
   const resolvedWorkspacePaths: string[] = []
   /** Permission presets the channel applied, in order. */
   const presetApplications: { sessionId: string; preset: string }[] = []
+  /** Model selections the channel installed, in order. */
+  const modelSelections: ModelRequest[] = []
   /** Recorded so a test can assert the permission behaviour rather than infer it. */
   const permissionPresetsSet = (session: unknown, preset: string): void => {
     presetApplications.push({ sessionId: String((session as { id?: string }).id ?? ''), preset })
@@ -366,6 +410,31 @@ async function mountWith(options: {
         return [...byId.values()].reverse()
       },
       cancel: async () => ({}),
+      // The catalog and the selection call, as the real controller exposes them. A stub without them
+      // would send `/model` down its "no model support" path and the whole feature would look like it
+      // worked while never being exercised.
+      modelCatalog: async () => MODEL_CATALOG,
+      selectModel: async (request: ModelRequest) => {
+        // The host validates the pair and throws for anything it cannot route; the stub has to as
+        // well, because that throw is the only failure path the user is told about in the host's own
+        // words.
+        const known = MODEL_CATALOG.groups.some(
+          (group) =>
+            group.id === request.provider &&
+            group.models.some((model) => model.id === request.model),
+        )
+        if (!known) throw new Error(`unknown model ${request.provider}/${request.model}`)
+        modelSelections.push(request)
+        return {
+          selected: {
+            provider: request.provider,
+            model: request.model,
+            ...(request.reasoningEffort === undefined
+              ? {}
+              : { reasoningEffort: request.reasoningEffort }),
+          },
+        }
+      },
     },
     sessions: { get: sessionsGet },
     permissionPresets: { set: permissionPresetsSet },
@@ -442,6 +511,7 @@ async function mountWith(options: {
     registeredTools,
     resolvedWorkspacePaths,
     presetApplications,
+    modelSelections,
     created,
     prompted,
     allPrompts,
@@ -910,13 +980,13 @@ function assertSupportedSchema(schema: Record<string, unknown>, path = 'schema')
   }
 }
 
-test('the agent gets send_to_wechat, session_control and notify_wechat', async () => {
+test('the agent gets send_to_wechat, session_control, model_control and notify_wechat', async () => {
   await withHarness(async (harness) => {
-    // Exactly these three. A duplicate would mean a registration path ran twice, which leaves an
+    // Exactly these four. A duplicate would mean a registration path ran twice, which leaves an
     // extra tool in the agent's list and a stale description behind.
     assert.deepEqual(
       harness.registeredTools.map((tool) => (tool as { name?: string }).name),
-      ['send_to_wechat', 'session_control', 'notify_wechat'],
+      ['send_to_wechat', 'session_control', 'model_control', 'notify_wechat'],
     )
 
     const tool = harness.registeredTools[0] as {
@@ -1085,6 +1155,48 @@ async function controlFrom(
   const args: Record<string, unknown> = { action }
   if (target !== undefined) args.target = target
   return await sessionTool(harness).execute(args, { agent: { session: { id: sessionId } } })
+}
+
+/** The registered `model_control` tool, driven the way the agent would drive it. */
+interface ModelTool {
+  name: string
+  description: string
+  parameters: { properties: Record<string, unknown>; required?: readonly string[] }
+  execute(
+    args: Record<string, unknown>,
+    exec: { agent?: unknown },
+  ): Promise<{ detail: string; ok: boolean }>
+}
+
+function modelTool(harness: Harness): ModelTool {
+  const tool = harness.registeredTools.find(
+    (candidate) => (candidate as { name?: string }).name === 'model_control',
+  )
+  assert.ok(tool, 'model_control must be registered')
+  return tool as ModelTool
+}
+
+/**
+ * Call the model tool as the agent of the conversation's **bound** session, exactly as `control`
+ * does for the session tool: the selection has to land on the session the phone user is talking to,
+ * not on whichever session happens to be asking.
+ *
+ * @param harness - Mounted harness.
+ * @param action - Action to invoke.
+ * @param target - Optional model argument.
+ */
+async function controlModel(
+  harness: Harness,
+  action: string,
+  target?: string,
+): Promise<{ detail: string; ok: boolean }> {
+  const bound = await harness.runtime.bindings()
+  const sessionId =
+    bound[0]?.sessionId ?? harness.prompted.at(-1)?.sessionId ?? harness.created.at(-1)?.sessionId
+  assert.ok(sessionId, 'a session must exist before the tool can be called')
+  const args: Record<string, unknown> = { action }
+  if (target !== undefined) args.target = target
+  return await modelTool(harness).execute(args, { agent: { session: { id: sessionId } } })
 }
 
 test('the channel note never precedes the request in what the namer sees', async () => {
@@ -1623,6 +1735,205 @@ test('the confirmation policy travels in the tool description and follows the se
     },
     { requireConfirmation: false },
   )
+})
+
+test('/model lists every model, numbered, with the one in use marked', async () => {
+  await withSettings(async (harness) => {
+    await harness.runtime.ingest(inbound('第一条'))
+    const promptsBefore = harness.prompted.length
+
+    await harness.runtime.ingest(inbound('/model'))
+
+    assert.equal(harness.prompted.length, promptsBefore, 'a command must not reach the agent')
+    const body = harness.sent.at(-1)?.text ?? ''
+    // The heading names the model in use, so the answer to "which one am I on" does not depend on
+    // the user scanning the rows for the marker.
+    assert.match(body, /可用模型（共 3 个，当前：DeepSeek V3\.2）：/)
+    // Rows in catalog order, numbered the way the user has to reply.
+    const rows = body.split('\n').filter((line) => /^\d+\. /.test(line))
+    assert.deepEqual(
+      rows.map((row) => row.replace('  ← 当前', '')),
+      ['1. DeepSeek V3.2', '2. DeepSeek Reasoner', '3. Qwen3 Coder'],
+    )
+    assert.equal(body.match(/← 当前/g)?.length, 1, 'exactly one model is marked current')
+    assert.match(body, /1\. DeepSeek V3\.2 {2}← 当前/)
+    /*
+     * The provider and the id sit on the second line of each row.
+     *
+     * Two providers can offer the same model id, and the id is what a user may end up typing, so a
+     * row that showed only the label would be ambiguous in exactly the case that matters.
+     */
+    assert.match(body, /DeepSeek 官方 · deepseek-chat/)
+    assert.match(body, /OpenRouter · qwen3-coder/)
+    assert.match(body, /回复 \/model 编号即可切换/)
+  })
+})
+
+test('/model switches by name, on the session the conversation is bound to', async () => {
+  await withSettings(async (harness) => {
+    await harness.runtime.ingest(inbound('第一条'))
+    const sessionId = harness.prompted[0]?.sessionId
+
+    await harness.runtime.ingest(inbound('/model DeepSeek Reasoner'))
+
+    /*
+     * The selection is addressed by session id rather than resolved from the caller.
+     *
+     * The person switching is on a phone and is not inside any session; the session that has to
+     * change is the one their conversation is bound to.
+     */
+    assert.deepEqual(harness.modelSelections, [
+      {
+        sessionId,
+        provider: 'deepseek-account',
+        model: 'deepseek-reasoner',
+        // A reasoning model has to be selected at a level, and the model's own default is what the
+        // host itself would pick — so the user is not silently handed a different one.
+        reasoningEffort: 'medium',
+      },
+    ])
+    const confirmation = harness.sent.at(-1)?.text ?? ''
+    assert.match(confirmation, /^已把「.+」切换到 DeepSeek Reasoner（DeepSeek 官方）。/)
+    // The id follows the label, because the id is what the user can type back.
+    assert.match(confirmation, /deepseek-reasoner/)
+  })
+})
+
+test('/model switches by the number the list printed', async () => {
+  await withSettings(async (harness) => {
+    await harness.runtime.ingest(inbound('第一条'))
+
+    await harness.runtime.ingest(inbound('/model 3'))
+
+    // Row 3 in the catalog is the other provider's model, so a number reaching the wrong row would
+    // land on the wrong provider and still look like a success.
+    assert.deepEqual(
+      harness.modelSelections.map((entry) => `${entry.provider}/${entry.model}`),
+      ['openrouter/qwen3-coder'],
+    )
+    assert.match(harness.sent.at(-1)?.text ?? '', /切换到 Qwen3 Coder（OpenRouter）/)
+  })
+})
+
+test('/model with a name that does not exist changes nothing and says so', async () => {
+  await withSettings(async (harness) => {
+    await harness.runtime.ingest(inbound('第一条'))
+
+    await harness.runtime.ingest(inbound('/model GPT-9'))
+
+    const reply = harness.sent.at(-1)?.text ?? ''
+    // Named back, and the next step spelled out — the user cannot tell a missing model from a
+    // differently spelled one without being shown the list.
+    assert.match(reply, /找不到模型「GPT-9」/)
+    assert.match(reply, /回复 \/model 看清单/)
+    assert.deepEqual(harness.modelSelections, [], 'nothing was selected')
+  })
+})
+
+test('the model tool offers the two actions a user can ask for', async () => {
+  await withSettings(async (harness) => {
+    const tool = modelTool(harness)
+    const action = (tool.parameters.properties as Record<string, { enum?: string[] }>).action
+    // The enum is what the model chooses from, so an action missing here is unreachable.
+    assert.deepEqual(action?.enum, ['list', 'switch'])
+    assert.deepEqual(tool.parameters.required, ['action'])
+    // The description is the only thing that decides whether a spoken request reaches this tool.
+    assert.match(tool.description, /Call this whenever the user asks/)
+    assert.match(tool.description, /换个模型/)
+    assert.match(tool.description, /Never tell the user a model switch succeeded/)
+  })
+})
+
+test('the model tool switches, and the channel tells the user', async () => {
+  await withSettings(async (harness) => {
+    await harness.runtime.ingest(inbound('第一条'))
+    const before = harness.sent.length
+
+    const result = await controlModel(harness, 'switch', 'Qwen3 Coder')
+
+    assert.equal(result.ok, true, `switch failed: ${result.detail}`)
+    assert.deepEqual(
+      harness.modelSelections.map((entry) => `${entry.provider}/${entry.model}`),
+      ['openrouter/qwen3-coder'],
+    )
+    /*
+     * Exactly one message, sent by the channel.
+     *
+     * A tool result is only ever shown to the agent, so leaving the confirmation to it is what
+     * produced replies pointing at a message that never existed. And the agent is told not to repeat
+     * it, so the user is not told twice.
+     */
+    assert.equal(harness.sent.length, before + 1, 'exactly one message was sent')
+    assert.match(harness.sent.at(-1)?.text ?? '', /切换到 Qwen3 Coder/)
+    assert.match(result.detail, /不要重复/)
+  })
+})
+
+test('the model tool lists models and hands the listing to the channel', async () => {
+  await withSettings(async (harness) => {
+    await harness.runtime.ingest(inbound('第一条'))
+    const before = harness.sent.length
+
+    const result = await controlModel(harness, 'list')
+
+    assert.equal(result.ok, true)
+    assert.equal(harness.sent.length, before + 1)
+    const body = harness.sent.at(-1)?.text ?? ''
+    assert.match(body, /可用模型（共 3 个/)
+    assert.match(body, /← 当前/)
+    assert.match(result.detail, /不要重复/)
+  })
+})
+
+test('a model switch that fails is reported, because the agent may claim it worked', async () => {
+  await withSettings(async (harness) => {
+    await harness.runtime.ingest(inbound('第一条'))
+    const before = harness.sent.length
+
+    const result = await controlModel(harness, 'switch', 'GPT-9')
+
+    // The command answers with guidance rather than throwing, so the result has to be read rather
+    // than assumed — otherwise the agent tells the user about a model the next turn is not using.
+    assert.equal(result.ok, false)
+    assert.match(result.detail, /找不到模型/)
+    // The user is told directly, which is the only thing that makes the agent's silence safe.
+    assert.equal(harness.sent.length, before + 1)
+    assert.match(harness.sent.at(-1)?.text ?? '', /找不到模型「GPT-9」/)
+  })
+})
+
+test('the model tool refuses an unknown action and a switch with no target', async () => {
+  await withSettings(async (harness) => {
+    await harness.runtime.ingest(inbound('第一条'))
+    const promptsBefore = harness.prompted.length
+    const selectionsBefore = harness.modelSelections.length
+
+    // An action this plugin does not have must fail here rather than being turned into some other
+    // slash command that happens to start with a slash.
+    const unknown = await controlModel(harness, 'new')
+    assert.equal(unknown.ok, false)
+    assert.match(unknown.detail, /不支持的操作/)
+
+    // A switch with no target would otherwise list the models and report success, which reads as a
+    // switch that happened.
+    const targetless = await controlModel(harness, 'switch')
+    assert.equal(targetless.ok, false)
+    assert.match(targetless.detail, /需要指定目标/)
+
+    assert.equal(harness.prompted.length, promptsBefore, 'neither attempt starts a turn')
+    assert.equal(harness.modelSelections.length, selectionsBefore)
+  })
+})
+
+test('the model tool refuses when the caller is not bound to a WeChat conversation', async () => {
+  await withSettings(async (harness) => {
+    const result = await modelTool(harness).execute(
+      { action: 'list' },
+      { agent: { session: { id: 'session-not-ours' } } },
+    )
+    assert.equal(result.ok, false)
+    assert.match(result.detail, /没有绑定/)
+  })
 })
 
 /**
