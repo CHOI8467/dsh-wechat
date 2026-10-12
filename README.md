@@ -162,11 +162,13 @@ Type these to control which DSH conversation you are talking to:
 | Command | What it does |
 |---|---|
 | `/new` | Start a fresh conversation. Anything after it becomes the title: `/new 修复登录` starts a conversation called 「修复登录」. Without one, the conversation gets a name from your first message |
-| `/list` | Conversations in the WeChat workspace only, grouped by workspace, newest first (up to 10 rows) |
-| `/list all` | Every conversation, grouped by workspace too — at most 3 rows per workspace and 12 in total, with the number left out printed at the end |
-| `/switch 3` | Move to number 3 in that list |
+| `/list` | This workspace's conversations — it opens that level directly (up to 10 rows per screen) |
+| `/list all` | The **workspaces** on this machine, one row each with its conversation count. Reply with a number or a name to enter one |
+| `/switch 3` | Move to number 3 on that screen |
 | `/switch e716f0` | Move by the **short id printed at the end of the row** — independent of numbering, so it never goes stale |
-| quote the list, then `/switch 3` | Move to number 3 **of that listing**, frozen in the message you quoted |
+| `查看其余` | The next ten rows, at either level, all the way to the end. Numbers run on across screens (1–10, then 11–20) |
+| reply `3`, a name, or a row's short id | Works with the listing on screen — no `/switch` needed |
+| quote the list, then `/switch 3` | Move to number 3 **of that screen**, frozen in the message you quoted |
 | `/model` | List the models, marking the one in use |
 | `/model 2` | Switch to number 2, or send a model name instead |
 | `/current` | Which conversation you are in |
@@ -177,8 +179,14 @@ Type these to control which DSH conversation you are talking to:
 
 **Numbers go stale.** Conversations run while you read the list, so by the time you reply "3" the third
 row may be a different one. That is why every row ends with a short id of **at most six characters** —
-`/switch` takes that instead — and why quoting the listing and replying with a number resolves against
-the numbers *that message* printed.
+which a reply or `/switch` takes directly — and why quoting a listing and replying with a number
+resolves against the numbers *that screen* printed.
+
+**The list is two levels, ten rows at a time.** `/list` opens this workspace's conversations; `/list
+all` opens the workspaces on the machine, and you enter one by number or by name. Either level pages
+with `查看其余`, numbering runs on across screens (1–10, then 11–20), and the last screen says so
+instead of offering a step that does nothing. Entering a workspace only moves where you are browsing —
+it does not move your conversation, which still takes a second reply inside it.
 
 **Plain language works too** — "switch to the other one", "what conversations do I have", "stop". The
 agent judges the intent rather than matching fixed rules, and a switch tells you whether it succeeded
@@ -231,7 +239,7 @@ pnpm install
 pnpm build              # compiles only, leaving @dsh-wechat/core imports for pack to rewrite
 pnpm run dist           # build + inline core: the loadable form a Git install needs
 pnpm typecheck
-pnpm test               # 253 tests
+pnpm test               # 264 tests
 pnpm check              # build + typecheck + test
 pnpm run pack           # run dist first
 pnpm run verify-pack    # unpack, check the manifest's files, mount it as DSH would

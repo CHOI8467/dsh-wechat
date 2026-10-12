@@ -51,16 +51,55 @@ export interface ListedSession extends NumberedSession {
    * Working directory the session belongs to, when the channel knows it.
    *
    * Absent means "this workspace's own", which is the only thing a conversation can vouch for — see
-   * {@link groupSessionRows}.
+   * {@link sessionFolders}.
    */
   workspace?: string
 }
 
-/** One workspace's rows, in the order the listing prints them. */
-export interface SessionGroup {
-  /** Heading printed above this workspace's rows. */
+/**
+ * The rows a numbering printed, and the number printed beside the first of them.
+ *
+ * The pair travels together because a number is only meaningful with its offset: numbering runs on
+ * across screens, so a second screen of ten starts at 11, and a reply of "13" read from row 1 would
+ * name a conversation the user never saw.
+ */
+export interface NumberedRows {
+  sessions: NumberedSession[]
+  /** 1-based number printed beside `sessions[0]`. 1 on a first screen, 11 on the second of ten. */
+  first: number
+}
+
+/**
+ * Where a conversation is in the two-level browser.
+ *
+ * Persisted because 「查看其余」 carries no target: it means "the next ten of what I am looking at",
+ * and this is the only record of what that is. Keyed per conversation, because one plugin serves
+ * several chats.
+ */
+export interface BrowsePosition {
+  /** `folders` is the workspace list; `sessions` is one workspace's conversations. */
+  level: 'folders' | 'sessions'
+  /** Directory whose conversations are shown at the `sessions` level; `''` is the channel's own. */
+  workspace: string
+  /** 1-based screen last shown. */
+  page: number
+  /** When it was last advanced, so an abandoned position can be retired. */
+  at: number
+}
+
+/**
+ * One workspace as the first level of the browser lists it.
+ *
+ * A folder rather than a row: the first level answers "which project", not "which conversation", and
+ * a conversation is only reachable after one has been chosen.
+ */
+export interface SessionFolder {
+  /** Absolute directory; `''` for the channel's own workspace. */
+  path: string
+  /** Name printed in the list and accepted back when entering. */
   label: string
-  sessions: ListedSession[]
+  /** Conversations inside, so the user can tell a project they work in from one they do not. */
+  count: number
 }
 
 /** Why the router handed work to the agent, for logging. */
@@ -86,7 +125,14 @@ export type RouteResult =
        * the numbering over here is what lets a quote pin the numbers the user is looking at, instead
        * of re-deriving them from sessions that have moved on since.
        */
-      numbered?: NumberedSession[]
+      numbered?: NumberedRows
+      /**
+       * Where this reply left the conversation in the browser, when it was a screen of a listing.
+       *
+       * Absent everywhere else, which is the signal to forget any position: a listing is a place the
+       * user is standing, and every other outcome means they walked away from it.
+       */
+      browse?: BrowsePosition
     }
   | { kind: 'prompt'; decision: RouteDecision }
 
@@ -143,7 +189,7 @@ export interface SessionGateway {
   /** Hand a prompt to a session. */
   prompt(sessionId: string, text: string): Promise<void>
   /**
-   * Recent sessions, newest first, for `/list all`.
+   * Recent sessions, newest first, for the whole-machine levels of the browser.
    *
    * Each row should carry its `workspace` so the listing can group by it. A row without one is
    * treated as belonging to the channel's own workspace.
@@ -235,6 +281,8 @@ export class SessionRouter {
    *   user is looking at — a quoted list, or the newest one sent into this conversation.
    * @param params.heldHint - Wording for the "there are more conversations elsewhere" sentence, which
    *   differs between a typed `/list` and a spoken request.
+   * @param params.browse - Where this conversation was left in the listing browser, when it is
+   *   somewhere. Without it a bare number is an ordinary message, as it always was.
    * @returns Either text to reply with directly, or a prompt for a session.
    */
   async route(params: {
@@ -242,13 +290,27 @@ export class SessionRouter {
     accountId: string
     peerId: string
     text: string
-    numbered?: readonly NumberedSession[]
+    numbered?: NumberedRows
     heldHint?: string
+    browse?: BrowsePosition
   }): Promise<RouteResult> {
     const text = params.text.trim()
 
     if (text.startsWith('/')) {
       return await this.#command(params, text)
+    }
+
+    /*
+     * A reply to a listing is answered here, before the agent is woken.
+     *
+     * It has to be, because the browsing position is the channel's own bookkeeping: the agent sees
+     * "2" and has no way to know whether that means a folder, a conversation, or the answer to
+     * something it asked. The router does know, so it decides — and returns nothing when the message
+     * is not a step at all, which keeps an ordinary remark during a listing on its way to the agent.
+     */
+    if (params.browse !== undefined && text !== '') {
+      const browsed = await this.#browseReply(params, text, params.browse)
+      if (browsed !== undefined) return browsed
     }
 
     const bindings = await this.#load()
@@ -282,7 +344,7 @@ export class SessionRouter {
       conversationId: string
       accountId: string
       peerId: string
-      numbered?: readonly NumberedSession[]
+      numbered?: NumberedRows
       heldHint?: string
     },
     text: string,
@@ -308,97 +370,73 @@ export class SessionRouter {
 
       case '/list': {
         /*
-         * The default list is this workspace's own conversations only; `/list all` adds the rest, and
-         * both are grouped by the workspace each conversation lives in.
+         * Two levels, one screen of ten at a time.
          *
-         * Grouping is read rather than inferred: a flat list of eighty conversations from six
-         * projects says nothing about which is which, and the number the user replies with has to
-         * identify a row they can actually see.
+         * The list used to be a single flattened table with a cut across it, and a cut is a dead end:
+         * whatever fell past row ten existed but could not be reached, and the sentence that counted
+         * it was the only sign it was there. So the first level lists the workspaces and the second
+         * lists one workspace's conversations, and 「查看其余」 walks either level ten rows at a time.
+         * Both levels number continuously across screens, because the number is what the user replies
+         * with and it has to keep meaning one row for as long as they are reading.
          *
-         * "Only", not "first": the rest are held back and counted, with the sentence that says how to
-         * see them. A user who is never told cannot ask.
-         *
-         * `/list all` is cut per workspace, never globally — see {@link LIST_ALL_GROUP_LIMIT}. A single
-         * global cut is what made this command useless: this workspace is the busiest one, so the ten
-         * rows were all its own, grouping then produced a single heading, and the reply was
-         * indistinguishable from plain `/list`.
+         * `/list` opens this workspace's own conversations directly — that is the listing people
+         * actually want, and making them choose a folder to reach it would be a step for nothing.
+         * `/list all` opens the workspace list, which is the only way to reach the rest.
          */
         const all = await this.#gateway.listSessions()
         const own = await this.#ownSessions(all)
-        const wantsAll = args.trim().toLowerCase() === 'all'
-        const rows = wantsAll ? all : own
-        const ownIds = new Set(own.map((session) => session.sessionId))
-        const held = wantsAll ? [] : all.filter((session) => !ownIds.has(session.sessionId))
-        if (rows.length === 0 && held.length === 0) {
-          return { kind: 'reply', text: '还没有任何对话，直接发消息就会新建一个。' }
+        const currentId = bindings[params.conversationId]?.sessionId
+        const now = Date.now()
+
+        if (args.trim().toLowerCase() === 'all') {
+          const folders = this.#folders(all)
+          if (folders.length === 0) {
+            return { kind: 'reply', text: '还没有任何对话，直接发消息就会新建一个。' }
+          }
+          return {
+            kind: 'reply',
+            text: renderFolderScreen(folders, 1),
+            browse: { level: 'folders', workspace: '', page: 1, at: now },
+          }
         }
-        if (rows.length === 0) {
+
+        if (own.length === 0) {
+          const ownIds = new Set(own.map((session) => session.sessionId))
+          const held = all.filter((session) => !ownIds.has(session.sessionId))
+          if (held.length === 0) {
+            return { kind: 'reply', text: '还没有任何对话，直接发消息就会新建一个。' }
+          }
+          /*
+           * Nothing to page through, so no position is left behind: 「查看其余」 would have no second
+           * screen to show, and a position that only ever answers "已经到底了" is worse than none.
+           */
           return { kind: 'reply', text: heldOnlyList(held, this.#ownWorkspaceLabel) }
         }
 
-        const groups = groupSessionRows(rows, {
-          ...(this.#ownWorkspace === undefined ? {} : { ownWorkspace: this.#ownWorkspace }),
-          ownLabel: this.#ownWorkspaceLabel,
-          ...(wantsAll ? { limit: LIST_ALL_LIMIT, groupLimit: LIST_ALL_GROUP_LIMIT } : {}),
+        const screen = renderSessionScreen(this.#rowsIn('', all, own), {
+          label: this.#ownWorkspaceLabel,
+          page: 1,
+          ...(currentId === undefined ? {} : { currentId }),
+          ...this.#heldHintFor(own, all, params.heldHint),
         })
-        const numbered = flattenSessionGroups(groups)
-        const text = renderSessionList(groups, bindings[params.conversationId]?.sessionId, {
-          total: rows.length + held.length,
-          ...(held.length === 0 ? {} : { held: { count: held.length, names: heldNames(held) } }),
-          ...(params.heldHint === undefined ? {} : { heldHint: params.heldHint }),
-          ...(wantsAll ? { groupLimit: LIST_ALL_GROUP_LIMIT } : {}),
-        })
-        return { kind: 'reply', text, numbered }
+        return {
+          kind: 'reply',
+          text: screen.text,
+          numbered: screen.numbered,
+          browse: { level: 'sessions', workspace: '', page: 1, at: now },
+        }
       }
 
       case '/switch': {
+        // Shared with a reply inside a folder, so a number, an id and a name mean the same thing
+        // whichever way they were typed.
+        const switched = await this.#switchTo(params, args, { mode: 'command' })
         /*
-         * A number is read against the listing the user was shown, never re-derived from live
-         * sessions.
-         *
-         * That is the whole point of the numbering: sessions run while the user reads the list, so a
-         * number resolved against "whatever is newest now" can land somewhere else entirely. The
-         * caller passes the rows a quote pinned, or the newest listing this conversation received;
-         * only when it knows of neither does this fall back to the live list.
+         * `mode: 'command'` answers every outcome, so this fallback is unreachable — it exists to say
+         * so in the types rather than with an assertion, because a future change that let a command
+         * resolve to nothing would otherwise become silence instead of a message.
          */
-        const all = await this.#gateway.listSessions()
-        const own = await this.#ownSessions(all)
-        const pinned = params.numbered !== undefined && params.numbered.length > 0 ? [...params.numbered] : []
-        /*
-         * Ordered here rather than trusted from the gateway: the number the user typed refers to a
-         * position in a listing, and a listing is ordered by this file. A gateway that happens to hand
-         * its rows over in directory order would otherwise make the same number mean two different
-         * things depending on whether a list was shown first.
-         */
-        const pool = pinned.length > 0 ? pinned : [...own].sort(compareSessionsNewestFirst)
-        // Ids and titles stay searchable across everything the machine knows, so a session named
-        // rather than numbered is still reachable — including one that only a pinned listing knows.
-        const known = new Map<string, NumberedSession>(
-          all.map((session) => [session.sessionId, session]),
-        )
-        for (const session of pinned) if (!known.has(session.sessionId)) known.set(session.sessionId, session)
-        const searchable = [...known.values()]
-        const resolution = resolveTarget(args, searchable, pool)
-        if (resolution.kind === 'ambiguous') {
-          return { kind: 'reply', text: ambiguousTargetMessage(args.trim(), resolution.candidates) }
-        }
-        if (resolution.kind === 'none') {
-          return { kind: 'reply', text: '找不到这个对话。回复 /list 看清单，再回复数字或 id。' }
-        }
-        const target = resolution.session
-        await this.#gateway.ensureSession(target.sessionId, target.title)
-        const binding: SessionBinding = {
-          conversationId: params.conversationId,
-          accountId: params.accountId,
-          peerId: params.peerId,
-          sessionId: target.sessionId,
-          title: target.title || this.#titlePrefix,
-          createdAt: bindings[params.conversationId]?.createdAt ?? Date.now(),
-          lastUsedAt: Date.now(),
-        }
-        bindings[params.conversationId] = binding
-        await this.#store.save(bindings)
-        return { kind: 'reply', text: `已切换到「${binding.title}」。\n${shortId(binding.sessionId)}` }
+        return switched ?? { kind: 'reply', text: UNKNOWN_TARGET }
       }
 
       case '/model': {
@@ -521,6 +559,273 @@ export class SessionRouter {
   async #ownSessions(fallback: ListedSession[]): Promise<ListedSession[]> {
     return (await this.#gateway.listOwnSessions?.()) ?? fallback
   }
+
+  /** The workspaces this machine has conversations in, in the order the first level prints them. */
+  #folders(rows: readonly ListedSession[]): SessionFolder[] {
+    return sessionFolders(rows, {
+      ...(this.#ownWorkspace === undefined ? {} : { ownWorkspace: this.#ownWorkspace }),
+      ownLabel: this.#ownWorkspaceLabel,
+    })
+  }
+
+  /** Whether a folder is the channel's own workspace. */
+  #isOwnFolder(path: string): boolean {
+    if (path === '') return true
+    return this.#ownWorkspace !== undefined && isSameWorkspace(path, this.#ownWorkspace)
+  }
+
+  /**
+   * The conversations inside one folder, newest first.
+   *
+   * The own workspace is asked for by name rather than filtered out of the whole-machine list, so a
+   * gateway that reports the two separately cannot have its own rows go missing here.
+   *
+   * Sorted here rather than trusted from the gateway, for the same reason `/switch` sorts its own
+   * pool: the number a reply uses is a position in *this* order, and a gateway that handed its rows
+   * over in directory order would make the same number mean two different things depending on which
+   * listing it came from.
+   *
+   * @param path - Folder directory, `''` for the channel's own.
+   * @param all - Every conversation the machine knows.
+   * @param own - The channel's own conversations.
+   * @returns Its rows, newest first.
+   */
+  #rowsIn(path: string, all: readonly ListedSession[], own: readonly ListedSession[]): ListedSession[] {
+    const rows = this.#isOwnFolder(path)
+      ? own
+      : all.filter(
+          (session) => session.workspace !== undefined && isSameWorkspace(session.workspace, path),
+        )
+    return [...rows].sort(compareSessionsNewestFirst)
+  }
+
+  /** The name a folder is printed and recognised by. */
+  #folderLabel(path: string): string {
+    if (this.#isOwnFolder(path)) return this.#ownWorkspaceLabel
+    return workspaceLabel(path) || path
+  }
+
+  /**
+   * The sentence a folder screen adds about the conversations it cannot show.
+   *
+   * Only the channel's own folder gets one: the user asked for this workspace's conversations and
+   * the rest are somewhere they did not ask about, so they are counted and named rather than left
+   * invisible. Inside another folder the same sentence would be noise — that is the folder they
+   * chose, and its contents are what they are looking at.
+   *
+   * @param own - The channel's own conversations.
+   * @param all - Every conversation the machine knows.
+   * @param hint - Caller's wording for reaching the rest, which differs between typed and spoken.
+   */
+  #heldHintFor(
+    own: readonly ListedSession[],
+    all: readonly ListedSession[],
+    hint: string | undefined,
+  ): { held?: { count: number; names?: readonly string[] }; heldHint?: string } {
+    const ownIds = new Set(own.map((session) => session.sessionId))
+    const held = all.filter((session) => !ownIds.has(session.sessionId))
+    if (held.length === 0) return {}
+    return {
+      held: { count: held.length, names: heldNames(held) },
+      ...(hint === undefined ? {} : { heldHint: hint }),
+    }
+  }
+
+  /**
+   * Answer a message from a conversation that is part-way through a listing.
+   *
+   * 「查看其余」 has no target, so it can only be understood against where the user is standing —
+   * which is the whole reason the position is persisted. A number or a name is read as a step in the
+   * level they are on: a workspace at the first, a conversation at the second.
+   *
+   * Returns nothing when the message is not a step. That is deliberate and load-bearing: a remark
+   * typed while a listing is on screen — a question, an instruction, an answer to something the
+   * agent asked — has to reach the agent, so the browser only claims what it can actually resolve.
+   *
+   * @param params - The routing parameters, for the numbering and the caller's held wording.
+   * @param text - The message, already trimmed.
+   * @param position - Where the conversation is in the browser.
+   * @returns A reply with the new position, or undefined when this is not a step.
+   */
+  async #browseReply(
+    params: {
+      conversationId: string
+      accountId: string
+      peerId: string
+      numbered?: NumberedRows
+      heldHint?: string
+    },
+    text: string,
+    position: BrowsePosition,
+  ): Promise<RouteResult | undefined> {
+    const bindings = await this.#load()
+    const all = await this.#gateway.listSessions()
+    const own = await this.#ownSessions(all)
+    const currentId = bindings[params.conversationId]?.sessionId
+    const now = Date.now()
+
+    if (position.level === 'folders') {
+      const folders = this.#folders(all)
+      if (isShowRest(text)) {
+        const { pages } = browsePage(folders, position.page)
+        if (position.page >= pages) {
+          return {
+            kind: 'reply',
+            text: `会话夹只有 ${String(pages)} 页，已经到底了。\n回复编号或名字进入。`,
+            // Kept, not cleared: nothing changed, and the user is plainly still reading.
+            browse: position,
+          }
+        }
+        return {
+          kind: 'reply',
+          text: renderFolderScreen(folders, position.page + 1),
+          browse: { ...position, page: position.page + 1, at: now },
+        }
+      }
+
+      const resolution = resolveFolder(text, folders)
+      if (resolution.kind === 'ambiguous') {
+        return {
+          kind: 'reply',
+          text: ambiguousFolderMessage(text, resolution.candidates, folders),
+          browse: position,
+        }
+      }
+      if (resolution.kind === 'none') return undefined
+
+      const folder = resolution.folder
+      const rows = this.#rowsIn(folder.path, all, own)
+      const screen = renderSessionScreen(rows, {
+        label: folder.label,
+        page: 1,
+        ...(currentId === undefined ? {} : { currentId }),
+        ...(this.#isOwnFolder(folder.path) ? this.#heldHintFor(own, all, params.heldHint) : {}),
+      })
+      return {
+        kind: 'reply',
+        text: screen.text,
+        numbered: screen.numbered,
+        browse: { level: 'sessions', workspace: folder.path, page: 1, at: now },
+      }
+    }
+
+    const rows = this.#rowsIn(position.workspace, all, own)
+    if (isShowRest(text)) {
+      const { pages } = browsePage(rows, position.page)
+      if (position.page >= pages) {
+        return {
+          kind: 'reply',
+          text: `【${this.#folderLabel(position.workspace)}】只有 ${String(pages)} 页，已经到底了。\n回复编号或行尾 6 位 id 切换。`,
+          browse: position,
+        }
+      }
+      const currentId = bindings[params.conversationId]?.sessionId
+      const screen = renderSessionScreen(rows, {
+        label: this.#folderLabel(position.workspace),
+        page: position.page + 1,
+        ...(currentId === undefined ? {} : { currentId }),
+        ...(this.#isOwnFolder(position.workspace)
+          ? this.#heldHintFor(own, all, params.heldHint)
+          : {}),
+      })
+      return {
+        kind: 'reply',
+        text: screen.text,
+        numbered: screen.numbered,
+        browse: { ...position, page: position.page + 1, at: now },
+      }
+    }
+
+    /*
+     * Anything else is read the way `/switch` reads a target, so a number, a trailing id and a name
+     * all work and both routes resolve identically.
+     *
+     * The screen is passed as the last resort for a number, so a reply still works if the listing it
+     * answers was never frozen — a state write that failed, say. The numbering the caller supplies
+     * wins when it has one, because that is the numbering the user is actually looking at.
+     */
+    return await this.#switchTo(params, text, {
+      mode: 'reply',
+      fallback: screenRows(rows, position.page),
+    })
+  }
+
+  /**
+   * Move this conversation to the session an argument names.
+   *
+   * Shared by `/switch` and by a reply inside a folder: one resolver, so a number cannot mean one
+   * thing to the typed command and another to a reply.
+   *
+   * @param params - The routing parameters.
+   * @param args - What the user typed or replied with.
+   * @param options.mode - `command` answers a failure with guidance; `reply` returns nothing instead,
+   *   so a message that merely failed to name a conversation still reaches the agent.
+   * @param options.fallback - Numbering to read a number against when the caller has no frozen one.
+   * @returns The confirmation, or undefined when nothing resolved and the caller asked to stay quiet.
+   */
+  async #switchTo(
+    params: { conversationId: string; accountId: string; peerId: string; numbered?: NumberedRows },
+    args: string,
+    options: { mode: 'command' | 'reply'; fallback?: NumberedRows },
+  ): Promise<RouteResult | undefined> {
+    /*
+     * A number is read against the listing the user was shown, never re-derived from live sessions.
+     *
+     * That is the whole point of the numbering: sessions run while the user reads the list, so a
+     * number resolved against "whatever is newest now" can land somewhere else entirely. The caller
+     * passes the rows a quote pinned, or the newest listing this conversation received; only when it
+     * knows of neither does this fall back to the live list.
+     */
+    const bindings = await this.#load()
+    const all = await this.#gateway.listSessions()
+    const own = await this.#ownSessions(all)
+    const pinned =
+      params.numbered !== undefined && params.numbered.sessions.length > 0
+        ? params.numbered
+        : options.fallback
+    /*
+     * Ordered here rather than trusted from the gateway: the number the user typed refers to a
+     * position in a listing, and a listing is ordered by this file. A gateway that happens to hand its
+     * rows over in directory order would otherwise make the same number mean two different things
+     * depending on whether a list was shown first.
+     */
+    const pool: NumberedRows =
+      pinned !== undefined && pinned.sessions.length > 0
+        ? pinned
+        : { sessions: [...own].sort(compareSessionsNewestFirst), first: 1 }
+    // Ids and titles stay searchable across everything the machine knows, so a session named rather
+    // than numbered is still reachable — including one that only a pinned listing knows.
+    const known = new Map<string, NumberedSession>(all.map((session) => [session.sessionId, session]))
+    for (const session of pool.sessions) {
+      if (!known.has(session.sessionId)) known.set(session.sessionId, session)
+    }
+    const searchable = [...known.values()]
+    const resolution = resolveTarget(args, searchable, pool)
+    if (resolution.kind === 'ambiguous') {
+      if (options.mode === 'reply') return undefined
+      return { kind: 'reply', text: ambiguousTargetMessage(args.trim(), resolution.candidates) }
+    }
+    if (resolution.kind === 'none') {
+      if (options.mode === 'reply') return undefined
+      return { kind: 'reply', text: UNKNOWN_TARGET }
+    }
+    const target = resolution.session
+    await this.#gateway.ensureSession(target.sessionId, target.title)
+    const binding: SessionBinding = {
+      conversationId: params.conversationId,
+      accountId: params.accountId,
+      peerId: params.peerId,
+      sessionId: target.sessionId,
+      title: target.title || this.#titlePrefix,
+      createdAt: bindings[params.conversationId]?.createdAt ?? Date.now(),
+      lastUsedAt: Date.now(),
+    }
+    bindings[params.conversationId] = binding
+    await this.#store.save(bindings)
+    // No `browse`: the reply names a conversation that is now in use, so the listing it came from is
+    // finished with and the next 「查看其余」 must not continue it.
+    return { kind: 'reply', text: `已切换到「${binding.title}」。\n${shortId(binding.sessionId)}` }
+  }
 }
 
 /** Commands that may be written with or without an argument. */
@@ -568,6 +873,9 @@ export function splitCommand(text: string): { command: string; args: string } {
   return { command: lower, args: '' }
 }
 
+/** What a `/switch` and a reply inside a folder both say when nothing matched. */
+const UNKNOWN_TARGET = '找不到这个对话。回复 /list 看清单，再回复数字或 id。'
+
 /**
  * What a `/switch` argument resolved to.
  *
@@ -597,16 +905,19 @@ export type TargetResolution =
  *
  * @param args - What the user typed after `/switch`.
  * @param sessions - Every session that may be named, usually the whole machine.
- * @param numbered - The rows a number refers to, when they differ from `sessions`.
+ * @param numbered - The rows a number refers to, and the number printed beside the first of them.
  *
  *   This matters because the two are not the same list. A number is answered from the listing the
  *   user was actually shown, while a title or id may name a session from any workspace — and a
  *   conversation the user picked out of a listing has to be switchable, or the listing is a lie.
+ *   The offset is part of it because numbering runs on across screens: the second screen of ten
+ *   prints 11..20, and a "13" read as row 3 would move the chat to a conversation that screen never
+ *   showed.
  */
 export function resolveTarget(
   args: string,
   sessions: readonly NumberedSession[],
-  numbered: readonly NumberedSession[] = sessions,
+  numbered: NumberedRows = { sessions: [...sessions], first: 1 },
 ): TargetResolution {
   const value = args.trim()
   if (!value) return { kind: 'none' }
@@ -614,9 +925,16 @@ export function resolveTarget(
   if (/^\d+$/.test(value)) {
     // A number refers to a row of the listing the user was shown, which is not necessarily the whole
     // machine — hence `numbered` rather than `sessions`.
-    const byIndex = numbered[Number(value) - 1]
+    const index = Number(value) - numbered.first
+    const byIndex = index < 0 ? undefined : numbered.sessions[index]
     if (byIndex !== undefined) return { kind: 'found', session: byIndex }
-    // Fall through: a numeric string can still be a title.
+    /*
+     * Fall through: a numeric string can still be a title or an id.
+     *
+     * A number *below* the screen's first one is not silently folded onto row 1 — numbering runs on,
+     * so "3" on a screen that starts at 11 is a number from a screen the user has scrolled past, and
+     * guessing which row they meant is exactly the drift the pin exists to prevent.
+     */
   }
 
   const exactId = sessions.find((session) => session.sessionId === value)
@@ -800,30 +1118,295 @@ export function resolveModelOption(
   return undefined
 }
 
-/** How many rows the list shows. Beyond this, older sessions are out of reach by number. */
-const LIST_LIMIT = 10
+/**
+ * How many rows one screen of the browser shows, at both levels.
+ *
+ * Ten, because that is what a phone screen holds and what the listing already showed. The point of
+ * two levels is not to fit more on one screen but to make every conversation reachable without ever
+ * printing more than a readable amount at once — which is what the old fixed cut could not do.
+ */
+export const BROWSE_PAGE_SIZE = 10
+
+/** The phrase that walks one screen further down whichever level the user is on. */
+export const SHOW_REST = '查看其余'
 
 /**
- * How many rows one workspace gets when `/list all` lists the whole machine.
+ * Whether a message is the phrase that walks to the next screen.
  *
- * A share per workspace rather than one cut over everything, because the cut used to be applied
- * *before* the rows were grouped: the channel's own workspace is almost always the most recently
- * active one, so a global top ten went to it in full and every other workspace disappeared. `/list all`
- * then printed exactly what `/list` prints — one heading, the same rows — and the user had no way to
- * tell that other workspaces existed at all. A per-workspace share makes several headings a property
- * of the listing rather than a coincidence of who happened to be busy.
+ * Trailing sentence punctuation is stripped because a phone keyboard adds it and the user is writing
+ * a sentence, not typing a token. Nothing else is accepted: this phrase has no target, so a near miss
+ * that was guessed at would move the user somewhere they did not ask to go.
+ *
+ * @param text - The inbound message.
  */
-export const LIST_ALL_GROUP_LIMIT = 3
+export function isShowRest(text: string): boolean {
+  return text.trim().replace(/[。．.!！?？]+$/, '') === SHOW_REST
+}
 
 /**
- * Ceiling on `/list all` in total.
+ * Group rows into the folders the first level lists.
  *
- * The share alone is not a bound: ten workspaces at three rows each is thirty rows, and a WeChat
- * message is read on a phone. Four workspaces' worth is about the length of the ten rows it replaces,
- * so listing everything costs the user no more scrolling than before — while still guaranteeing that
- * more than one workspace is visible.
+ * The channel's own workspace leads, because those are the conversations this chat created; the rest
+ * follow, most recently active first, with the directory as the tie-break so the same machine always
+ * produces the same list. A row that does not say where it lives counts as the channel's own, which
+ * is the only workspace a conversation can vouch for.
+ *
+ * Counts, not rows: the first level answers "which project", and its rows have to be small enough
+ * that ten of them name ten projects. A folder holding nothing is left out — a row that opens onto
+ * an empty list is a dead end dressed as a choice.
+ *
+ * @param rows - Every conversation the machine knows.
+ * @param options.ownWorkspace - Directory the channel's own conversations live in.
+ * @param options.ownLabel - Name printed for that directory.
+ * @returns Non-empty folders, in display order.
  */
-export const LIST_ALL_LIMIT = 12
+export function sessionFolders(
+  rows: readonly ListedSession[],
+  options: { ownWorkspace?: string; ownLabel: string },
+): SessionFolder[] {
+  let own = 0
+  const byPath = new Map<string, { count: number; newest: number }>()
+  for (const row of rows) {
+    const path = row.workspace
+    const isOwn =
+      path === undefined ||
+      (options.ownWorkspace !== undefined && isSameWorkspace(path, options.ownWorkspace))
+    if (isOwn) {
+      own += 1
+      continue
+    }
+    const seen = byPath.get(path)
+    if (seen === undefined) byPath.set(path, { count: 1, newest: row.updatedAt })
+    else {
+      seen.count += 1
+      if (row.updatedAt > seen.newest) seen.newest = row.updatedAt
+    }
+  }
+
+  const others = [...byPath.entries()]
+    .map(([path, stats]) => ({ path, ...stats }))
+    .sort((a, b) => {
+      if (a.newest !== b.newest) return b.newest - a.newest
+      if (a.path === b.path) return 0
+      return a.path < b.path ? -1 : 1
+    })
+
+  const folders: SessionFolder[] = []
+  if (own > 0) folders.push({ path: options.ownWorkspace ?? '', label: options.ownLabel, count: own })
+  for (const group of others) {
+    folders.push({
+      path: group.path,
+      label: workspaceLabel(group.path) || group.path,
+      count: group.count,
+    })
+  }
+  return folders
+}
+
+/**
+ * Cut one screen of ten out of an ordered sequence.
+ *
+ * @param rows - The whole sequence, already ordered.
+ * @param page - 1-based screen to cut; clamped into range, so a stored page that no longer exists
+ *   still renders something rather than an empty message.
+ * @returns The rows on that screen, where the screen sits, and how many there are.
+ */
+export function browsePage<T>(
+  rows: readonly T[],
+  page: number,
+): { items: T[]; page: number; pages: number; start: number } {
+  const pages = Math.max(1, Math.ceil(rows.length / BROWSE_PAGE_SIZE))
+  const wanted = Number.isFinite(page) ? Math.trunc(page) : 1
+  const current = Math.min(Math.max(wanted, 1), pages)
+  const start = (current - 1) * BROWSE_PAGE_SIZE
+  return { items: rows.slice(start, start + BROWSE_PAGE_SIZE), page: current, pages, start }
+}
+
+/**
+ * The numbering one screen of a folder prints, for a caller that has no frozen listing.
+ *
+ * Only a fallback: the numbering the user is looking at is the one frozen under the message that
+ * printed it, and the caller passes that whenever it has one.
+ *
+ * @param rows - Every row of the folder, ordered.
+ * @param page - Screen the reply is answering.
+ * @returns That screen's rows and the number printed beside the first of them.
+ */
+export function screenRows(rows: readonly ListedSession[], page: number): NumberedRows {
+  const { items, start } = browsePage(rows, page)
+  return {
+    sessions: items.map((session) => ({ sessionId: session.sessionId, title: session.title })),
+    first: start + 1,
+  }
+}
+
+/**
+ * Render one screen of the workspace list.
+ *
+ * @param folders - Every folder, in display order.
+ * @param page - 1-based screen to print.
+ * @returns The message body.
+ */
+export function renderFolderScreen(folders: readonly SessionFolder[], page: number): string {
+  const { items, page: current, pages, start } = browsePage(folders, page)
+  const sections = [`会话夹（${String(current)}/${String(pages)}）`]
+  if (items.length === 0) sections.push('（还没有其它工作区）')
+  items.forEach((folder, index) => {
+    sections.push(`${String(start + index + 1)}. ${folder.label}  ${String(folder.count)} 个会话`)
+  })
+  sections.push(
+    '',
+    current < pages ? '回复编号或名字进入；回复「查看其余」看下十个。' : '回复编号或名字进入。',
+  )
+  return sections.join('\n')
+}
+
+/**
+ * Render one screen of a folder's conversations.
+ *
+ * The numbering runs on across screens, so the second screen of ten prints 11..20 — the number is
+ * what the user replies with, and starting over at 1 would give one number two meanings within a
+ * single browse.
+ *
+ * @param rows - Every conversation in the folder, ordered.
+ * @param options.label - Folder name, printed in the heading.
+ * @param options.page - 1-based screen to print.
+ * @param options.currentId - Session this conversation is bound to, marked in the list.
+ * @param options.held - Conversations in other folders, counted and named rather than left invisible.
+ * @param options.heldHint - How to reach them, which differs between typed and spoken requests.
+ * @param options.now - Current time, so every row of one message agrees on what "3 分钟前" means.
+ * @returns The message body, and the numbering it printed.
+ */
+export function renderSessionScreen(
+  rows: readonly ListedSession[],
+  options: {
+    label: string
+    page: number
+    currentId?: string
+    held?: { count: number; names?: readonly string[] }
+    heldHint?: string
+    now?: number
+  },
+): { text: string; numbered: NumberedRows } {
+  const now = options.now ?? Date.now()
+  const { items, page, pages, start } = browsePage(rows, options.page)
+  const sections = [`【${options.label}】会话（${String(page)}/${String(pages)}）`]
+  if (items.length === 0) sections.push('（这个会话夹还没有对话）')
+  items.forEach((session, index) => {
+    sections.push(renderSessionRow(session, start + index, options.currentId, now))
+  })
+
+  const held = options.held
+  if (held !== undefined && held.count > 0) {
+    const names = held.names ?? []
+    sections.push(
+      '',
+      `另有 ${String(held.count)} 个对话在其它会话夹${
+        names.length === 0 ? '' : `（${names.join('、')}）`
+      }，${options.heldHint ?? '发 /list all 看会话夹。'}`,
+    )
+  }
+
+  /*
+   * The phrase is offered only when there is somewhere for it to go. A listing that ends by inviting
+   * the user to ask for more, on a screen where there is no more, teaches them the command does
+   * nothing.
+   *
+   * The row's trailing id is named, not just printed: reading the number and replying with it is what
+   * users did, and nothing said the id was also a way in — the one form that cannot expire.
+   */
+  sections.push(
+    '',
+    page < pages
+      ? '回复编号或行尾 6 位 id 切换；回复「查看其余」看下十个。'
+      : '回复编号或行尾 6 位 id 切换。',
+  )
+  sections.push('引用这条消息再回编号，可以避免编号过期。')
+
+  return {
+    text: sections.join('\n'),
+    numbered: {
+      sessions: items.map((session) => ({ sessionId: session.sessionId, title: session.title })),
+      first: start + 1,
+    },
+  }
+}
+
+/** What entering a folder resolved to. Ambiguous and none are separate, as for `resolveTarget`. */
+export type FolderResolution =
+  | { kind: 'found'; folder: SessionFolder }
+  | { kind: 'ambiguous'; candidates: SessionFolder[] }
+  | { kind: 'none' }
+
+/**
+ * Resolve what the user typed against the workspace list.
+ *
+ * Accepts the printed number, the printed name, or a fragment of it — the same three shapes
+ * `resolveTarget` accepts for a conversation, for the same reason: the number is what the listing
+ * prints, and the name is what a person remembers.
+ *
+ * Two directories routinely share a last component (`…/workplace` under two parents), and the printed
+ * name is that last component — so a name matching several folders returns the candidates instead of
+ * picking one. Entering the wrong project's folder is worse than a question.
+ *
+ * @param args - What the user replied with.
+ * @param folders - Every folder, in the order the listing numbered them.
+ * @returns What it named.
+ */
+export function resolveFolder(args: string, folders: readonly SessionFolder[]): FolderResolution {
+  const value = args.trim()
+  if (value === '') return { kind: 'none' }
+
+  if (/^\d+$/.test(value)) {
+    const byIndex = folders[Number(value) - 1]
+    if (byIndex !== undefined) return { kind: 'found', folder: byIndex }
+    // Fall through: a numeric string can still be a folder name.
+  }
+
+  const byLabel = folders.filter((folder) => folder.label === value)
+  if (byLabel.length === 1) return { kind: 'found', folder: byLabel[0] }
+  if (byLabel.length > 1) return { kind: 'ambiguous', candidates: byLabel }
+
+  // Last, a *core* match in either direction, exactly as a conversation title is matched: people
+  // name a project the way they talk about it, so a fragment or the name with words of its own has
+  // to work. Uniqueness is the safeguard.
+  const byCore = folders.filter(
+    (folder) => folder.label !== '' && (folder.label.includes(value) || value.includes(folder.label)),
+  )
+  if (byCore.length === 1) return { kind: 'found', folder: byCore[0] }
+  if (byCore.length > 1) return { kind: 'ambiguous', candidates: byCore }
+
+  return { kind: 'none' }
+}
+
+/**
+ * The message for a workspace name that named several folders.
+ *
+ * The candidates are printed with their numbers, because the number is the one form that is never
+ * ambiguous, and it is what the user replies with next.
+ *
+ * @param value - What the user typed.
+ * @param candidates - Every folder it matched.
+ * @param folders - The whole list, so each candidate can be shown with its own number.
+ * @returns The message body.
+ */
+export function ambiguousFolderMessage(
+  value: string,
+  candidates: readonly SessionFolder[],
+  folders: readonly SessionFolder[],
+): string {
+  const lines = candidates.map((folder) => {
+    const number = folders.findIndex((candidate) => candidate.path === folder.path) + 1
+    return `${String(number)}. ${folder.path}  ${String(folder.count)} 个会话`
+  })
+  return [
+    `有多个会话夹匹配「${value.trim()}」，请回复编号：`,
+    '',
+    ...lines,
+    '',
+    '回复 /list all 能再看一次会话夹清单。',
+  ].join('\n')
+}
 
 /** How much of a conversation title a row prints before it is cut. */
 const TITLE_LIMIT = 24
@@ -876,183 +1459,6 @@ function truncateTitle(title: string): string {
 }
 
 /**
- * Group rows by the workspace they belong to, in the order a listing prints them.
- *
- * A row without a `workspace`, or one whose directory is the channel's own, goes under `ownLabel`;
- * everything else is headed by the last component of its path, which is what the desktop sidebar
- * shows. The channel's own workspace leads, because those are the conversations this chat created;
- * the rest follow, most recently active first.
- *
- * Two cuts apply, in this order. First every workspace is cut to `groupLimit` rows
- * ({@link LIST_ALL_GROUP_LIMIT}), which is what makes a whole-machine listing show more than one
- * workspace instead of handing every row to the busiest one. Then the groups are walked in display
- * order and rows are taken until `limit` is reached, so the total stays readable on a phone and what
- * survives is the most recently active workspaces. The channel's own workspace is walked first and
- * therefore always keeps its share.
- *
- * @param rows - Every row the listing could show.
- * @param options.ownWorkspace - Directory the channel's own sessions live in.
- * @param options.ownLabel - Heading for that directory.
- * @param options.limit - Ceiling on the total number of rows.
- * @param options.groupLimit - Per-workspace ceiling, or undefined for a plain recency cut.
- * @returns Non-empty groups, in display order.
- */
-export function groupSessionRows(
-  rows: readonly ListedSession[],
-  options: { ownWorkspace?: string; ownLabel: string; limit?: number; groupLimit?: number },
-): SessionGroup[] {
-  const limit = Math.max(options.limit ?? LIST_LIMIT, 0)
-  const groupLimit = options.groupLimit === undefined ? undefined : Math.max(options.groupLimit, 0)
-  const ordered = [...rows].sort(compareSessionsNewestFirst)
-
-  const own: ListedSession[] = []
-  const byPath = new Map<string, ListedSession[]>()
-  for (const row of ordered) {
-    const path = row.workspace
-    // A row that does not say where it lives is this workspace's own — that is the only workspace a
-    // conversation can vouch for. A row that does say, and names a different directory, is not.
-    const isOwn =
-      path === undefined ||
-      (options.ownWorkspace !== undefined && isSameWorkspace(path, options.ownWorkspace))
-    if (isOwn) own.push(row)
-    else {
-      const list = byPath.get(path)
-      if (list === undefined) byPath.set(path, [row])
-      else list.push(row)
-    }
-  }
-
-  const others = [...byPath.entries()]
-    .map(([path, list]) => ({ path, list, newest: list[0]?.updatedAt ?? 0 }))
-    .sort((a, b) => {
-      if (a.newest !== b.newest) return b.newest - a.newest
-      if (a.path === b.path) return 0
-      return a.path < b.path ? -1 : 1
-    })
-
-  const inDisplayOrder: { label: string; list: ListedSession[] }[] = []
-  if (own.length > 0) inDisplayOrder.push({ label: options.ownLabel, list: own })
-  for (const group of others) inDisplayOrder.push({ label: workspaceLabel(group.path), list: group.list })
-
-  const groups: SessionGroup[] = []
-  let budget = limit
-  for (const group of inDisplayOrder) {
-    if (budget <= 0) break
-    const withinShare = groupLimit === undefined ? group.list : group.list.slice(0, groupLimit)
-    const sessions = withinShare.slice(0, budget)
-    if (sessions.length === 0) continue
-    groups.push({ label: group.label, sessions })
-    budget -= sessions.length
-  }
-  return groups
-}
-
-/**
- * The rows of a grouped listing, in the order they were numbered.
- *
- * The number the user replies with is a position in this flat sequence, so the caller that freezes a
- * listing for later reference stores exactly this — and the ordering lives in one place rather than
- * being re-derived by the caller.
- *
- * @param groups - Groups in display order.
- * @returns Every row, numbered 1..n in display order.
- */
-export function flattenSessionGroups(groups: readonly SessionGroup[]): ListedSession[] {
-  return groups.flatMap((group) => [...group.sessions])
-}
-
-/**
- * Render the session list.
- *
- * @param groups - Workspaces and their rows, in display order and already cut to size.
- * @param currentId - Session this conversation is bound to, marked in the list.
- * @param options.total - How many conversations the message is about, including any not shown, so the
- *   heading can say "最近 10 个对话（共 86 个）" rather than pretending ten is all there is.
- * @param options.held - Conversations in other workspaces that this listing left out, with the names
- *   of those workspaces. Naming them is the whole point: a user who is never told cannot ask.
- * @param options.heldHint - How to reach the held conversations. Typed and spoken requests need
- *   different wording, because a spoken request cannot be told to type a command it never mentions.
- * @param options.groupLimit - The per-workspace share the caller cut the rows with, when it used one.
- *   It changes how truncation is described: a plain cut drops the *oldest* rows, while a share drops
- *   rows that can be newer than the ones still on screen, so calling those "更早的" would be false.
- * @param options.now - Current time, so every row of one message agrees on what "3 分钟前" means.
- * @returns The message body.
- */
-export function renderSessionList(
-  groups: readonly SessionGroup[],
-  currentId: string | undefined,
-  options: {
-    total?: number
-    held?: { count: number; names?: readonly string[] }
-    heldHint?: string
-    groupLimit?: number
-    now?: number
-  } = {},
-): string {
-  const now = options.now ?? Date.now()
-  const shown = flattenSessionGroups(groups)
-  const held = options.held ?? { count: 0 }
-  const total = options.total ?? shown.length + held.count
-  const missing = total - shown.length
-  const share = options.groupLimit
-  const heading =
-    missing <= 0
-      ? `共 ${String(shown.length)} 个对话`
-      : share === undefined
-        ? `最近 ${String(shown.length)} 个对话（共 ${String(total)} 个）`
-        : `共 ${String(total)} 个对话（每个工作区最多显示 ${String(share)} 个）`
-
-  const sections: string[] = []
-  let index = 0
-  for (const group of groups) {
-    if (group.sessions.length === 0) continue
-    sections.push('', `【${group.label}】`)
-    for (const session of group.sessions) {
-      sections.push(renderSessionRow(session, index, currentId, now))
-      index += 1
-    }
-  }
-
-  const more =
-    missing <= 0 || held.count > 0
-      ? ''
-      : share === undefined
-        ? `（还有 ${String(missing)} 个更早的对话未显示）`
-        : `（还有 ${String(missing)} 个对话未显示）`
-  const names = held.names ?? []
-  const elsewhere =
-    held.count === 0
-      ? ''
-      : `另有 ${String(held.count)} 个对话在其它工作区${
-          names.length === 0 ? '' : `（${names.join('、')}）`
-        }，${options.heldHint ?? '一起看就发 /list all。'}`
-
-  /*
-   * The row's trailing id is named here, with a real example from this very listing.
-   *
-   * Printing an id without saying what it is for left it looking like decoration: users read the
-   * number, replied with the number, and never knew the id was also a way to switch — which is the
-   * one form that cannot expire. The example is taken from row 1 rather than written into the string,
-   * so it is always a row the user can see and check against.
-   */
-  const first = shown[0]
-  const switchHint =
-    first === undefined
-      ? '回复 /switch 编号，或 /switch 行尾那个 6 位 id 切换。'
-      : `回复 /switch 编号，或 /switch 行尾那个 6 位 id（如第 1 行的 ${shortId(first.sessionId)}）切换。`
-
-  return [
-    `${heading}：`,
-    ...sections,
-    ...(more === '' ? [] : ['', more]),
-    ...(elsewhere === '' ? [] : ['', elsewhere]),
-    '',
-    switchHint,
-    '引用这条消息再回编号，可以避免编号过期。',
-  ].join('\n')
-}
-
-/**
  * The message for a `/list` whose own workspace has no conversations yet.
  *
  * @param held - Conversations in other workspaces.
@@ -1063,7 +1469,7 @@ export function heldOnlyList(held: readonly ListedSession[], ownLabel: string): 
   return [
     `【${ownLabel}】还没有对话，直接发消息就会新建一个。`,
     '',
-    `另有 ${String(held.length)} 个对话在其它工作区${heldHintSuffix(held)}，发 /list all 一起看。`,
+    `另有 ${String(held.length)} 个对话在其它会话夹${heldHintSuffix(held)}，发 /list all 看会话夹。`,
   ].join('\n')
 }
 
@@ -1186,14 +1592,17 @@ export function relativeTime(at: number, now: number = Date.now()): string {
 export const HELP_TEXT = [
   '可用指令：',
   '/new [标题]      新建对话',
-  '/list            列出本工作区的最近对话',
-  `/list all        连其它工作区一起列出（每个工作区最多 ${String(LIST_ALL_GROUP_LIMIT)} 个）`,
+  '/list            列出微信会话（本工作区）',
+  '/list all        列出全部会话夹，回复编号或名字进入',
   '/switch <编号>   切换（引用列表消息再回编号，编号不会过期）',
   '/switch <id>     按列表行尾那个 6 位 id 切换，例如 /switch e716f0',
   '/model <编号>    查看或切换模型',
   '/current         显示当前对话',
   '/cancel          中断当前任务',
   '/help            显示本帮助',
+  '',
+  `每屏最多 ${String(BROWSE_PAGE_SIZE)} 条，编号跨屏连续；回复「${SHOW_REST}」看下十个。`,
+  '列表就在眼前时，直接回编号、名字或行尾 id 即可，不必打 /switch。',
   '',
   '直接发消息即与当前对话对话。',
   '',

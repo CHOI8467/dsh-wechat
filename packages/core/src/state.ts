@@ -24,7 +24,7 @@ import { dirname, join } from 'node:path'
 
 import type { WeixinAccount } from './types.ts'
 import { normalizeQuota, type QuotaEntry } from './quota.ts'
-import type { SessionBinding } from './router.ts'
+import type { BrowsePosition, SessionBinding } from './router.ts'
 
 /** Everything persisted for one channel deployment. */
 export interface ChannelState {
@@ -64,6 +64,19 @@ export interface ChannelState {
    * per conversation: only a recent list is ever quoted.
    */
   sessionLists?: Record<string, Record<string, SessionListMessage[]>>
+  /**
+   * Where each conversation is in the two-level listing browser, per account.
+   *
+   * Persisted because 「查看其余」 has no target: it means "the next ten of what I am looking at", and
+   * nothing else in the system knows what that is. Kept per **conversation**, not per plugin, because
+   * one channel serves several chats and each is standing somewhere different.
+   *
+   * The entry is small on purpose — a level, a directory and a page number, never a snapshot of the
+   * list. A snapshot would make 「查看其余」 immune to the machine moving underneath it, but it would
+   * also make every listing write a copy of the session list into a file that is rewritten whole on
+   * every message, which is the opposite of what this file is for.
+   */
+  browsing?: Record<string, Record<string, BrowsePosition>>
   /**
    * Proactive messages the service refused, waiting for the reply window to reopen.
    *
@@ -241,6 +254,15 @@ export interface SessionListMessage {
   messageId: string
   /** The rows in the order that message numbered them. */
   sessions: { sessionId: string; title: string }[]
+  /**
+   * The number printed beside `sessions[0]`.
+   *
+   * Stored because numbering runs on across screens: a message showing rows 11..20 is quoted with
+   * "14", and an array read from index 1 would answer with row 4 — a conversation that message never
+   * printed. Written as 1 for a first screen, which is also what an entry stored before paging
+   * existed is read back as.
+   */
+  first: number
   /** When it was sent, for pruning. */
   at: number
 }
@@ -283,6 +305,7 @@ export function rememberSessionList(
       sessionId: row.sessionId,
       title: row.title.slice(0, SESSION_LIST_TITLE_LIMIT),
     })),
+    first: entry.first,
     at: entry.at,
   })
   if (limit >= 0 && history.length > limit) history.splice(0, history.length - limit)
@@ -335,6 +358,67 @@ export function latestSessionList(
 ): SessionListMessage | undefined {
   const history = state.sessionLists?.[accountId]?.[conversationId]
   return history?.[history.length - 1]
+}
+
+/**
+ * Record where a conversation is in the listing browser.
+ *
+ * @param state - State to mutate.
+ * @param accountId - Account the conversation belongs to.
+ * @param conversationId - Conversation to record for.
+ * @param position - The place it has reached.
+ */
+export function rememberBrowse(
+  state: ChannelState,
+  accountId: string,
+  conversationId: string,
+  position: BrowsePosition,
+): void {
+  const perAccount = (state.browsing ??= {})
+  const perConversation = (perAccount[accountId] ??= {})
+  perConversation[conversationId] = {
+    level: position.level,
+    workspace: position.workspace,
+    page: position.page,
+    at: position.at,
+  }
+}
+
+/**
+ * Where a conversation is in the listing browser, if it is anywhere.
+ *
+ * @param state - State to read.
+ * @param accountId - Account the conversation belongs to.
+ * @param conversationId - Conversation to look up.
+ * @returns The stored position, or undefined when this conversation is not browsing.
+ */
+export function findBrowse(
+  state: ChannelState,
+  accountId: string,
+  conversationId: string,
+): BrowsePosition | undefined {
+  return state.browsing?.[accountId]?.[conversationId]
+}
+
+/**
+ * Forget a conversation's place in the listing browser.
+ *
+ * Called both when the user moves on and when a position is found to be stale, so the state file
+ * does not accumulate a row per conversation that ever asked for a listing.
+ *
+ * @param state - State to mutate.
+ * @param accountId - Account the conversation belongs to.
+ * @param conversationId - Conversation to forget.
+ */
+export function forgetBrowse(
+  state: ChannelState,
+  accountId: string,
+  conversationId: string,
+): void {
+  const perAccount = state.browsing?.[accountId]
+  if (perAccount === undefined) return
+  delete perAccount[conversationId]
+  if (Object.keys(perAccount).length === 0) delete state.browsing?.[accountId]
 }
 
 /**
@@ -545,6 +629,9 @@ export class StateStore {
       delete state.syncBufs[accountId]
       delete state.contextTokens[accountId]
       if (state.sessionLists !== undefined) delete state.sessionLists[accountId]
+      // A position is only meaningful for a conversation that can still be reached, and the
+      // conversations go with the account.
+      if (state.browsing !== undefined) delete state.browsing[accountId]
       for (const [key, binding] of Object.entries(state.bindings)) {
         if (binding.accountId === accountId) delete state.bindings[key]
       }
@@ -587,6 +674,13 @@ function normalize(parsed: Partial<ChannelState>): ChannelState {
      * missing conversation or a row without an id would resolve a number to nothing at all.
      */
     ...(isRecord(parsed.sessionLists) ? { sessionLists: normalizeSessionLists(parsed.sessionLists) } : {}),
+    /*
+     * Validated entry by entry, like the listings above, and for the same reason: this is read back
+     * and acted on. A page number that arrived as a string would make 「查看其余」 arithmetic produce
+     * NaN, and a level that is neither of the two known ones would send the router down a branch that
+     * does not exist. The loss is one stale position, which the next `/list` replaces.
+     */
+    ...(isRecord(parsed.browsing) ? { browsing: normalizeBrowsing(parsed.browsing) } : {}),
     /*
      * Filtered rather than trusted. This array is read back and sent to the user, so an entry with a
      * missing conversation or a non-string text would reach the send path as `undefined`.
@@ -646,7 +740,11 @@ function normalizeSessionLists(
     const kept: Record<string, SessionListMessage[]> = {}
     for (const [conversationId, history] of Object.entries(conversations)) {
       if (!Array.isArray(history)) continue
-      const entries = history.filter(isSessionListMessage)
+      const entries: SessionListMessage[] = []
+      for (const candidate of history) {
+        const entry = asSessionListMessage(candidate)
+        if (entry !== undefined) entries.push(entry)
+      }
       if (entries.length > 0) kept[conversationId] = entries
     }
     if (Object.keys(kept).length > 0) result[accountId] = kept
@@ -655,20 +753,74 @@ function normalizeSessionLists(
 }
 
 /**
- * Whether a stored entry is a usable numbered listing.
+ * Coerce one stored entry into a usable numbered listing, copying the fields it validates.
+ *
+ * A listing without a message id can never be found by a quote, and one with a malformed row would
+ * resolve a number to a session id of `undefined` — which reaches the session controller as a request
+ * to adopt nothing. Both are dropped rather than repaired: the cost is one stale number, and the
+ * alternative is guessing at what the user was looking at. The copy is what keeps `first` from being
+ * absent on an entry written before paging existed — see {@link SessionListMessage.first}.
  *
  * @param raw - One entry from the state file.
- * @returns True when it can resolve a number to a real session.
+ * @returns The usable entry, or undefined when it cannot resolve a number to a real session.
  */
-function isSessionListMessage(raw: unknown): raw is SessionListMessage {
-  if (!isRecord(raw)) return false
-  if (typeof raw.messageId !== 'string' || raw.messageId === '') return false
-  if (typeof raw.at !== 'number' || !Number.isFinite(raw.at)) return false
-  if (!Array.isArray(raw.sessions) || raw.sessions.length === 0) return false
-  return raw.sessions.every(
-    (row: unknown) =>
-      isRecord(row) && typeof row.sessionId === 'string' && typeof row.title === 'string',
-  )
+function asSessionListMessage(raw: unknown): SessionListMessage | undefined {
+  if (!isRecord(raw)) return undefined
+  if (typeof raw.messageId !== 'string' || raw.messageId === '') return undefined
+  if (typeof raw.at !== 'number' || !Number.isFinite(raw.at)) return undefined
+  if (!Array.isArray(raw.sessions) || raw.sessions.length === 0) return undefined
+  const sessions: { sessionId: string; title: string }[] = []
+  for (const row of raw.sessions) {
+    if (!isRecord(row) || typeof row.sessionId !== 'string' || typeof row.title !== 'string') {
+      return undefined
+    }
+    sessions.push({ sessionId: row.sessionId, title: row.title })
+  }
+  const first = raw.first === undefined ? 1 : raw.first
+  if (typeof first !== 'number' || !Number.isInteger(first) || first < 1) return undefined
+  return { messageId: raw.messageId, sessions, first, at: raw.at }
+}
+
+/**
+ * Keep only the browsing positions that are usable.
+ *
+ * A position that does not name a known level or carries a page that is not a positive integer cannot
+ * be continued, and continuing it wrongly is worse than starting over: 「查看其余」 would page from a
+ * number nobody chose. Dropping costs the user one `/list all`.
+ *
+ * @param raw - The stored `browsing` object.
+ * @returns The usable subset, in the stored order.
+ */
+function normalizeBrowsing(
+  raw: Record<string, unknown>,
+): Record<string, Record<string, BrowsePosition>> {
+  const result: Record<string, Record<string, BrowsePosition>> = {}
+  for (const [accountId, conversations] of Object.entries(raw)) {
+    if (!isRecord(conversations)) continue
+    const kept: Record<string, BrowsePosition> = {}
+    for (const [conversationId, entry] of Object.entries(conversations)) {
+      const position = asBrowsePosition(entry)
+      if (position !== undefined) kept[conversationId] = position
+    }
+    if (Object.keys(kept).length > 0) result[accountId] = kept
+  }
+  return result
+}
+
+/**
+ * Whether a stored entry is a resumable browsing position.
+ *
+ * @param raw - One entry from the state file.
+ * @returns The position, or undefined when it cannot be continued.
+ */
+function asBrowsePosition(raw: unknown): BrowsePosition | undefined {
+  if (!isRecord(raw)) return undefined
+  const level = raw.level
+  if (level !== 'folders' && level !== 'sessions') return undefined
+  if (typeof raw.workspace !== 'string') return undefined
+  if (typeof raw.page !== 'number' || !Number.isInteger(raw.page) || raw.page < 1) return undefined
+  if (typeof raw.at !== 'number' || !Number.isFinite(raw.at)) return undefined
+  return { level, workspace: raw.workspace, page: raw.page, at: raw.at }
 }
 
 /**

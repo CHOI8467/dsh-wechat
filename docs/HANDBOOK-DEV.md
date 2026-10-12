@@ -498,6 +498,10 @@ token 由**用户那条消息**签发，回信时必须原样带回。它过期�
 
 ## 4.12 `/list all` 只看得见微信会话：上限是「全局」的
 
+> **这一节的做法已经被 §4.13 推翻。** 它记录的是"分组平铺 + 截断"那一代的问题与修法，那些常量
+> （`LIST_ALL_GROUP_LIMIT` / `LIST_ALL_LIMIT`）已经删除。留着它是因为**下面两条教训仍然成立**，
+> 而且 §4.13 正是从它的天花板出发的：截断是死路。
+
 **现象**：用户发 `/list all` 想看全部会话，看到的**和 `/list` 几乎一样**——只有微信会话。
 
 **根因**：`groupSessionRows` 先对**全机**会话取最新 10 条，**再**按工作区分组。而微信工作区几乎总是最新的那批（用户刚在用它），于是 10 行全归微信，分组之后**只剩一个组**，`all` 形同虚设。
@@ -550,6 +554,76 @@ token 由**用户那条消息**签发，回信时必须原样带回。它过期�
 **反向验证**：把 `text` 改回 `/list`，这条测试立刻变红，报的是 `已切换到「本工作区 9」。` 而不是 `已切换到「别处的工作」`——正是上面那张表里"打印 ffff99、锁定 0009aa"的老 bug；恢复后全绿。
 
 > **教训**：`/list all` 和 `/list` 长得一样，**这本身就是报告**——一个功能没有可见的效果，等于没做。而「存在多个工作区时至少列出两个」这条断言，本该在加分组那次就写下来：它检查的不是某处代码改对了没有，而是**用户能不能看出这个功能存在**。同一件事还有第二层：**同一个功能的两个半边必须问同一份数据**。打印用一份、冻结用另一份，各自都对，合起来是错的。
+
+## 4.13 `/list all` 推翻重做：两层、每屏十条、「查看其余」
+
+**§4.12 的修法是对的，但天花板很低。** 每个工作区 3 行、整条 12 行——这是一把**截断**，而截断是**死路**：掉在第 12 行之后的东西**存在**，数字写在末尾，但**点不到**。工作区一多，别的工作区整组不出现。用户的原话是「使得用户有能力查看所有并且同时显示的会话数可控」。
+
+**所以改成两层分页**：
+
+| 层 | 内容 | 进入方式 |
+|---|---|---|
+| 第一层 | **会话夹**（= 工作区），每个一行、带会话数 | `/list all` |
+| 第二层 | 某个工作区里的会话 | 回**编号**或**名字** |
+
+- **每屏最多 10 条**，回复「**查看其余**」往下翻十条，一直翻到底；到底了明说「只有 N 页，已经到底了」，并且**不再邀请你翻**
+- **编号跨屏连续**（第一屏 1–10，第二屏 11–20）。每屏从 1 重来的话，一个浏览过程里同一个数字会有两个含义
+- **`/list` 直接进微信工作区那一层**，不显示会话夹列表（既定设计：那才是大多数人要的那份列表）
+- **进会话夹只改浏览位置，不改绑定**
+
+### 被删掉的东西（不要留死代码）
+
+`groupSessionRows`、`flattenSessionGroups`、`renderSessionList`、`SessionGroup`、`LIST_ALL_GROUP_LIMIT = 3`、`LIST_ALL_LIMIT = 12`，以及 `host.ts` 里**自己重画一份列表**的 `#sessionTable` / `renderTable`。**说大白话那条路现在把 `/list`、`/list all` 原样交给路由器，再把路由器的渲染发出去**——一个渲染器，一个编号，两条路不可能再分叉（§4.12 最后那条「打印和冻结问的不是同一份数据」在结构上消失了）。留下的只有「另有 N 个对话在其它会话夹」这句提示（`heldNames` / `heldOnlyList`），它不是截断，是一次指路。
+
+### 新的 state 字段：`browsing`
+
+「查看其余」**不带参数**，所以插件必须记住「翻到哪儿了」：`{ level: 'folders' | 'sessions', workspace, page, at }`，**按账号 → 会话**存。
+
+**什么时候清**（理由写在 `host.ts` 的 `BROWSE_IDLE_MS` 与 `#trackBrowse` 旁）：
+
+| 时机 | 为什么 |
+|---|---|
+| 新的 `/list` 覆盖它 | 新列表就是新的立足点 |
+| **任何别的消息**（交给 agent 的、`/switch`、`/new`、`/current`……）清掉 | 用户已经走开了，这句话不该再续上一份列表 |
+| **闲置 30 分钟**过期，并从状态文件里删掉 | 隔一夜回来说「查看其余」，翻到莫名其妙的地方比不认这句话更糟 |
+| **只有真正发出去的那一屏才推进位置** | 发送被拒时推进，下一句「查看其余」会跳过用户没见过的一页 |
+
+**这里有一处为「不许猜」付的代价**：位置只存页码，**不存列表快照**（§4.11 的纪律是"能确定"，而快照会让每次列表都把整份会话清单写进一个每消息重写的文件）。所以翻页期间如果有会话活动，列表整体位移，第二屏可能与第一屏重叠一行。要彻底消除就得把快照写进 state——**没有做，写在这里当作已知取舍**。
+
+### 引用锁定在新结构下怎么处理（关键）
+
+编号跨屏连续之后，`SessionListMessage` **必须多存一个 `first`**（这一屏第一个编号是几）。否则第二屏印 11–20、冻结的却是 10 个格子，用户引用它回「13」，`resolveTarget` 会去取 `numbered[12]`——**那是一屏根本没印过的第 3 行**。所以：
+
+- `NumberedRows = { sessions, first }` 贯穿「路由器 → 宿主的冻结 → 读回解析」
+- `resolveTarget(args, sessions, numbered)` 的第三参从数组改成 `NumberedRows`；编号的读取变成 `index = n - first`，**`index < 0` 不折回第 1 行**（那是用户翻过去的一屏，猜他指哪一行正是 pin 要防的事）
+- 每一屏按**自己那条消息的 id** 单独冻结，所以「引用的是哪一条消息的那一屏」是自动成立的
+- **会话夹那一层没有编号可冻结**（行是文件夹，不是会话），它的编号按当时的实时顺序解析。文件夹顺序很稳（本工作区第一，其余按最近活动 + 路径），且这一层的位置 30 分钟就作废——**这是已知的、可接受的弱一处**，写在这里而不是假装它不存在
+
+### 验证
+
+新增/改写的测试（都在，且都做过反向验证）：
+
+| 测试 | 断言的是什么 |
+|---|---|
+| `core.test.ts`「the workspace level pages ten at a time…」 | 第一层每屏 10 条、编号 1–10 / 11–12 连续、最后一屏不写「查看其余」、到底了明说且**位置不动** |
+| 「entering a workspace works by number and by name…」 | 按编号、按名字都能进；**绑定没动**；不是步骤的消息落回 agent |
+| 「two workspaces with the same folder name are not guessed between」 | 同名文件夹按名字进入时**列出编号**而不是猜 |
+| 「the conversation level pages ten at a time…」 | 第二层 25 个会话 → 3 屏，最后一屏 21–25；回「25」切到那一行；**切换后位置被清掉** |
+| 「a number on a later screen is read with that screen's offset」 | 第二屏 `first=11` 时「13」是丙、「3」**不折回第 1 行** |
+| 「where a conversation is in the listing browser survives a save and a reload」 | **§4.9 纪律**：`browsing` 往返，`forgetBrowse` 收尾 |
+| 「a browsing position that cannot be continued is dropped」 | 非法 level/page/workspace/at **逐项丢弃** |
+| `plugin.test.ts`「the phrase that pages on is answered by the channel…」 | 「查看其余」**不吵醒 agent**、翻到第二屏、切换后位置失效 |
+| 「a quoted spoken listing answers with the rows that message printed」 | 引用第二屏回「14」切到那一行；引用**第一屏**回「14」**什么都不动**（偏移真的在起作用） |
+| 「a position left overnight pages nothing…」 | 过期位置被丢弃，那句话当成普通消息 |
+| 「a spoken full list shows every workspace…」 | 说大白话的 `all` 也到**同一层**（同一个渲染器） |
+
+**反向验证**（三次，都恢复到全绿）：
+
+1. 把 `resolveTarget` 的偏移去掉（回到 `numbered[n - 1]`）→「a number on a later screen…」与 plugin 的引用测试同时变红（报的是切到了下一屏的行，而不是那一屏印的那一行）
+2. 把 `#rowsIn` 的排序去掉（信任网关顺序）→ 第二层分页测试变红（第一行不是最新的那个），并且 `/list` 与 `/switch` 对同一个数字的理解不一致
+3. 把 `normalize` 里的 `browsing` 去掉 → 往返测试变红（写进去了，读回来没有）
+
+> **教训（与 §4.9 同一条）**：这次又差点在同一个地方交学费——`normalize()` 是白名单，加字段就必须同时加校验和往返测试。而更要紧的是那条**结构**上的收获：§4.12 的「打印用一份、冻结用另一份」不是靠更小心修好的，是**把第二份删掉**修好的。同一份事实有两个产生者时，先找能不能只留一个。
 
 ## 5. 认证：OIDC，不要用 token
 
@@ -628,7 +702,7 @@ npm view dsh-wechat-plugin versions --registry=https://registry.npmjs.org
 pnpm build              # 只编译，保留 @dsh-wechat/core 引用（pack 要靠它改写）
 pnpm run dist           # build + 内嵌 core：Git 安装要的可直接加载形态
 pnpm typecheck          # 含 examples/
-pnpm test               # 253 项
+pnpm test               # 264 项
 pnpm run check:install  # 两条安装路径的约束
 pnpm run pack           # 需要先 build，不能先 dist
 pnpm run verify-pack    # 解包、校验清单、按 DSH 的方式挂载一次

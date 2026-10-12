@@ -20,20 +20,17 @@ import {
   StateStore,
   UploadMediaType,
   downloadItemMedia,
+  findBrowse,
   findSentMessage,
   findSessionList,
-  flattenSessionGroups,
-  groupSessionRows,
-  heldNames,
+  forgetBrowse,
   latestSessionList,
-  LIST_ALL_GROUP_LIMIT,
-  LIST_ALL_LIMIT,
   login as loginHandshake,
   isSameWorkspace,
   listAllStoredSessions,
   quotaLedgerFor,
+  rememberBrowse,
   rememberSessionList,
-  renderSessionList,
   renderSessionRow,
   storedSessionWorkspace,
   rememberSentMessage,
@@ -44,13 +41,13 @@ import {
   sendVideo,
   toDataUrl,
   uploadMedia,
-  workspaceLabel,
   SendRefusedError,
   queuePendingNotification,
   expirePendingNotifications,
   QUOTA_PER_TOKEN as QUOTA_LIMIT,
   QUOTA_WARNING as QUOTA_WARNING_TEXT,
   type BindingStore,
+  type BrowsePosition,
   type CDNMedia,
   type ChannelSettings,
   type ChannelState,
@@ -59,12 +56,11 @@ import {
   type ListedSession,
   type LoginEvent,
   type MessageItem,
-  type NumberedSession,
+  type NumberedRows,
   type QuotaLedger,
   type RouteDecision,
   type SessionBinding,
   type SessionGateway,
-  type SessionGroup,
   type UploadMediaTypeValue,
   type WeixinAccount,
 } from '@dsh-wechat/core'
@@ -232,11 +228,15 @@ export function sessionToolDescription(requireConfirmation: boolean): string {
     'do not repeat that outcome either way. Never tell the user a switch or a new conversation ' +
     'succeeded; read the result\'s `ok` field and, if it is false, say nothing about it because the ' +
     'channel has already told them what went wrong. ' +
-    // The default list is deliberately short, so the user has to be told the rest exists and how to
-    // reach it — otherwise they never learn that conversations from other projects are switchable.
-    'The list shows this channel\'s own conversations by default and reports how many others exist ' +
-    'in other workspaces; when the user asks to see those as well, call list again with ' +
-    'target "all". Any conversation in the full list can be switched to, whichever workspace it is in.'
+    // The two levels of the list, because the agent has to be able to say what it just showed: this
+    // workspace's conversations, or the workspaces themselves. A spoken request never types `/list
+    // all`, so the words matter more here than for the typed command.
+    'The list has two levels: action "list" shows this channel\'s own conversations, and target "all" ' +
+    'shows the workspaces on the machine, each with how many conversations it holds. Both are paged ' +
+    'ten rows at a time with numbering that runs on across pages, and the user walks them by replying ' +
+    'to the channel itself — a number, a name, or 「查看其余」 for the next ten — so do not try to ' +
+    'carry that on yourself. Any conversation in any workspace can be switched to, whichever ' +
+    'workspace it is in.'
   if (requireConfirmation) {
     return (
       `${base} IMPORTANT: before acting, state what you are about to do and wait for the user to ` +
@@ -355,36 +355,14 @@ function quotedMessageId(message: InboundMessage): string | undefined {
 }
 
 /**
- * Render the session rows the way the agent should present them.
+ * How long an unfinished listing stays open.
  *
- * A spoken request is sent the *same* body a typed `/list` produces — the router renders it and the
- * channel delivers it — so there is one format and one numbering, and the agent's structured result
- * is built from the same grouping. Anything else is a second list the user has to reconcile.
- *
- * @param groups - Workspaces and their rows, already ordered and cut to size.
- * @param currentId - Session the conversation is bound to, marked in the list.
- * @param total - How many conversations the message is about, including any not shown.
- * @param held - Conversations in other workspaces this listing left out.
- * @param heldHint - Wording for reaching them, which differs between typed and spoken requests.
- * @param groupLimit - The per-workspace share the rows were cut with, when one was used, so the
- *   message describes truncation the way it actually happened.
- * @returns The message body.
+ * 「查看其余」 carries no target, so it means "the next ten of what I am looking at" — and that only
+ * holds while the user is still looking. Half an hour is long enough to read a screen, answer
+ * something else and come back, and short enough that a phrase typed the next morning continues
+ * nothing rather than jumping into the middle of a list nobody remembers.
  */
-function renderTable(
-  groups: readonly SessionGroup[],
-  currentId: string | undefined,
-  total: number,
-  held: { count: number; names?: readonly string[] },
-  heldHint?: string,
-  groupLimit?: number,
-): string {
-  return renderSessionList(groups, currentId, {
-    total,
-    ...(held.count === 0 ? {} : { held }),
-    ...(heldHint === undefined ? {} : { heldHint }),
-    ...(groupLimit === undefined ? {} : { groupLimit }),
-  })
-}
+const BROWSE_IDLE_MS = 30 * 60 * 1000
 
 /** A state with nothing stored, so defaults can be resolved without reading the disk. */
 const EMPTY_STATE: ChannelState = {
@@ -769,51 +747,31 @@ class WechatRuntime {
   ): Promise<{
     ok: boolean
     detail: string
-    sessions: { index: number; sessionId: string; title: string; updatedAt: number; current: boolean }[]
     /**
      * The numbered rows exactly as the user received them.
      *
-     * Rendered from the same grouping and numbering, so a number the agent repeats in its own words
-     * is the number the user is looking at. Built separately from the message body only because the
-     * agent needs the rows without the heading and the instructions.
+     * Rendered from the same numbering the message was built from, so a number the agent repeats in
+     * its own words is the number the user is looking at. Built separately from the message body only
+     * because the agent needs the rows without the heading and the instructions.
      */
     rows: string
-    /** Sessions in other workspaces, which the list does not show unless asked. */
-    otherWorkspaces: number
-    /** Folder names of those workspaces, so the hint can say which they are. */
-    otherNames: string[]
   }> {
     const conversationId = await this.#conversationForAgentSession(callerSessionId)
     if (conversationId === undefined) {
-      return {
-        ok: false,
-        detail: '这个会话没有绑定任何微信对话，无法操作。',
-        sessions: [],
-        rows: '',
-        otherWorkspaces: 0,
-        otherNames: [],
-      }
+      return { ok: false, detail: '这个会话没有绑定任何微信对话，无法操作。', rows: '' }
     }
     const binding = (await this.#store.read()).bindings[conversationId]
     if (binding === undefined) {
-      return {
-        ok: false,
-        detail: '这个会话没有绑定任何微信对话，无法操作。',
-        sessions: [],
-        rows: '',
-        otherWorkspaces: 0,
-        otherNames: [],
-      }
+      return { ok: false, detail: '这个会话没有绑定任何微信对话，无法操作。', rows: '' }
     }
 
     /*
-     * `list` with `all` has to reach the router as `/list all`, not as `/list`.
+     * Every action reaches the router as the command a typed request would be, `list all` included.
      *
-     * The rows the router numbers are the rows that get frozen under the message id, and a quote of
-     * that message is answered from them. A bare `/list` made the router number *this workspace's*
-     * conversations while the message below printed every workspace's, so quoting a full list and
-     * replying with a number moved the chat to a row that message never showed. The body itself is
-     * rendered by {@link #sessionTable} either way, so this changes only which numbering is pinned.
+     * That is what keeps the two routes one implementation: the router renders the message, numbers
+     * it, decides which level of the browser it opens and reports where that leaves the conversation
+     * — and the channel only delivers the result. Rendering a second copy here is what previously let
+     * the message and the numbering disagree about which list they were describing.
      */
     const text =
       action === 'switch'
@@ -839,24 +797,13 @@ class WechatRuntime {
         : {}),
     })
     if (result.kind !== 'reply') {
-      return {
-        ok: false,
-        detail: `不支持的操作：${action}`,
-        sessions: [],
-        rows: '',
-        otherWorkspaces: 0,
-        otherNames: [],
-      }
+      return { ok: false, detail: `不支持的操作：${action}`, rows: '' }
     }
 
-    const includeAll = target === 'all'
-    const table = await this.#sessionTable(conversationId, includeAll)
-    const { sessions, otherWorkspaces, otherNames } = table
-    const currentId = sessions.find((row) => row.current)?.sessionId
-    // The same numbering the user is reading, rendered for the agent's own words.
-    const rows = sessions
-      .map((session) => renderSessionRow(session, session.index - 1, currentId))
-      .join('\n')
+    // The rows the message printed, rendered for the agent's own words. A workspace screen has none:
+    // its rows are folders, and the next number is chosen by replying to the channel, which this
+    // conversation is already doing.
+    const rows = await this.#rowsForAgent(conversationId, result.numbered)
     // A switch to something unknown answers with guidance rather than throwing, so the text has to
     // be read rather than assumed to mean success — otherwise the agent would report a move that
     // never happened.
@@ -878,6 +825,9 @@ class WechatRuntime {
         const after = (await this.#store.read()).bindings[conversationId]
         await this.#notify(conversationId, switchConfirmation(action, after?.title ?? ''))
       }
+      // A switch ends any browse: the listing the user was reading is finished with, and a later
+      // 「查看其余」 must not continue it.
+      await this.#trackBrowse(binding.accountId, conversationId, result.browse)
     }
 
     if (failed) {
@@ -886,10 +836,7 @@ class WechatRuntime {
         // Stated as done, because it was: the user has been told directly, and a retelling can only
         // contradict what they already read.
         detail: `切换失败，已直接告诉用户。原因：${result.text.split('\n')[0] ?? ''}`,
-        sessions,
         rows,
-        otherWorkspaces,
-        otherNames,
       }
     }
     /*
@@ -901,23 +848,11 @@ class WechatRuntime {
      * own, in its own format, without the other workspaces and without the numbering the user is
      * meant to reply with.
      *
-     * So the channel sends it, and the agent is told not to repeat it. The body is the router's own
-     * rendering, which is what `/list` sends for a typed request — one format for both routes, and one
-     * numbering for the agent to repeat.
+     * So the channel sends the router's own rendering — the same bytes a typed `/list` produces — and
+     * the agent is told not to repeat it.
      */
     if (action === 'list' || action === 'current') {
-      const body =
-        table.groups.length === 0
-          ? '还没有其他对话。'
-          : renderTable(
-              table.groups,
-              currentId,
-              table.total,
-              { count: otherWorkspaces, names: otherNames },
-              '说「看全部对话」就能一起看，也可以直接切过去。',
-              includeAll ? LIST_ALL_GROUP_LIMIT : undefined,
-            )
-      const sentId = await this.#notify(conversationId, body)
+      const sentId = await this.#notify(conversationId, result.text)
       /*
        * The id the service assigned is what a later quote of this message refers to, so the numbering
        * it just printed is frozen under it. Without this a spoken listing could be quoted and the
@@ -926,18 +861,49 @@ class WechatRuntime {
       if (action === 'list' && sentId !== undefined && result.numbered !== undefined) {
         await this.#rememberListedRows(binding.accountId, conversationId, sentId, result.numbered)
       }
+      /*
+       * Where the browser was left, remembered only when the screen actually reached the user: a
+       * position advanced past a message nobody received would skip a page on the next 「查看其余」.
+       * Clearing needs no such condition, and every other command clears — `/current` included,
+       * because a listing the user has stopped reading is not one to page through later.
+       */
+      if (sentId !== undefined || result.browse === undefined) {
+        await this.#trackBrowse(binding.accountId, conversationId, result.browse)
+      }
       return {
         ok: true,
         // The agent gets told what happened, not the list itself: repeating it would double every
-        // request, and paraphrasing it is what produced a list the user could not act on.
-        detail: `列表已直接发给用户（共 ${String(sessions.length)} 个对话）。不要重复这份列表。`,
-        sessions,
+        // request, and paraphrasing it is what produced a list the user could not act on. `/current`
+        // is different — its answer *is* the useful text, and it names a conversation the user cannot
+        // see, so the agent is handed the same words the channel just sent.
+        detail: action === 'list' ? '列表已直接发给用户。不要重复这份列表。' : result.text,
         rows,
-        otherWorkspaces,
-        otherNames,
       }
     }
-    return { ok: true, detail: result.text, sessions, rows, otherWorkspaces, otherNames }
+    return { ok: true, detail: result.text, rows }
+  }
+
+  /**
+   * The numbered rows of a reply, rendered the way the user received them.
+   *
+   * @param conversationId - Conversation the listing went to, whose bound session is marked.
+   * @param numbered - The numbering the reply printed, when it printed one.
+   * @returns The rows as lines, or an empty string when this reply numbered nothing.
+   */
+  async #rowsForAgent(conversationId: string, numbered: NumberedRows | undefined): Promise<string> {
+    if (numbered === undefined || numbered.sessions.length === 0) return ''
+    const currentId = (await this.#store.read()).bindings[conversationId]?.sessionId
+    const known = new Map<string, ListedSession>(
+      (await this.#gateway().listSessions()).map((session) => [session.sessionId, session]),
+    )
+    return numbered.sessions
+      .map((session, offset) => {
+        const row = known.get(session.sessionId) ?? session
+        // The number printed beside the row, not its position in this array: the second screen of ten
+        // starts at 11, and the agent repeats these numbers back to the user.
+        return renderSessionRow(row, numbered.first - 1 + offset, currentId)
+      })
+      .join('\n')
   }
 
   /**
@@ -946,25 +912,26 @@ class WechatRuntime {
    * @param accountId - Account the message went out on.
    * @param conversationId - Conversation it went to.
    * @param messageId - Id the service assigned, which is what a quote carries.
-   * @param numbered - The rows, in the order the message numbered them.
+   * @param numbered - The rows, and the number printed beside the first of them.
    */
   async #rememberListedRows(
     accountId: string,
     conversationId: string,
     messageId: string,
-    numbered: readonly NumberedSession[],
+    numbered: NumberedRows,
   ): Promise<void> {
     try {
       await this.#store.update((state) => {
         rememberSessionList(state, accountId, conversationId, {
           messageId,
-          // Copied field by field: what is stored has to be exactly the two fields the reader
-          // validates, so a later change to the row shape cannot smuggle an unvalidated value in.
-          // Long titles are trimmed by the store, which owns that bound.
-          sessions: numbered.map((session) => ({
+          // Copied field by field: what is stored has to be exactly the fields the reader validates,
+          // so a later change to the row shape cannot smuggle an unvalidated value in. Long titles
+          // are trimmed by the store, which owns that bound.
+          sessions: numbered.sessions.map((session) => ({
             sessionId: session.sessionId,
             title: session.title,
           })),
+          first: numbered.first,
           at: Date.now(),
         })
       })
@@ -1110,7 +1077,7 @@ class WechatRuntime {
     conversationId: string,
     accountId: string,
     message?: InboundMessage,
-  ): Promise<{ numbered?: NumberedSession[] }> {
+  ): Promise<{ numbered?: NumberedRows }> {
     const state = await this.#store.read()
     const quotedId = message === undefined ? undefined : quotedMessageId(message)
     const quoted = quotedId === undefined ? undefined : findSessionList(state, accountId, quotedId)
@@ -1118,91 +1085,78 @@ class WechatRuntime {
     if (listing === undefined) return {}
     this.#recordBoot(
       `session numbering: ${quoted === undefined ? 'latest' : 'quoted'} listing ` +
-        `id=${listing.messageId} rows=${String(listing.sessions.length)}`,
+        `id=${listing.messageId} rows=${String(listing.sessions.length)} first=${String(listing.first)}`,
     )
-    return { numbered: listing.sessions }
+    return { numbered: { sessions: listing.sessions, first: listing.first } }
   }
 
   /**
-   * The sessions a conversation can move between, numbered the way the list presents them.
+   * Where a conversation is in the two-level listing browser, or nothing when it is nowhere.
    *
-   * The agent gets this alongside every result so it can offer the choice it just described
-   * without a second call. The numbering comes from the same grouping and ordering the message itself
-   * was rendered from, so a number the agent repeats and a number the user reads are the same number.
+   * An abandoned position is dropped and reported as absent, because 「查看其余」 means "the next ten
+   * of what I am looking at": once the user has moved on, the phrase has nothing to continue, and a
+   * jump to wherever they left off reads as a malfunction rather than a convenience.
    *
-   * @param conversationId - Conversation whose current session is marked.
-   * @param includeAll - Whether to include sessions from other workspaces.
-   * @returns Rows ready to relay, the groups they were rendered from, and what was held back.
+   * @param accountId - Account the conversation belongs to.
+   * @param conversationId - Conversation to look up.
+   * @returns The position to continue from, when there is a live one.
    */
-  async #sessionTable(
+  async #browseFor(accountId: string, conversationId: string): Promise<BrowsePosition | undefined> {
+    const stored = findBrowse(await this.#store.read(), accountId, conversationId)
+    if (stored === undefined) return undefined
+    if (Date.now() - stored.at <= BROWSE_IDLE_MS) return stored
+    await this.#trackBrowse(accountId, conversationId, undefined)
+    this.#recordBoot(
+      `browse expired: level=${stored.level} page=${String(stored.page)}`,
+    )
+    return undefined
+  }
+
+  /**
+   * Remember where a conversation is in the listing browser, or forget it.
+   *
+   * Written only when it changes: this runs on every message, and the state file is rewritten whole
+   * on every write. A failure is recorded rather than thrown, because the cost is one page of
+   * browsing and the message it was attached to matters more.
+   *
+   * @param accountId - Account the conversation belongs to.
+   * @param conversationId - Conversation to record for.
+   * @param next - The new position, or undefined to forget the old one.
+   */
+  async #trackBrowse(
+    accountId: string,
     conversationId: string,
-    includeAll: boolean,
-  ): Promise<{
-    sessions: { index: number; sessionId: string; title: string; updatedAt: number; current: boolean }[]
-    groups: SessionGroup[]
-    total: number
-    otherWorkspaces: number
-    otherNames: string[]
-  }> {
-    const state = await this.#store.read()
-    const current = state.bindings[conversationId]
-    const currentId = current?.sessionId ?? ''
-    const all = await this.#gateway().listSessions()
-    const own = (await this.#gateway().listOwnSessions?.()) ?? all
-    const ownIds = new Set(own.map((session) => session.sessionId))
-    const others = all.filter((session) => !ownIds.has(session.sessionId))
-
-    if (all.length === 0) {
-      // The host reports nothing, but this conversation is plainly on a session. Offering that one
-      // is what keeps "list my conversations" from answering with silence — which is exactly how
-      // the request failed in practice.
-      return {
-        sessions:
-          current === undefined
-            ? []
-            : [
-                {
-                  index: 1,
-                  sessionId: current.sessionId,
-                  title: current.title.trim() || '(无标题)',
-                  updatedAt: current.lastUsedAt,
-                  current: true,
-                },
-              ],
-        groups: [],
-        total: 0,
-        otherWorkspaces: 0,
-        otherNames: [],
-      }
+    next: BrowsePosition | undefined,
+  ): Promise<void> {
+    const current = findBrowse(await this.#store.read(), accountId, conversationId)
+    /*
+     * `at` is compared too, so listing the same page again restarts the idle clock.
+     *
+     * Leaving it out would look like a saving and behave like a bug: `/list` twice inside the window
+     * would keep the first timestamp, and the position would expire while the user was still using
+     * it. The write it costs is at most one per listing, because every other path either clears the
+     * position (compared as equality below) or does not touch it at all.
+     */
+    if (current === next) return
+    if (
+      current !== undefined &&
+      next !== undefined &&
+      current.level === next.level &&
+      current.workspace === next.workspace &&
+      current.page === next.page &&
+      current.at === next.at
+    ) {
+      return
     }
-
-    // `all` shows everything; otherwise the wider list is only counted, so the default stays short
-    // and the user is told the rest is there.
-    //
-    // The whole-machine list is cut per workspace, exactly as the typed `/list all` cuts it: a single
-    // global cut went entirely to this workspace, which is the busiest, leaving one heading and no
-    // sign that other workspaces existed.
-    const rows = includeAll ? all : own
-    const groups = groupSessionRows(rows, {
-      ownWorkspace: this.#workspace,
-      ownLabel: WORKSPACE_TITLE,
-      ...(includeAll ? { limit: LIST_ALL_LIMIT, groupLimit: LIST_ALL_GROUP_LIMIT } : {}),
-    })
-    const ordered = flattenSessionGroups(groups)
-    return {
-      sessions: ordered.map((session, index) => ({
-        index: index + 1,
-        sessionId: session.sessionId,
-        title: session.title.trim() || '(无标题)',
-        updatedAt: session.updatedAt,
-        current: session.sessionId === currentId,
-      })),
-      groups,
-      total: rows.length + (includeAll ? 0 : others.length),
-      otherWorkspaces: includeAll ? 0 : others.length,
-      // Folder names, because they are what the user recognises from the desktop. Named rather than
-      // counted so "which other lists are there" needs no second question.
-      otherNames: includeAll ? [] : heldNames(others),
+    try {
+      await this.#store.update((state) => {
+        if (next === undefined) forgetBrowse(state, accountId, conversationId)
+        else rememberBrowse(state, accountId, conversationId, next)
+      })
+    } catch (error) {
+      this.#recordError(
+        `浏览位置未能保存: ${error instanceof Error ? error.message : String(error)}`,
+      )
     }
   }
 
@@ -1253,6 +1207,8 @@ class WechatRuntime {
       delete state.sentMessages[accountId]
       // The frozen listings go with it: they exist to resolve a quote that arrives on this account.
       if (state.sessionLists !== undefined) delete state.sessionLists[accountId]
+      // So does where its conversations were in the listing browser, for the same reason.
+      if (state.browsing !== undefined) delete state.browsing[accountId]
       for (const [key, binding] of Object.entries(state.bindings)) {
         if (binding.accountId === accountId) delete state.bindings[key]
       }
@@ -1807,6 +1763,9 @@ class WechatRuntime {
     }
     this.#interactions.delete(message.conversationId)
     this.#recordBoot(`interaction settled: ${pending.kind}`)
+    // The reply was meant for the prompt, not for a listing the user had open before it: that browse
+    // is over, and a later 「查看其余」 must not continue it.
+    await this.#trackBrowse(message.accountId, message.conversationId, undefined)
     pending.settle(value as never)
     return true
   }
@@ -2043,6 +2002,14 @@ class WechatRuntime {
       // A command answered in the user's own words is proposed, not performed. Recognition is
       // allowed to be imperfect precisely because this stands between it and any effect.
       if (attachments.length === 0) {
+        /*
+         * Where this conversation is in the listing browser, read before routing.
+         *
+         * 「查看其余」 has no target, so the router can only interpret it against the position the
+         * user left — and the state file is the only place that lives. Read here rather than inside
+         * the router so the router keeps knowing nothing about persistence.
+         */
+        const browse = await this.#browseFor(message.accountId, message.conversationId)
         const routed = await this.#router.route({
           conversationId: message.conversationId,
           accountId: message.accountId,
@@ -2051,17 +2018,31 @@ class WechatRuntime {
           // The listing a bare number answers from: the one this message quotes, or the newest one
           // this conversation was sent. Read before routing, so the router never has to guess.
           ...(await this.#numberedRowsFor(message.conversationId, message.accountId, message)),
+          ...(browse === undefined ? {} : { browse }),
         })
         if (routed.kind === 'reply') {
-          await this.#reply(
+          const delivered = await this.#reply(
             account,
             message.conversationId,
             message.peerId,
             routed.text,
             routed.numbered,
           )
+          /*
+           * A screen advances the browse only once it has actually gone out.
+           *
+           * The position is what 「查看其余」 continues, so advancing it past a message the service
+           * refused would make the next step skip a page the user never saw. Clearing is exempt:
+           * a conversation that is not browsing is already there, and a failed clear costs nothing.
+           */
+          if (delivered || routed.browse === undefined) {
+            await this.#trackBrowse(message.accountId, message.conversationId, routed.browse)
+          }
           return false
         }
+        // Anything handed to the agent ends the browse: the user has moved on to something else, and
+        // the phrase must not later continue a listing they are no longer looking at.
+        await this.#trackBrowse(message.accountId, message.conversationId, undefined)
         await this.#prompt(routed.decision, message, [], quoted)
         return true
       }
@@ -2079,6 +2060,9 @@ class WechatRuntime {
         await this.#reply(account, message.conversationId, message.peerId, bound.text)
         return false
       }
+      // A file is not a step in a listing, so the browse it may have interrupted is left behind —
+      // the same rule as any other message that is not a step.
+      await this.#trackBrowse(message.accountId, message.conversationId, undefined)
       await this.#prompt({ ...bound.decision, prompt: text }, message, attachments, quoted)
       return true
     } catch (error) {
@@ -2650,7 +2634,7 @@ class WechatRuntime {
           target: {
             type: 'string',
             description:
-              'For switch, the conversation to move to: its number from list, or its title. For new, an optional title. For list, the literal "all" shows conversations from every workspace, not just this channel\'s own.',
+              'For switch, the conversation to move to: its number from list, its title, or the 6-character id printed at the end of its row. For new, an optional title. For list, the literal "all" shows the workspaces on this machine instead of this workspace\'s own conversations.',
           },
         },
         required: ['action'],
@@ -2663,7 +2647,6 @@ class WechatRuntime {
           properties: {
             detail: { type: 'string' },
             ok: { type: 'boolean' },
-            otherWorkspaces: { type: 'number' },
           },
           required: ['detail', 'ok'],
         },
@@ -2686,7 +2669,6 @@ class WechatRuntime {
         return {
           detail: result.rows === '' ? result.detail : `${result.detail}\n\n${result.rows}`,
           ok: result.ok,
-          otherWorkspaces: result.otherWorkspaces,
         }
       },
     }
@@ -3136,8 +3118,8 @@ class WechatRuntime {
     conversationId: string,
     peerId: string,
     text: string,
-    numbered?: readonly NumberedSession[],
-  ): Promise<void> {
+    numbered?: NumberedRows,
+  ): Promise<boolean> {
     /*
      * Anything sent into a conversation ends the "typing…" state for it: the channel is speaking, so
      * it is no longer composing. This is where the indicator is cleared for a turn handed to the
@@ -3149,7 +3131,7 @@ class WechatRuntime {
     const contextToken = state.contextTokens[account.accountId]?.[conversationId]
     const settings = await this.#settings()
     try {
-      await this.#sendWithinLimit(
+      return await this.#sendWithinLimit(
         account,
         conversationId,
         peerId,
@@ -3160,6 +3142,7 @@ class WechatRuntime {
       )
     } catch (error) {
       this.#recordError(`发送失败: ${error instanceof Error ? error.message : String(error)}`)
+      return false
     }
   }
 
@@ -3177,6 +3160,8 @@ class WechatRuntime {
    * @param settings - Resolved settings, so one message sees one consistent limit.
    * @param contextToken - Reply token, when one is stored.
    * @param numbered - Rows this reply numbered, recorded against the id the service assigns.
+   * @returns Whether the message reached the service, which a caller tracking a browsing position
+   *   needs: a position must not advance past a screen nobody received.
    */
   async #sendWithinLimit(
     account: WeixinAccount,
@@ -3185,11 +3170,11 @@ class WechatRuntime {
     text: string,
     settings: Required<ChannelSettings>,
     contextToken: string | undefined,
-    numbered?: readonly NumberedSession[],
-  ): Promise<void> {
+    numbered?: NumberedRows,
+  ): Promise<boolean> {
     const limit = settings.maxReplyChars
     if (limit <= 0 || text.length <= limit) {
-      await this.#sendText(
+      return await this.#sendText(
         account,
         conversationId,
         peerId,
@@ -3197,7 +3182,6 @@ class WechatRuntime {
         contextToken,
         numbered,
       )
-      return
     }
 
     // A caption so the file is not an unexplained attachment, then the file itself. The numbering is
@@ -3220,6 +3204,8 @@ class WechatRuntime {
       ...(contextToken === undefined ? {} : { contextToken }),
     })
     this.#recordBoot(`long reply ${String(text.length)} chars -> ${name}`)
+    // The content arrived, as a file: a caller tracking a browsing position may advance.
+    return true
   }
 
   /**
@@ -3286,8 +3272,8 @@ class WechatRuntime {
     peerId: string,
     text: string,
     contextToken: string | undefined,
-    numbered?: readonly NumberedSession[],
-  ): Promise<void> {
+    numbered?: NumberedRows,
+  ): Promise<boolean> {
     const sent = await this.#send({
       account,
       to: peerId,
@@ -3336,6 +3322,9 @@ class WechatRuntime {
         await this.#rememberListedRows(account.accountId, conversationId, id, numbered)
       }
     }
+    // Reported so a caller with a browsing position knows whether the screen arrived. A service that
+    // answered without a message id did not deliver it, which is the same failure §3.6 records.
+    return typeof id === 'string'
   }
 
   /**

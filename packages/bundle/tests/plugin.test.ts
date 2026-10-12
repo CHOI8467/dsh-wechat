@@ -1135,7 +1135,7 @@ async function control(
   harness: Harness,
   action: string,
   target?: string,
-): Promise<{ detail: string; ok: boolean; otherWorkspaces: number }> {
+): Promise<{ detail: string; ok: boolean }> {
   const bound = await harness.runtime.bindings()
   const sessionId =
     bound[0]?.sessionId ?? harness.prompted.at(-1)?.sessionId ?? harness.created.at(-1)?.sessionId
@@ -1151,7 +1151,7 @@ async function controlFrom(
   sessionId: string,
   action: string,
   target?: string,
-): Promise<{ detail: string; ok: boolean; otherWorkspaces: number }> {
+): Promise<{ detail: string; ok: boolean }> {
   const args: Record<string, unknown> = { action }
   if (target !== undefined) args.target = target
   return await sessionTool(harness).execute(args, { agent: { session: { id: sessionId } } })
@@ -1252,19 +1252,20 @@ test('the session tool lists conversations with the number to answer', async () 
      */
     assert.equal(harness.sent.length, before + 1, 'exactly one message was sent')
     const body = harness.sent.at(-1)?.text ?? ''
-    // A count, a numbered row per conversation with the current one marked, the id that tells two
-    // same-workspace conversations apart, and the sentence that makes it answerable.
-    assert.match(body, /共 2 个对话/)
+    // A heading that says which level and which screen, a numbered row per conversation with the
+    // current one marked, the id that tells two same-workspace conversations apart, and the sentence
+    // that makes it answerable.
+    assert.match(body, /【微信会话】会话（1\/1）/)
     assert.match(body, /1\. /)
     assert.match(body, /2\. /)
     assert.match(body, /← 当前/)
-    assert.match(body, /【微信会话】/, 'the rows are grouped under the workspace they belong to')
     // Both ways to answer are named, including the short id: the row prints it, so nothing else tells
     // the user what it is for, and it is the one form that cannot expire.
-    assert.match(body, /回复 \/switch 编号，或 \/switch 行尾那个 6 位 id/)
-    assert.match(body, /如第 1 行的 [0-9a-f]{1,6}/, 'the hint uses a row from this very listing')
+    assert.match(body, /回复编号或行尾 6 位 id 切换/)
     assert.match(body, /引用这条消息再回编号/, 'the quote trick is explained where it is needed')
-    // Every row closes with the short id `/switch <id>` accepts, within the six-character bound.
+    // One screen and no more, so the phrase that pages on is not offered where it would do nothing.
+    assert.doesNotMatch(body, /查看其余/)
+    // Every row closes with the short id the reply accepts, within the six-character bound.
     for (const row of body.split('\n').filter((line) => /^\d+\. /.test(line))) {
       assert.ok(/  [0-9a-f]{1,6}$/.test(row), `no short id at the end of the row: ${row}`)
     }
@@ -1674,20 +1675,30 @@ test('another workspace is counted and named as reachable, not listed by default
 
       await control(harness, 'list')
       const body = harness.sent.at(-1)?.text ?? ''
-      // The default list stays short: this chat's own conversations only.
+      // The default list opens this workspace's conversations, so the other project's session is not
+      // in it — but the user is told the rest exists, which workspaces they are in, and how to reach
+      // them, or they never learn that conversations from other projects can be switched to.
       assert.doesNotMatch(body, /解题辅导会话/)
-      // But the user is told the rest exists, which workspaces they are in, and how to reach them —
-      // otherwise they never learn that conversations from other projects can be switched to.
-      assert.match(body, /另有 1 个对话在其它工作区（some_project）/)
+      assert.match(body, /【微信会话】会话（1\/1）/)
+      assert.match(body, /另有 1 个对话在其它会话夹（some_project）/)
       assert.match(body, /看全部对话/)
 
       await control(harness, 'list', 'all')
       const wider = harness.sent.at(-1)?.text ?? ''
-      assert.match(wider, /解题辅导会话/, 'the wider list shows it')
-      // Grouped, so a row's project is readable rather than inferred: the channel's own workspace by
-      // the name the user knows it by, and the other by its folder.
-      assert.match(wider, /【微信会话】/)
-      assert.match(wider, /【some_project】/)
+      // The workspace level: one row per project, with how many conversations it holds. The session
+      // title belongs to the level below this one.
+      assert.match(wider, /会话夹（1\/1）/)
+      assert.match(wider, /1\. 微信会话  1 个会话/)
+      assert.match(wider, /2\. some_project  1 个会话/)
+      assert.doesNotMatch(wider, /解题辅导会话/)
+      assert.doesNotMatch(wider, /另有/, 'nothing is held back at this level')
+
+      // Entering the folder is answered by the channel, by name or by number, and shows its rows.
+      await harness.runtime.ingest(inbound('some_project'))
+      assert.match(harness.sent.at(-1)?.text ?? '', /【some_project】会话（1\/1）/)
+      assert.match(harness.sent.at(-1)?.text ?? '', /1\. 解题辅导会话/)
+      // Entering a folder is browsing, not switching: no turn was started and the chat has not moved.
+      assert.equal(harness.prompted.length, 1, 'only the first message reached the agent')
     } finally {
       harness.dispose()
     }
@@ -1696,18 +1707,19 @@ test('another workspace is counted and named as reachable, not listed by default
   }
 })
 
-test('a spoken full list shows more than one workspace even when this one is the busiest', async () => {
+test('a spoken full list shows every workspace even when this one is the busiest', async () => {
   /*
-   * The spoken route groups and cuts the rows itself, so the per-workspace share has to be applied
-   * there too. Fixing only the typed command would leave the same question answered two ways — the
-   * divergence this repository has already been bitten by once.
+   * The spoken route must reach the same level as the typed command. Before this it grouped and cut
+   * the rows itself, so fixing only `/list all` would have left the same question answered two ways —
+   * the divergence this repository has already been bitten by once. Now both call the same command
+   * and send the router's own rendering.
    */
   const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
   try {
     await seedState(home, { ...DEFAULT_SETTINGS, requireConfirmation: false })
     const workspace = join(home, 'dsh_wechat')
-    // Seeded first, so it is older than everything this workspace holds: a single global cut of the
-    // newest rows would be this workspace alone.
+    // Seeded first, so it is older than everything this workspace holds: any single cut of the newest
+    // rows would be this workspace alone.
     await seedStoredSession(home, join(home, 'some_project'), 'session-ffff9999-ffff9999-x', '别处的工作')
     for (let index = 0; index < 12; index += 1) {
       await seedStoredSession(
@@ -1725,12 +1737,12 @@ test('a spoken full list shows more than one workspace even when this one is the
       assert.equal(result.ok, true, result.detail)
 
       const body = harness.sent.at(-1)?.text ?? ''
-      const headings = [...body.matchAll(/^【(.+)】$/gm)].map((match) => match[1])
-      assert.ok(
-        headings.includes('some_project'),
-        `asked to see everything, the reply must not be this workspace alone:\n${body}`,
-      )
-      assert.ok(headings.length >= 2, `expected several workspaces:\n${body}`)
+      assert.match(body, /会话夹（1\/1）/, 'the workspace level, not a flat table')
+      assert.match(body, /1\. 微信会话  13 个会话/, 'this workspace is a folder like any other')
+      assert.match(body, /2\. some_project  1 个会话/, 'and the other one is visible without paging')
+      assert.match(body, /回复编号或名字进入/)
+      // The session titles live one level down, so they are not printed here.
+      assert.doesNotMatch(body, /本工作区 0|别处的工作/)
     } finally {
       harness.dispose()
     }
@@ -1739,26 +1751,86 @@ test('a spoken full list shows more than one workspace even when this one is the
   }
 })
 
-test('a quoted spoken full list answers with the rows it printed', async () => {
+test('a quoted spoken listing answers with the rows that message printed', async () => {
   /*
-   * The failure this guards: the spoken "show me every conversation" ran the router with a bare
-   * `/list`, so the numbering frozen under the sent message was *this workspace's* while the message
-   * itself printed every workspace's. Quoting it and replying with a number then moved the chat to a
-   * row that message never showed — the drift the quote exists to remove, reintroduced by the two
-   * halves of the same feature disagreeing about which list they were numbering.
-   *
-   * The two numberings are made to differ at the row under test on purpose: with thirteen
-   * conversations in this workspace and one elsewhere, that row is a workspace conversation in a
-   * plain `/list` and the foreign one in the full list. A test whose two sources happened to agree
-   * would pass with the bug still in place, so the disagreement is asserted rather than assumed.
+   * The numbering is frozen under the id the service assigns to the message that printed it, so a
+   * quote of that message resolves the numbers the user can see. Paging makes this sharper rather
+   * than weaker: numbering runs on across screens, so a screen that printed 11..13 must answer "13"
+   * with its own row — and the screen before it, which stopped at 10, must not answer that number at
+   * all. The two are asserted against each other, because a test where they agreed would pass with
+   * the offset missing.
    */
   const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
   try {
     await seedState(home, { ...DEFAULT_SETTINGS, requireConfirmation: false })
     const workspace = join(home, 'dsh_wechat')
-    const foreignId = 'session-ffff9999-ffff9999-x'
-    // Seeded first, so it is the oldest of all and can only appear after every workspace row.
-    await seedStoredSession(home, join(home, 'some_project'), foreignId, '别处的工作')
+    const ids: string[] = []
+    for (let index = 0; index < 13; index += 1) {
+      const id = `session-${String(index).padStart(4, '0')}aaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa`
+      ids.push(id)
+      // Oldest first, so the newest is row 1 and the oldest is row 13.
+      await seedStoredSession(home, workspace, id, `本工作区 ${String(index)}`)
+    }
+    const oldest = ids[0] ?? ''
+
+    const harness = await mount({ home, seedAccount: false, hostReportsNoSessions: true })
+    try {
+      await harness.runtime.ingest(inbound('第一条'))
+
+      const listed = await control(harness, 'list')
+      assert.equal(listed.ok, true, listed.detail)
+      const pageOne = harness.sent.at(-1)?.text ?? ''
+      const pageOneId = `msg-${String(harness.sent.length)}`
+      assert.match(pageOne, /【微信会话】会话（1\/2）/)
+      assert.equal(pageOne.split('\n').filter((line) => /^\d+\. /.test(line)).length, 10)
+      assert.doesNotMatch(pageOne, /本工作区 0 ·/, 'the oldest is not on the first screen')
+
+      // 「查看其余」 walks to the second screen, which the channel answers itself.
+      await harness.runtime.ingest(inbound('查看其余'))
+      const pageTwo = harness.sent.at(-1)?.text ?? ''
+      const pageTwoId = `msg-${String(harness.sent.length)}`
+      assert.match(pageTwo, /【微信会话】会话（2\/2）/)
+      assert.match(pageTwo, /^14\. 本工作区 0/m, `the numbering runs on:\n${pageTwo}`)
+
+      // Quoting the second screen and answering with its own number means that row.
+      await harness.runtime.ingest(quoting('/switch 14', pageTwoId))
+      assert.match(harness.sent.at(-1)?.text ?? '', /已切换到「本工作区 0」/)
+      assert.equal((await harness.runtime.bindings())[0]?.sessionId, oldest)
+
+      // And the first screen, which never printed 14, does not answer it: the offset is what makes
+      // the same text mean the row on the screen it was typed against. Row 1 is a different
+      // conversation, so "nothing moved" is a real assertion rather than the binding already being
+      // the one under test.
+      await harness.runtime.ingest(quoting('/switch 1', pageOneId))
+      const afterFirst = (await harness.runtime.bindings())[0]?.sessionId
+      assert.ok(afterFirst)
+      assert.notEqual(afterFirst, oldest, 'row 1 of the first screen is a different conversation')
+
+      await harness.runtime.ingest(quoting('/switch 14', pageOneId))
+      assert.match(harness.sent.at(-1)?.text ?? '', /找不到这个对话/)
+      assert.equal(
+        (await harness.runtime.bindings())[0]?.sessionId,
+        afterFirst,
+        'a number that screen never printed moves nothing',
+      )
+    } finally {
+      harness.dispose()
+    }
+  } finally {
+    await removeHome(home)
+  }
+})
+
+test('the phrase that pages on is answered by the channel, without waking the agent', async () => {
+  /*
+   * 「查看其余」 carries no target, so only the channel knows what it continues — the agent sees two
+   * characters and no question. It has to be answered locally, and the position it continues has to
+   * outlive the message that set it, which is what the state file is for.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
+  try {
+    await seedState(home, { ...DEFAULT_SETTINGS, requireConfirmation: false })
+    const workspace = join(home, 'dsh_wechat')
     for (let index = 0; index < 12; index += 1) {
       await seedStoredSession(
         home,
@@ -1771,43 +1843,139 @@ test('a quoted spoken full list answers with the rows it printed', async () => {
     const harness = await mount({ home, seedAccount: false, hostReportsNoSessions: true })
     try {
       await harness.runtime.ingest(inbound('第一条'))
+      const promptsBefore = harness.prompted.length
 
-      const listed = await control(harness, 'list', 'all')
-      assert.equal(listed.ok, true, listed.detail)
-      const body = harness.sent.at(-1)?.text ?? ''
-      // The id the service assigned to that very message, which is what a quote of it carries.
-      const listId = `msg-${String(harness.sent.length)}`
-
-      const rows = body.split('\n').filter((line) => /^\d+\. /.test(line))
-      const foreignRow = rows.findIndex((line) => line.includes('别处的工作')) + 1
-      assert.ok(foreignRow > 3, `the foreign row sits past this workspace's share:\n${body}`)
-
-      /*
-       * What that number would have meant had the full list been numbered as a plain `/list` — a
-       * workspace conversation. Asserted, because the test below is only able to detect the bug if
-       * the two numberings really do disagree here.
-       */
       await harness.runtime.ingest(inbound('/list'))
-      const ownRows = (harness.sent.at(-1)?.text ?? '')
-        .split('\n')
-        .filter((line) => /^\d+\. /.test(line))
-      const ownRow = ownRows[foreignRow - 1] ?? ''
-      assert.match(ownRow, /本工作区/, `the plain list has a row ${String(foreignRow)}`)
-      assert.doesNotMatch(
-        ownRow,
-        /别处的工作/,
-        'the two numberings must differ at this row, or the quote is untested',
-      )
+      assert.match(harness.sent.at(-1)?.text ?? '', /【微信会话】会话（1\/2）/)
+      const pageOneId = `msg-${String(harness.sent.length)}`
 
-      // Quoting the full list and answering with its own number still means that row: the row the
-      // message printed, not the row this workspace's numbering would put there.
-      await harness.runtime.ingest(quoting(`/switch ${String(foreignRow)}`, listId))
-      assert.match(harness.sent.at(-1)?.text ?? '', /已切换到「别处的工作」/)
-      assert.equal(
-        (await harness.runtime.bindings())[0]?.sessionId,
-        foreignId,
-        'the quoted full list decided what the number meant',
+      await harness.runtime.ingest(inbound('查看其余'))
+      const pageTwo = harness.sent.at(-1)?.text ?? ''
+      assert.match(pageTwo, /【微信会话】会话（2\/2）/)
+      assert.match(pageTwo, /^11\. /m, 'the numbering runs on across screens')
+      assert.equal(harness.prompted.length, promptsBefore, 'the phrase never became a turn')
+
+      // The second screen is frozen under its own message id, and answering it with a row on it
+      // switches — so the position and the numbering agree about which screen is on screen.
+      await harness.runtime.ingest(quoting('12', `msg-${String(harness.sent.length)}`))
+      assert.match(harness.sent.at(-1)?.text ?? '', /已切换到/)
+
+      // That switch ended the browse, so the phrase now belongs to the agent again rather than
+      // continuing a listing the user has left.
+      await harness.runtime.ingest(inbound('查看其余'))
+      assert.equal(harness.prompted.length, promptsBefore + 1, 'the browse was dropped by the switch')
+      assert.doesNotMatch(harness.sent.at(-1)?.text ?? '', /会话（2\/2）/)
+      void pageOneId
+    } finally {
+      harness.dispose()
+    }
+  } finally {
+    await removeHome(home)
+  }
+})
+
+test('where a conversation stopped browsing outlives the plugin, and not for ever', async () => {
+  /*
+   * The position is in the state file, so it has to survive the two things that happen to that file:
+   * a restart (DSH updates, the machine reboots, the user toggles the channel) and time.
+   *
+   * The restart half is the one that catches the §4.9 mistake — a field written but dropped by the
+   * reader looks perfectly healthy inside one process, where the in-memory copy still has it. Only a
+   * remount reads the file back, and a 「查看其余」 that reaches the agent instead of paging is what a
+   * dropped position looks like to the user.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
+  try {
+    await seedState(home, { ...DEFAULT_SETTINGS, requireConfirmation: false })
+    const workspace = join(home, 'dsh_wechat')
+    for (let index = 0; index < 12; index += 1) {
+      await seedStoredSession(
+        home,
+        workspace,
+        `session-${String(index).padStart(4, '0')}aaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa`,
+        `本工作区 ${String(index)}`,
       )
+    }
+
+    const first = await mount({ home, seedAccount: false, hostReportsNoSessions: true })
+    try {
+      await first.runtime.ingest(inbound('第一条'))
+      await first.runtime.ingest(inbound('/list'))
+      assert.match(first.sent.at(-1)?.text ?? '', /会话（1\/2）/)
+      const stored = JSON.parse(await readFile(join(home, 'wechat', 'state.json'), 'utf8')) as {
+        browsing?: Record<string, Record<string, { page: number }>>
+      }
+      assert.equal(
+        stored.browsing?.['test@im.bot']?.['test@im.bot:peer@im.wechat']?.page,
+        1,
+        'the position is on disk, not only in memory',
+      )
+    } finally {
+      first.dispose()
+    }
+
+    const second = await mount({ home, seedAccount: false, hostReportsNoSessions: true })
+    try {
+      const before = second.prompted.length
+      await second.runtime.ingest(inbound('查看其余'))
+      assert.match(second.sent.at(-1)?.text ?? '', /会话（2\/2）/, 'the position was read back')
+      assert.equal(second.prompted.length, before, 'and the phrase still never became a turn')
+    } finally {
+      second.dispose()
+    }
+  } finally {
+    await removeHome(home)
+  }
+})
+
+test('a position left overnight pages nothing, and a stale one is dropped', async () => {
+  /*
+   * The phrase is only meaningful while the user is still reading. Without an expiry, 「查看其余」
+   * typed the next morning would jump into the middle of a list nobody remembers — which is worse
+   * than treating it as an ordinary message, so an abandoned position is retired and the words reach
+   * the agent like anything else.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
+  try {
+    await seedState(home, { ...DEFAULT_SETTINGS, requireConfirmation: false })
+    const workspace = join(home, 'dsh_wechat')
+    for (let index = 0; index < 12; index += 1) {
+      await seedStoredSession(
+        home,
+        workspace,
+        `session-${String(index).padStart(4, '0')}aaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa`,
+        `本工作区 ${String(index)}`,
+      )
+    }
+
+    const harness = await mount({ home, seedAccount: false, hostReportsNoSessions: true })
+    try {
+      await harness.runtime.ingest(inbound('第一条'))
+      await harness.runtime.ingest(inbound('/list'))
+      const stateFile = join(home, 'wechat', 'state.json')
+      const stored = JSON.parse(await readFile(stateFile, 'utf8')) as {
+        browsing?: Record<string, Record<string, { page: number; at: number }>>
+      }
+      const at = stored.browsing?.['test@im.bot']?.['test@im.bot:peer@im.wechat']?.at
+      assert.ok(at, `the position was not stored: ${JSON.stringify(stored.browsing)}`)
+
+      // Backdate it past the idle window, the way a night's sleep would.
+      stored.browsing!['test@im.bot']!['test@im.bot:peer@im.wechat']!.at = at - 24 * 60 * 60 * 1000
+      await writeFile(stateFile, JSON.stringify(stored, null, 2), 'utf8')
+      // The store caches, so the plugin has to be restarted to read the edited file — which is also
+      // what a real overnight gap looks like from the plugin's point of view.
+      harness.dispose()
+      const restarted = await mount({ home, seedAccount: false, hostReportsNoSessions: true })
+      try {
+        const before = restarted.prompted.length
+        await restarted.runtime.ingest(inbound('查看其余'))
+        assert.equal(restarted.prompted.length, before + 1, 'it reached the agent as an ordinary message')
+        assert.doesNotMatch(restarted.sent.at(-1)?.text ?? '', /会话（2\/2）/)
+        const after = JSON.parse(await readFile(stateFile, 'utf8')) as { browsing?: unknown }
+        assert.equal(after.browsing?.['test@im.bot'], undefined, 'and the stale position was dropped')
+      } finally {
+        restarted.dispose()
+      }
     } finally {
       harness.dispose()
     }
@@ -1944,9 +2112,14 @@ test('the session tool reports the current conversation', async () => {
     await harness.runtime.ingest(inbound('第一条'))
     const result = await control(harness, 'current')
     assert.equal(result.ok, true)
-    // The marker is the answer to "which one am I in", so it has to be present and unambiguous.
-    assert.match(result.detail, /← 当前/)
-    assert.match(result.detail, /1\. /)
+    // The answer is `/current`'s own words, the same ones a typed command produces: the spoken and
+    // typed routes share one implementation, so a user asking in a sentence and a user typing the
+    // command must not get two different replies.
+    assert.match(result.detail, /当前对话「/)
+    assert.match(result.detail, /[0-9a-f]{6}/, 'and the id, which is what identifies it')
+    // And the channel said it, rather than leaving the agent to describe a conversation the user
+    // cannot see.
+    assert.match(harness.sent.at(-1)?.text ?? '', /当前对话「/)
   })
 })
 

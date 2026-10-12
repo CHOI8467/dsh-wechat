@@ -127,8 +127,8 @@ window.__ModuleLoader__.load({
         commandsSlashHint: '在微信里直接发送。不经过 agent，也不问确认，最快。',
         commandHelp: '显示指令列表',
         commandNew: '新建对话，可带标题',
-        commandList: '列出本工作区的对话（加 all 连其它工作区一起列）',
-        commandSwitch: '切换到第 N 个对话，或按行尾那个 6 位 id 切换',
+        commandList: '列出本工作区的对话；加 all 先列会话夹（工作区），回复编号或名字进入',
+        commandSwitch: '切换到第 N 个对话，或按行尾那个 6 位 id 切换；回复「查看其余」看下十个',
         commandModel: '看有哪些模型；带编号或名字则切换',
         commandCurrent: '显示当前对话',
         commandCancel: '中断当前任务',
@@ -225,8 +225,10 @@ window.__ModuleLoader__.load({
         commandsSlashHint: 'Sent straight from WeChat. They skip the agent and need no confirmation, so they are the fastest route.',
         commandHelp: 'Show the command list',
         commandNew: 'Start a new conversation, optionally titled',
-        commandList: 'List this workspace\'s conversations (add all for every workspace)',
-        commandSwitch: 'Move to conversation number N, or switch by the 6-character id at the end of a row',
+        commandList:
+          'List this workspace\'s conversations; with all, list the workspaces first and reply with a number or a name to enter one',
+        commandSwitch:
+          'Move to conversation number N, or switch by the 6-character id at the end of a row; reply 「查看其余」 for the next ten',
         commandModel: 'List the models; with a number or name, switch to it',
         commandCurrent: 'Show the conversation in use',
         commandCancel: 'Interrupt the running task',

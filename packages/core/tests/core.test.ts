@@ -14,24 +14,28 @@ import { test } from 'node:test'
 
 import { parseWireJson, extractRawIds, baseInfo, buildHeaders, assertSendAccepted, SendRefusedError } from '../src/http.ts'
 import { conversationKey, extractText, toInbound, sendText } from '../src/channel.ts'
-import { DEFAULT_SETTINGS, StateStore, SESSION_LIST_HISTORY, SESSION_LIST_TITLE_LIMIT, expirePendingNotifications, findSessionList, latestSessionList, queuePendingNotification, rememberSessionList, type ChannelSettings } from '../src/state.ts'
+import { DEFAULT_SETTINGS, StateStore, SESSION_LIST_HISTORY, SESSION_LIST_TITLE_LIMIT, expirePendingNotifications, findBrowse, findSessionList, forgetBrowse, latestSessionList, queuePendingNotification, rememberBrowse, rememberSessionList, type ChannelSettings } from '../src/state.ts'
 import {
   SessionRouter,
+  BROWSE_PAGE_SIZE,
   SHORT_ID_LENGTH,
-  LIST_ALL_GROUP_LIMIT,
-  LIST_ALL_LIMIT,
+  SHOW_REST,
+  ambiguousFolderMessage,
   ambiguousTargetMessage,
-  flattenSessionGroups,
-  groupSessionRows,
+  browsePage,
+  isShowRest,
   mintSessionId,
   relativeTime,
-  renderSessionList,
+  renderFolderScreen,
+  renderSessionScreen,
+  resolveFolder,
   resolveTarget,
+  sessionFolders,
   shortId,
   splitCommand,
   HELP_TEXT,
 } from '../src/router.ts'
-import type { ListedSession, NumberedSession, SessionBinding, SessionGateway, TargetResolution } from '../src/router.ts'
+import type { BrowsePosition, ListedSession, NumberedRows, NumberedSession, SessionBinding, SessionFolder, SessionGateway, TargetResolution } from '../src/router.ts'
 import type { ChannelState } from '../src/state.ts'
 import { chargeQuota, quotaLedgerFor, type QuotaEntry } from '../src/quota.ts'
 import type { WeixinAccount, WeixinMessage } from '../src/types.ts'
@@ -347,18 +351,51 @@ test('/list marks the current session and /switch moves between them', async () 
   assert.doesNotMatch(after.text, /第二个/)
 })
 
-test('/list shows this workspace and mentions the rest, and /list all shows everything', async () => {
+/** The `1. …` rows of a rendered screen, in printed order. */
+function screenRows(text: string): string[] {
+  return text.split('\n').filter((line) => /^\d+\. /.test(line))
+}
+
+/**
+ * Drive the router the way the host does, carrying the browsing position between messages.
+ *
+ * In production the position lives in the state file and the host reads and writes it; here it is a
+ * local, because what is under test is the router's half of that arrangement — 「查看其余」 walking
+ * whichever level the last reply left the conversation on.
+ *
+ * @param router - Router to drive.
+ * @param target - Conversation to drive it for.
+ */
+function browsing(
+  router: SessionRouter,
+  target: { conversationId: string; accountId: string; peerId: string } = conversation,
+) {
+  let browse: BrowsePosition | undefined
+  return {
+    async say(text: string) {
+      const result = await router.route({
+        ...target,
+        text,
+        ...(browse === undefined ? {} : { browse }),
+      })
+      browse = result.kind === 'reply' ? result.browse : undefined
+      return result
+    },
+    position: () => browse,
+  }
+}
+
+test('/list opens this workspace, and /list all opens the workspace list', async () => {
   /*
-   * The typed and spoken routes have to agree. Before this, `/list` printed every session on the
-   * machine — sixty-six of them here, ten of which belonged to this workspace — while a spoken
-   * request showed only the ten and said how many others existed. The same question giving two
-   * different answers is what makes a command feel broken.
+   * The two commands answer at different levels now. `/list` is the listing people actually want, so
+   * it opens this workspace's conversations directly; `/list all` opens the workspaces, which is the
+   * only way to reach anything else. Before this, both printed one flat table and the whole-machine
+   * one was indistinguishable from the local one on a machine whose own workspace is the busiest.
    */
   const gateway = new FakeGateway()
   const router = new SessionRouter({ gateway, store: memoryStore() })
 
   await router.route({ ...conversation, text: 'one' })
-  const mine = await gateway.listSessions()
   // A session belonging to another project, which the gateway reports separately.
   gateway.foreign.push({
     sessionId: 'session-ffff9999-ffff9999-x',
@@ -370,234 +407,267 @@ test('/list shows this workspace and mentions the rest, and /list all shows ever
   const own = await router.route({ ...conversation, text: '/list' })
   assert.equal(own.kind, 'reply')
   if (own.kind !== 'reply') return
-  // The count includes the held sessions, so the user knows the size of what they are not seeing.
-  assert.match(own.text, new RegExp(`共 ${String(mine.length + 1)} 个`))
+  // The heading says which level this is and how many screens it has.
+  assert.match(own.text, /【微信会话】会话（1\/1）/)
   assert.doesNotMatch(own.text, /别处的工作/, 'the default list is this workspace only')
-  assert.match(own.text, /另有 1 个对话在其它工作区（some_project）/)
+  assert.match(own.text, /另有 1 个对话在其它会话夹（some_project）/)
   // And how to reach them, or the hint is useless.
   assert.match(own.text, /\/list all/)
+  // Every screen leaves a position behind, or 「查看其余」 has nothing to continue.
+  assert.equal(own.browse?.level, 'sessions')
+  assert.equal(own.browse?.page, 1)
 
   const all = await router.route({ ...conversation, text: '/list all' })
   assert.equal(all.kind, 'reply')
   if (all.kind !== 'reply') return
-  assert.match(all.text, /别处的工作/, 'the wider list shows it')
-  assert.doesNotMatch(all.text, /另有/, 'nothing is being held back now')
-  // Grouped rather than flat: each workspace gets its own heading, which is the only thing that says
-  // which project a row came from.
-  assert.match(all.text, /【微信会话】/)
-  assert.match(all.text, /【some_project】/)
+  // The workspace level lists folders with counts, not conversations: a session title here would mean
+  // the level the user asked for is not the level they got.
+  assert.match(all.text, /会话夹（1\/1）/)
+  assert.match(all.text, /1\. 微信会话  1 个会话/)
+  assert.match(all.text, /2\. some_project  1 个会话/)
+  assert.doesNotMatch(all.text, /别处的工作/)
+  assert.equal(all.browse?.level, 'folders')
+  // Nothing is held back at this level, so nothing is counted out loud.
+  assert.doesNotMatch(all.text, /另有/)
 })
 
-test('a listing groups by workspace, and numbers the rows it prints', async () => {
-  const gateway = new FakeGateway()
-  const router = new SessionRouter({
-    gateway,
-    store: memoryStore(),
-    ownWorkspace: 'C:\\Users\\me\\dsh_wechat',
-  })
-  await router.route({ ...conversation, text: 'one' })
-  gateway.foreign.push(
-    {
-      sessionId: 'session-bbbb2222-bbbb2222-x',
-      title: '优化封面图',
-      updatedAt: gateway.nextStamp(),
-      workspace: 'C:\\Users\\me\\Desktop\\DH\\workplace',
-    },
-    {
-      sessionId: 'session-cccc3333-cccc3333-x',
-      title: '修 bug',
-      updatedAt: gateway.nextStamp(),
-      workspace: 'C:\\Users\\me\\Desktop\\DH\\workplace',
-    },
-  )
-
-  const listed = await router.route({ ...conversation, text: '/list all' })
-  assert.equal(listed.kind, 'reply')
-  if (listed.kind !== 'reply') return
-
-  const rows = listed.text.split('\n').filter((line) => /^\d+\. /.test(line))
-  assert.equal(rows.length, 3)
-  // The numbering runs on across headings, which is what makes a single number enough to reply with.
-  assert.match(rows[0]!, /^1\. /)
-  assert.match(rows[2]!, /^3\. /)
-  // Every row ends with the short form of its own id, which is what `/switch <id>` accepts.
-  for (const line of rows) {
-    const id = /  ([0-9a-f]{1,6})$/.exec(line)?.[1]
-    assert.ok(id, `no short id at the end of the row: ${line}`)
-    assert.ok(id.length <= 6, `short id longer than six characters: ${id}`)
-  }
-
-  // And the numbering the reply reports is exactly what it printed, in the same order — this is what
-  // the caller freezes so a quote can resolve against it later.
-  assert.deepEqual(
-    listed.numbered?.map((session) => session.sessionId),
-    [
-      gateway.sessions[0]!.sessionId,
-      gateway.foreign[1]!.sessionId,
-      gateway.foreign[0]!.sessionId,
-    ],
-    'own workspace first, then the others newest first',
-  )
-})
-
-/**
- * The workspace headings of a rendered listing, with the rows printed under each.
- *
- * Read back out of the message rather than out of the renderer's own structures, because the bug this
- * is used to catch was visible only in the text the user receives.
- *
- * @param text - A rendered listing.
- * @returns Headings in display order, each mapped to its numbered rows.
- */
-function listingGroups(text: string): Map<string, string[]> {
-  const groups = new Map<string, string[]>()
-  let current: string[] | undefined
-  for (const line of text.split('\n')) {
-    const heading = /^【(.+)】$/.exec(line)
-    if (heading) {
-      current = []
-      groups.set(heading[1]!, current)
-      continue
-    }
-    if (current !== undefined && /^\d+\. /.test(line)) current.push(line)
-  }
-  return groups
-}
-
-test('/list all gives every workspace a share, so the busiest one cannot crowd the others out', async () => {
+test('the workspace level pages ten at a time, and the numbering runs on', async () => {
   /*
-   * The failure this exists for: the row limit was applied to the whole machine *before* the rows were
-   * grouped, and this workspace is almost always the busiest one. So `/list all` printed rows from this
-   * workspace alone, grouping then produced a single heading, and the reply was indistinguishable from
-   * plain `/list` — the user asked to see every conversation and was shown one workspace twice.
-   *
-   * The assertion is therefore about the number of *headings*. Under a single global cut this test sees
-   * one, whatever the row count says.
+   * The requirement this exists for: 「查看其余」 walks ten more, all the way to the end, and the
+   * numbers do not start over. Restarting each screen at 1 would give one number two meanings inside
+   * a single browse, which is exactly what the number is not allowed to do.
    */
   const gateway = new FakeGateway()
-  const router = new SessionRouter({
-    gateway,
-    store: memoryStore(),
-    ownWorkspace: 'C:\\Users\\me\\dsh_wechat',
-  })
-
-  // The other workspaces are seeded first, and are therefore older than everything this workspace
-  // holds: a global top ten would be nothing but this workspace, which is the state being reproduced.
-  gateway.foreign.push(
-    {
-      sessionId: 'session-ffff9999-ffff9999-x',
-      title: '别处的工作',
+  const router = new SessionRouter({ gateway, store: memoryStore() })
+  await router.route({ ...conversation, text: 'one' })
+  for (let index = 0; index < 11; index += 1) {
+    gateway.foreign.push({
+      sessionId: `session-${String(index).padStart(4, '0')}bbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb`,
+      title: `别处 ${String(index)}`,
       updatedAt: gateway.nextStamp(),
-      workspace: 'C:\\Users\\me\\some_project',
-    },
+      workspace: `C:\\Users\\me\\project${String(index)}`,
+    })
+  }
+
+  const browser = browsing(router)
+  const first = await browser.say('/list all')
+  assert.equal(first.kind, 'reply')
+  if (first.kind !== 'reply') return
+  assert.match(first.text, /会话夹（1\/2）/)
+  assert.equal(screenRows(first.text).length, BROWSE_PAGE_SIZE, 'a screen holds ten and no more')
+  assert.match(screenRows(first.text)[0] ?? '', /^1\. 微信会话/)
+  assert.match(screenRows(first.text)[BROWSE_PAGE_SIZE - 1] ?? '', /^10\. /)
+  assert.match(first.text, /回复「查看其余」看下十个/)
+
+  const second = await browser.say(SHOW_REST)
+  assert.equal(second.kind, 'reply')
+  if (second.kind !== 'reply') return
+  assert.match(second.text, /会话夹（2\/2）/)
+  assert.equal(screenRows(second.text).length, 2)
+  assert.match(screenRows(second.text)[0] ?? '', /^11\. /, 'the numbering runs on')
+  assert.match(screenRows(second.text)[1] ?? '', /^12\. /)
+  // The last screen does not invite a step that does not exist: teaching the user a command that
+  // answers "已经到底了" is worse than not mentioning it.
+  assert.doesNotMatch(second.text, /查看其余/)
+
+  const bottom = await browser.say(SHOW_REST)
+  assert.equal(bottom.kind, 'reply')
+  if (bottom.kind !== 'reply') return
+  assert.match(bottom.text, /只有 2 页，已经到底了/)
+  assert.equal(browser.position()?.page, 2, 'a step that goes nowhere must not move the position')
+})
+
+test('entering a workspace works by number and by name, and does not move the binding', async () => {
+  /*
+   * Entering is browsing, not switching. The user picked a folder to look inside; the conversation
+   * they are talking to has not changed, and moving work on the strength of a menu selection is the
+   * kind of inference this channel does not make.
+   */
+  const gateway = new FakeGateway()
+  const router = new SessionRouter({ gateway, store: memoryStore() })
+  const home = await router.route({ ...conversation, text: '第一条' })
+  assert.equal(home.kind, 'prompt')
+  if (home.kind !== 'prompt') return
+  gateway.foreign.push(
     {
       sessionId: 'session-eeee8888-eeee8888-x',
       title: '另一个项目',
       updatedAt: gateway.nextStamp(),
       workspace: 'C:\\Users\\me\\dsh_orb',
     },
-  )
-  for (let index = 0; index < 12; index += 1) {
-    gateway.sessions.push({
-      sessionId: `session-${String(index).padStart(4, '0')}aaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa`,
-      title: `本工作区 ${String(index)}`,
+    {
+      sessionId: 'session-ffff9999-ffff9999-x',
+      title: '别处的工作',
       updatedAt: gateway.nextStamp(),
-      workspace: 'C:\\Users\\me\\dsh_wechat',
+      workspace: 'C:\\Users\\me\\some_project',
+    },
+  )
+
+  const browser = browsing(router)
+  await browser.say('/list all')
+
+  const byNumber = await browser.say('2')
+  assert.equal(byNumber.kind, 'reply')
+  if (byNumber.kind !== 'reply') return
+  assert.match(byNumber.text, /【some_project】会话（1\/1）/)
+  assert.match(byNumber.text, /1\. 别处的工作/)
+  assert.equal(byNumber.browse?.level, 'sessions')
+  assert.equal(byNumber.browse?.workspace, 'C:\\Users\\me\\some_project')
+  assert.equal(
+    (await router.current(conversation.conversationId))?.sessionId,
+    home.decision.sessionId,
+    'entering a folder is not a switch',
+  )
+
+  // The name printed in the list is also accepted, because that is what a person remembers.
+  await browser.say('/list all')
+  const byName = await browser.say('some_project')
+  assert.equal(byName.kind, 'reply')
+  if (byName.kind !== 'reply') return
+  assert.match(byName.text, /【some_project】会话（1\/1）/)
+
+  // A remark that names nothing is not swallowed by the browser: it belongs to the agent.
+  await browser.say('/list all')
+  const unmatched = await browser.say('帮我看看这个 bug')
+  assert.equal(unmatched.kind, 'prompt')
+})
+
+test('two workspaces with the same folder name are not guessed between', async () => {
+  /*
+   * Two projects can both end in `workplace`, and the name printed is the last path component — so a
+   * name alone cannot say which was meant. Entering the wrong project's folder is worse than a
+   * question, and the answer names the numbers, which are never ambiguous.
+   */
+  const gateway = new FakeGateway()
+  const router = new SessionRouter({ gateway, store: memoryStore() })
+  await router.route({ ...conversation, text: '第一条' })
+  gateway.foreign.push(
+    {
+      sessionId: 'session-ffff9999-ffff9999-x',
+      title: '甲项目的工作',
+      updatedAt: gateway.nextStamp(),
+      workspace: 'C:\\Users\\me\\alpha\\workplace',
+    },
+    {
+      sessionId: 'session-eeee8888-eeee8888-x',
+      title: '乙项目的工作',
+      updatedAt: gateway.nextStamp(),
+      workspace: 'C:\\Users\\me\\beta\\workplace',
+    },
+  )
+
+  const browser = browsing(router)
+  await browser.say('/list all')
+  const clash = await browser.say('workplace')
+  assert.equal(clash.kind, 'reply')
+  if (clash.kind !== 'reply') return
+  assert.match(clash.text, /有多个会话夹匹配「workplace」/)
+  // Both candidates, each with the number that identifies it.
+  assert.match(clash.text, /2\. C:\\Users\\me\\(alpha|beta)\\workplace/)
+  assert.match(clash.text, /3\. C:\\Users\\me\\(alpha|beta)\\workplace/)
+
+  // The number works, and it is what the message told them to reply with. Folder 2 is the more
+  // recently active of the two, so it is beta — the listing's own order, not the order they were
+  // pushed in.
+  const entered = await browser.say('2')
+  assert.equal(entered.kind, 'reply')
+  if (entered.kind !== 'reply') return
+  assert.match(entered.text, /【workplace】会话（1\/1）/)
+  assert.match(entered.text, /乙项目的工作/)
+  assert.ok(entered.browse?.workspace.endsWith('beta\\workplace'))
+})
+
+test('the conversation level pages ten at a time, and a number names the row it printed', async () => {
+  /*
+   * The second level, with the same two rules: one screen of ten, and numbering that runs on. The
+   * last screen is short, and the number on it is the one that has to name its row.
+   */
+  const gateway = new FakeGateway()
+  const router = new SessionRouter({ gateway, store: memoryStore() })
+  for (let index = 0; index < 25; index += 1) {
+    gateway.sessions.push({
+      sessionId: `session-${String(index).padStart(4, '0')}cccc-cccc-4ccc-8ccc-cccccccccccc`,
+      title: `会话 ${String(index)}`,
+      updatedAt: gateway.nextStamp(),
     })
   }
 
-  const all = await router.route({ ...conversation, text: '/list all' })
-  assert.equal(all.kind, 'reply')
-  if (all.kind !== 'reply') return
+  const browser = browsing(router)
+  const first = await browser.say('/list')
+  assert.equal(first.kind, 'reply')
+  if (first.kind !== 'reply') return
+  assert.match(first.text, /【微信会话】会话（1\/3）/)
+  assert.equal(screenRows(first.text).length, BROWSE_PAGE_SIZE)
+  assert.match(screenRows(first.text)[0] ?? '', /^1\. 会话 24/)
 
-  const groups = listingGroups(all.text)
-  assert.ok(groups.size >= 2, `expected rows from several workspaces, got:\n${all.text}`)
-  assert.ok(groups.has('some_project'), 'a workspace other than this one has to be visible')
-  assert.ok(groups.has('dsh_orb'))
-  // Every workspace gets the same share, this one included — that equality is what makes room for the
-  // others; a larger share here would put the bug back.
-  assert.equal(groups.get('微信会话')?.length, LIST_ALL_GROUP_LIMIT)
-  // A workspace with a single conversation is still shown in full.
-  assert.equal(groups.get('some_project')?.length, 1)
+  const second = await browser.say(SHOW_REST)
+  assert.equal(second.kind, 'reply')
+  if (second.kind !== 'reply') return
+  assert.match(second.text, /【微信会话】会话（2\/3）/)
+  assert.match(screenRows(second.text)[0] ?? '', /^11\. /)
+  assert.match(screenRows(second.text)[9] ?? '', /^20\. /)
 
-  // The total stays bounded, so "see every workspace" cannot turn into an unreadable message.
-  const rows = all.text.split('\n').filter((line) => /^\d+\. /.test(line))
-  assert.equal(rows.length, LIST_ALL_GROUP_LIMIT + 1 + 1)
-  assert.ok(rows.length <= LIST_ALL_LIMIT)
-  // Truncation is counted rather than silent, and the wording is the quota's rather than "older":
-  // rows dropped by a share can be newer than rows still on screen.
-  assert.match(all.text, new RegExp(`每个工作区最多显示 ${String(LIST_ALL_GROUP_LIMIT)} 个`))
-  assert.match(all.text, /（还有 9 个对话未显示）/)
-  // The trailing id is explained as a way to switch, with an example taken from this very listing —
-  // printing it without saying what it is for is what left it looking like decoration.
-  const newestOwn = gateway.sessions.at(-1)!
-  assert.match(all.text, /行尾那个 6 位 id/)
-  assert.match(all.text, new RegExp(`如第 1 行的 ${shortId(newestOwn.sessionId)}`))
+  const third = await browser.say(SHOW_REST)
+  assert.equal(third.kind, 'reply')
+  if (third.kind !== 'reply') return
+  assert.match(third.text, /【微信会话】会话（3\/3）/)
+  assert.equal(screenRows(third.text).length, 5)
+  assert.match(screenRows(third.text)[0] ?? '', /^21\. /)
+  assert.match(screenRows(third.text)[4] ?? '', /^25\. /)
+  assert.doesNotMatch(third.text, /查看其余/)
 
-  // And the default list is unchanged: this workspace only, still up to its own ten rows.
-  const own = await router.route({ ...conversation, text: '/list' })
-  assert.equal(own.kind, 'reply')
-  if (own.kind !== 'reply') return
-  const ownGroups = listingGroups(own.text)
-  assert.deepEqual(
-    [...ownGroups.keys()],
-    ['微信会话'],
-    'the default list is still this workspace only',
+  const bottom = await browser.say(SHOW_REST)
+  assert.equal(bottom.kind, 'reply')
+  if (bottom.kind !== 'reply') return
+  assert.match(bottom.text, /只有 3 页，已经到底了/)
+
+  // Row 25 is the oldest conversation, which only the third screen ever printed.
+  const picked = await browser.say('25')
+  assert.equal(picked.kind, 'reply')
+  if (picked.kind !== 'reply') return
+  assert.match(picked.text, /已切换到「会话 0」/)
+  assert.equal(
+    (await router.current(conversation.conversationId))?.sessionId,
+    gateway.sessions[0]?.sessionId,
   )
-  assert.equal(ownGroups.get('微信会话')?.length, 10)
-  assert.doesNotMatch(own.text, /别处的工作|另一个项目/)
-  assert.match(own.text, /另有 2 个对话在其它工作区/)
+  // A switch ends the browse: the position is dropped rather than continued.
+  assert.equal(picked.browse, undefined)
+  assert.equal(browser.position(), undefined)
 })
 
-test('/list all stops at a readable length however many workspaces there are', () => {
+test('a number on a later screen is read with that screen’s offset', () => {
   /*
-   * The other half of the requirement: a share per workspace is not a bound on its own. Six workspaces
-   * at four rows each is twenty-four rows, which is a wall of text on a phone — so the total is capped
-   * as well, and what does not fit is counted out loud.
+   * Numbering runs on across screens, so a screen printing 11..20 has to be resolved with `first`.
+   * Without it, "13" would be answered from row 3 of that screen — a conversation it never printed —
+   * which is the drift the pinned numbering exists to prevent, reintroduced by paging.
    */
-  const rows: ListedSession[] = []
-  for (let group = 0; group < 6; group += 1) {
-    for (let row = 0; row < 4; row += 1) {
-      rows.push({
-        sessionId: `session-${String(group)}${String(row)}aaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa`,
-        title: `项目 ${String(group)} 的第 ${String(row)} 个`,
-        updatedAt: 1_800_000_000_000 - group * 1_000 - row,
-        workspace: `C:\\Users\\me\\project${String(group)}`,
-      })
-    }
+  const titles = ['甲', '乙', '丙', '丁', '戊', '己', '庚', '辛', '壬', '癸']
+  const rows: NumberedRows = {
+    sessions: titles.map((title, index) => ({
+      sessionId: `session-aaaa${String(index).padStart(4, '0')}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`,
+      title: `会话 ${title}`,
+    })),
+    first: 11,
   }
 
-  const groups = groupSessionRows(rows, {
-    ownLabel: '微信会话',
-    limit: LIST_ALL_LIMIT,
-    groupLimit: LIST_ALL_GROUP_LIMIT,
-  })
-  assert.equal(flattenSessionGroups(groups).length, LIST_ALL_LIMIT, 'the cap is the cap')
-  assert.equal(groups.length, LIST_ALL_LIMIT / LIST_ALL_GROUP_LIMIT, 'four whole workspaces fit')
-  assert.deepEqual(
-    groups.map((group) => group.label),
-    ['project0', 'project1', 'project2', 'project3'],
-    'the budget goes to the most recently active workspaces',
-  )
-
-  const text = renderSessionList(groups, undefined, {
-    total: rows.length,
-    groupLimit: LIST_ALL_GROUP_LIMIT,
-  })
-  // 24 conversations, 12 printed, so 12 are owed an explanation.
-  assert.match(text, /（还有 12 个对话未显示）/)
-  assert.match(text, /共 24 个对话（每个工作区最多显示 3 个）/)
+  assert.equal(found(resolveTarget('13', rows.sessions, rows))?.title, '会话 丙')
+  assert.equal(found(resolveTarget('11', rows.sessions, rows))?.title, '会话 甲')
+  assert.equal(found(resolveTarget('20', rows.sessions, rows))?.title, '会话 癸')
+  // A number from a screen the user has scrolled past is not folded onto row 1: guessing which row
+  // they meant is the one thing a pinned numbering must never do.
+  assert.equal(resolveTarget('3', rows.sessions, rows).kind, 'none')
+  assert.equal(resolveTarget('25', rows.sessions, rows).kind, 'none')
 })
 
-test('the same listing is byte-identical however the store hands the rows over', () => {
+test('the same screen is byte-identical however the store hands the rows over', () => {
   /*
-   * The regression this exists for: `/list all` printed a different order on every run, and a
+   * The regression this exists for: the listing printed a different order on every run, and a
    * different "上次时间" beside the same conversation. The order came from the directory walk and the
    * time from a file's mtime, so neither was a property of the data — and with several sessions
    * sharing a timestamp (imports, bulk runs) there was no tie-break to save it.
    *
-   * Two things are checked together, because they are one bug: equal timestamps must still order
-   * deterministically, and the input order must not be able to reach the output at all.
+   * Both levels are rendered here, because both are built out of the same ordering and both are what
+   * the user reads.
    */
   const stamp = 1_700_000_000_000
   const rows: ListedSession[] = [
@@ -606,25 +676,105 @@ test('the same listing is byte-identical however the store hands the rows over',
     { sessionId: 'session-cccc3333-cccc3333-x', title: '丙', updatedAt: stamp },
     { sessionId: 'session-dddd4444-dddd4444-x', title: '丁', updatedAt: stamp - 1 },
   ]
-  const render = (input: readonly ListedSession[]): string =>
-    renderSessionList(groupSessionRows(input, { ownLabel: '微信会话' }), undefined, {
+  const renderOne = (input: readonly ListedSession[]): string =>
+    renderSessionScreen([...input].sort(compareRowsNewestFirst), {
+      label: '微信会话',
+      page: 1,
       now: stamp + 60_000,
-    })
+    }).text
+  const renderFolders = (input: readonly ListedSession[]): string =>
+    renderFolderScreen(
+      sessionFolders(folderRows(input), { ownWorkspace: 'C:\\Users\\me\\dsh_wechat', ownLabel: '微信会话' }),
+      1,
+    )
+  const folderRows = (input: readonly ListedSession[]): ListedSession[] =>
+    input.map((row, index) => ({ ...row, workspace: `C:\\Users\\me\\p${String(index % 2)}` }))
 
-  const forward = render(rows)
-  const backward = render([...rows].reverse())
-  assert.equal(forward, backward, 'the input order must not survive into the output')
-  // Byte-for-byte, not merely "same rows": this is the assertion the pnpm test run makes on the
-  // rendered message, so any instability shows up here first.
-  assert.equal(render([...rows].reverse()), forward)
+  assert.equal(renderOne(rows), renderOne([...rows].reverse()), 'input order must not reach the output')
+  assert.equal(renderFolders(rows), renderFolders([...rows].reverse()))
 
   // The tie is broken on the id, ascending, so the equal-timestamp rows come out in a fixed order —
   // and the older one still follows them, because time is still the first key.
-  const order = forward
-    .split('\n')
-    .filter((line) => /^\d+\. /.test(line))
-    .map((line) => /^\d+\. (\S+)/.exec(line)?.[1])
+  const order = screenRows(renderOne(rows)).map((line) => /^\d+\. (\S+)/.exec(line)?.[1])
   assert.deepEqual(order, ['甲', '乙', '丙', '丁'])
+})
+
+/** Order rows the way every listing does, so these tests exercise the same comparator. */
+function compareRowsNewestFirst(a: { sessionId: string; updatedAt: number }, b: { sessionId: string; updatedAt: number }): number {
+  if (a.updatedAt !== b.updatedAt) return b.updatedAt - a.updatedAt
+  if (a.sessionId === b.sessionId) return 0
+  return a.sessionId < b.sessionId ? -1 : 1
+}
+
+test('the workspace list counts each folder, and leads with this workspace', () => {
+  const rows: ListedSession[] = [
+    { sessionId: 'session-aaaa1111-aaaa1111-x', title: '甲', updatedAt: 1_000 },
+    { sessionId: 'session-bbbb2222-bbbb2222-x', title: '乙', updatedAt: 2_000 },
+    { sessionId: 'session-cccc3333-cccc3333-x', title: '丙', updatedAt: 5_000, workspace: 'C:\\me\\alpha' },
+    { sessionId: 'session-dddd4444-dddd4444-x', title: '丁', updatedAt: 4_000, workspace: 'C:\\me\\alpha' },
+    { sessionId: 'session-eeee5555-eeee5555-x', title: '戊', updatedAt: 9_000, workspace: 'C:\\me\\beta' },
+  ]
+  const folders = sessionFolders(rows, {
+    ownWorkspace: 'C:\\Users\\me\\dsh_wechat',
+    ownLabel: '微信会话',
+  })
+  assert.deepEqual(
+    folders.map((folder) => [folder.label, folder.count]),
+    [
+      ['微信会话', 2],
+      ['beta', 1],
+      ['alpha', 2],
+    ],
+    'this workspace first, then the others by their most recent conversation',
+  )
+})
+
+test('resolveFolder accepts a number and a name, and refuses to choose between two', () => {
+  const folders: SessionFolder[] = [
+    { path: '', label: '微信会话', count: 3 },
+    { path: 'C:\\me\\alpha\\workplace', label: 'workplace', count: 1 },
+    { path: 'C:\\me\\beta\\workplace', label: 'workplace', count: 2 },
+    { path: 'C:\\me\\dsh_orb', label: 'dsh_orb', count: 7 },
+  ]
+
+  // The number is the one the listing printed, which runs on across screens.
+  const byNumber = resolveFolder('3', folders)
+  assert.equal(byNumber.kind, 'found')
+  if (byNumber.kind !== 'found') return
+  assert.equal(byNumber.folder.path, 'C:\\me\\beta\\workplace')
+  assert.equal(resolveFolder('9', folders).kind, 'none')
+  // A name that names one folder is enough, in either direction of slop.
+  assert.equal(resolveFolder('dsh_orb', folders).kind, 'found')
+  assert.equal(resolveFolder('dsh', folders).kind, 'found')
+  // Two directories share the printed name, so the name cannot decide.
+  const clash = resolveFolder('workplace', folders)
+  assert.equal(clash.kind, 'ambiguous')
+  if (clash.kind !== 'ambiguous') return
+  assert.equal(clash.candidates.length, 2)
+  // And the message it produces points at the numbers, which are never ambiguous.
+  const message = ambiguousFolderMessage('workplace', clash.candidates, folders)
+  assert.match(message, /2\. C:\\me\\alpha\\workplace  1 个会话/)
+  assert.match(message, /3\. C:\\me\\beta\\workplace  2 个会话/)
+})
+
+test('the phrase that pages on tolerates a full stop and nothing else', () => {
+  assert.equal(isShowRest('查看其余'), true)
+  assert.equal(isShowRest(' 查看其余。 '), true)
+  assert.equal(isShowRest('查看其余！'), true)
+  // A near miss must not be guessed at: the phrase carries no target, so a wrong reading moves the
+  // user somewhere they did not ask to go.
+  assert.equal(isShowRest('看看其余'), false)
+  assert.equal(isShowRest('查看其余 2'), false)
+  assert.equal(isShowRest(''), false)
+})
+
+test('browsePage clamps a page that no longer exists instead of printing nothing', () => {
+  const rows = [1, 2, 3]
+  assert.deepEqual(browsePage(rows, 1), { items: [1, 2, 3], page: 1, pages: 1, start: 0 })
+  assert.deepEqual(browsePage(rows, 4), { items: [1, 2, 3], page: 1, pages: 1, start: 0 })
+  const many = Array.from({ length: 25 }, (_, index) => index)
+  assert.equal(browsePage(many, 3).items.length, 5)
+  assert.equal(browsePage(many, 3).pages, 3)
 })
 
 test('relative times read the way a person says them', () => {
@@ -660,10 +810,13 @@ test('a pinned listing decides what a number means', async () => {
   assert.ok(newest && newest !== first.decision.sessionId)
 
   // What the user was shown: the older conversation on row 1, the newer one on row 2.
-  const pinned: NumberedSession[] = [
-    { sessionId: first.decision.sessionId, title: '第一条' },
-    { sessionId: newest, title: '第二个' },
-  ]
+  const pinned: NumberedRows = {
+    sessions: [
+      { sessionId: first.decision.sessionId, title: '第一条' },
+      { sessionId: newest, title: '第二个' },
+    ],
+    first: 1,
+  }
 
   const toFirst = await router.route({ ...conversation, text: '/switch 1', numbered: pinned })
   assert.equal(toFirst.kind, 'reply')
@@ -704,6 +857,7 @@ test('a numbered listing survives a save and a reload', async () => {
       rememberSessionList(state, 'acct', 'acct:peer', {
         messageId: 'msg-1',
         sessions: [{ sessionId: 'session-aaaa1111-aaaa1111-x', title: '甲' }],
+        first: 1,
         at: 1_700_000_000_000,
       })
       rememberSessionList(state, 'acct', 'acct:peer', {
@@ -712,6 +866,9 @@ test('a numbered listing survives a save and a reload', async () => {
           { sessionId: 'session-aaaa1111-aaaa1111-x', title: '甲' },
           { sessionId: 'session-bbbb2222-bbbb2222-x', title: '乙' },
         ],
+        // A second screen of ten: the numbers it printed start at 11, and the offset has to survive
+        // the reload or a quoted "13" would be read as row 3 of that screen.
+        first: 11,
         at: 1_700_000_001_000,
       })
     })
@@ -722,12 +879,123 @@ test('a numbered listing survives a save and a reload', async () => {
       { sessionId: 'session-aaaa1111-aaaa1111-x', title: '甲' },
       { sessionId: 'session-bbbb2222-bbbb2222-x', title: '乙' },
     ])
+    assert.equal(findSessionList(reloaded, 'acct', 'msg-2')?.first, 11)
     // The older one is still there, keyed by its own message id.
     assert.equal(findSessionList(reloaded, 'acct', 'msg-1')?.sessions.length, 1)
+    assert.equal(findSessionList(reloaded, 'acct', 'msg-1')?.first, 1)
     // And the conversation's newest listing is the one a bare number answers from.
     assert.equal(latestSessionList(reloaded, 'acct', 'acct:peer')?.messageId, 'msg-2')
     // Another account sees nothing, so a shared machine cannot resolve across bots.
     assert.equal(findSessionList(reloaded, 'other', 'msg-2'), undefined)
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('where a conversation is in the listing browser survives a save and a reload', async () => {
+  /*
+   * The field this covers is the one 「查看其余」 depends on, and the store's reader is an allowlist: a
+   * field added to `ChannelState` and forgotten in `normalize` saves perfectly and is gone after the
+   * next restart — which here would mean the phrase answers with nothing, or pages from a number
+   * nobody chose. The extra `update(() => {})` is the part that matters: every write re-reads and
+   * re-normalizes, so a dropped field disappears on the *next* write rather than the next restart.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-state-'))
+  try {
+    const file = join(home, 'state.json')
+    const store = new StateStore(file)
+    await store.update((state) => {
+      rememberBrowse(state, 'acct', 'acct:peer', {
+        level: 'sessions',
+        workspace: 'C:\\Users\\me\\some_project',
+        page: 2,
+        at: 1_700_000_000_000,
+      })
+      rememberBrowse(state, 'acct', 'acct:other', {
+        level: 'folders',
+        workspace: '',
+        page: 1,
+        at: 1_700_000_000_500,
+      })
+    })
+    await store.update(() => {})
+
+    const reloaded = await new StateStore(file).read()
+    assert.deepEqual(findBrowse(reloaded, 'acct', 'acct:peer'), {
+      level: 'sessions',
+      workspace: 'C:\\Users\\me\\some_project',
+      page: 2,
+      at: 1_700_000_000_000,
+    })
+    assert.deepEqual(findBrowse(reloaded, 'acct', 'acct:other'), {
+      level: 'folders',
+      workspace: '',
+      page: 1,
+      at: 1_700_000_000_500,
+    })
+    // Another account sees nothing: one plugin serves several chats, and neither place is the other's.
+    assert.equal(findBrowse(reloaded, 'other', 'acct:peer'), undefined)
+
+    // Forgetting one leaves the other alone, and forgetting the last one takes the account with it —
+    // otherwise the file keeps a row per conversation that ever asked for a listing.
+    await store.update((state) => {
+      forgetBrowse(state, 'acct', 'acct:peer')
+    })
+    const after = await new StateStore(file).read()
+    assert.equal(findBrowse(after, 'acct', 'acct:peer'), undefined)
+    assert.ok(findBrowse(after, 'acct', 'acct:other'))
+    await store.update((state) => {
+      forgetBrowse(state, 'acct', 'acct:other')
+    })
+    assert.equal((await new StateStore(file).read()).browsing?.acct, undefined)
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('a browsing position that cannot be continued is dropped', async () => {
+  /*
+   * Read back and acted on: a page that arrived as a string would make the next page's arithmetic
+   * produce NaN, and a level that is neither of the two known ones would send the router down a branch
+   * that does not exist. Dropping costs one `/list all`; continuing it wrongly pages from a number
+   * nobody chose.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-state-'))
+  try {
+    const file = join(home, 'state.json')
+    await writeFile(
+      file,
+      JSON.stringify({
+        version: 1,
+        browsing: {
+          acct: {
+            'acct:peer': { level: 'sessions', workspace: 'C:\\me\\x', page: 2, at: 1 },
+            'acct:bad-level': { level: 'chapters', workspace: '', page: 1, at: 1 },
+            'acct:bad-page': { level: 'folders', workspace: '', page: '2', at: 1 },
+            'acct:zero-page': { level: 'folders', workspace: '', page: 0, at: 1 },
+            'acct:no-workspace': { level: 'folders', page: 1, at: 1 },
+            'acct:bad-time': { level: 'folders', workspace: '', page: 1, at: 'yesterday' },
+            'acct:not-an-entry': 'nope',
+          },
+          'not-an-account': 7,
+        },
+      }),
+      'utf8',
+    )
+
+    const state = await new StateStore(file).read()
+    assert.ok(findBrowse(state, 'acct', 'acct:peer'), 'the good one stays')
+    for (const conversation of [
+      'acct:bad-level',
+      'acct:bad-page',
+      'acct:zero-page',
+      'acct:no-workspace',
+      'acct:bad-time',
+      'acct:not-an-entry',
+    ]) {
+      assert.equal(findBrowse(state, 'acct', conversation), undefined, `${conversation} is unusable`)
+    }
+    assert.deepEqual(Object.keys(state.browsing ?? {}), ['acct'])
   } finally {
     await rm(home, { recursive: true, force: true })
   }
@@ -754,6 +1022,14 @@ test('a malformed numbered listing is dropped instead of resolving a number to n
               { messageId: 'msg-3', at: 3, sessions: [] },
               { messageId: 'msg-4', at: 4, sessions: [{ sessionId: 7, title: '丙' }] },
               { messageId: 'msg-5', at: 'soon', sessions: [{ sessionId: 'session-eeee-x', title: '戊' }] },
+              {
+                messageId: 'msg-6',
+                at: 6,
+                sessions: [{ sessionId: 'session-ffff-x', title: '己' }],
+                // A page number that is not a positive whole number cannot be paged from: it would
+                // make the offset arithmetic produce a fraction or NaN.
+                first: 0,
+              },
               'not an entry',
             ],
           },
@@ -765,9 +1041,11 @@ test('a malformed numbered listing is dropped instead of resolving a number to n
 
     const state = await new StateStore(file).read()
     assert.equal(findSessionList(state, 'acct', 'msg-1')?.sessions.length, 1, 'the good one stays')
+    assert.equal(findSessionList(state, 'acct', 'msg-1')?.first, 1, 'a pre-paging entry is a first screen')
     assert.equal(findSessionList(state, 'acct', 'msg-3'), undefined, 'an empty numbering is unusable')
     assert.equal(findSessionList(state, 'acct', 'msg-4'), undefined, 'a non-string id is unusable')
     assert.equal(findSessionList(state, 'acct', 'msg-5'), undefined, 'a non-numeric time is unusable')
+    assert.equal(findSessionList(state, 'acct', 'msg-6'), undefined, 'an impossible page is unusable')
     assert.equal(state.sessionLists?.acct?.['acct:peer']?.length, 1)
   } finally {
     await rm(home, { recursive: true, force: true })
@@ -782,6 +1060,7 @@ test('a stored listing keeps its rows and trims a paragraph-long title', () => {
   rememberSessionList(state, 'acct', 'acct:peer', {
     messageId: 'msg-1',
     sessions: [{ sessionId: 'session-aaaa1111-aaaa1111-x', title: paragraph }],
+    first: 1,
     at: 1_700_000_000_000,
   })
   const stored = latestSessionList(state, 'acct', 'acct:peer')?.sessions[0]
@@ -796,6 +1075,7 @@ test('only the newest few listings are kept, so the state file cannot grow witho
     rememberSessionList(state, 'acct', 'acct:peer', {
       messageId: `msg-${String(i)}`,
       sessions: [{ sessionId: `session-${String(i)}-x`, title: `第 ${String(i)} 个` }],
+      first: 1,
       at: 1_700_000_000_000 + i,
     })
   }
@@ -1088,16 +1368,17 @@ test('a number answers from the shown list while a name may reach any workspace'
    */
   const mine = [row('session-aaaa1111-aaaa1111-x', '我的')]
   const every = [mine[0]!, row('session-bbbb2222-bbbb2222-x', '别处的')]
+  const shown = (sessions: ListedSession[]): NumberedRows => ({ sessions, first: 1 })
 
   // A number counts the rows the user saw, so with only one own session, 2 is not a shown row.
-  assert.equal(found(resolveTarget('1', every, mine))?.title, '我的')
-  assert.equal(resolveTarget('2', every, mine).kind, 'none')
+  assert.equal(found(resolveTarget('1', every, shown(mine)))?.title, '我的')
+  assert.equal(resolveTarget('2', every, shown(mine)).kind, 'none')
   // With everything shown, 2 is the foreign session.
-  assert.equal(found(resolveTarget('2', every, every))?.title, '别处的')
+  assert.equal(found(resolveTarget('2', every, shown(every)))?.title, '别处的')
   // A name is searched across everything, however few rows were displayed.
-  assert.equal(found(resolveTarget('别处的', every, mine))?.title, '别处的')
+  assert.equal(found(resolveTarget('别处的', every, shown(mine)))?.title, '别处的')
   // A short id likewise, which is the form `/list` prints beside each row.
-  assert.equal(found(resolveTarget('bbbb', every, mine))?.title, '别处的')
+  assert.equal(found(resolveTarget('bbbb', every, shown(mine)))?.title, '别处的')
   // Omitting the third argument keeps the old behaviour: one pool for both.
   assert.equal(found(resolveTarget('2', every))?.title, '别处的')
 })
