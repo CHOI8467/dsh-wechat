@@ -114,6 +114,23 @@ const QUOTA_PER_TOKEN = 10
 const QUOTA_WARN_AT = QUOTA_PER_TOKEN - 2
 
 /**
+ * How long an opt-in merge waits for more, and the longest it may wait in total.
+ *
+ * The window alone is not enough: a caller emitting a fragment every second would reset it
+ * forever and nothing would ever be delivered. The hold is what makes the wait finite.
+ */
+const MERGE_WINDOW_MS = 3_000
+const MERGE_MAX_HOLD_MS = 10_000
+
+/** Where a push is going. Named because the merge buffer has to remember it. */
+interface NotifyTarget {
+  account: WeixinAccount
+  peerId: string
+  conversationId: string
+  contextToken?: string
+}
+
+/**
  * What the user is told when the window is nearly spent.
  *
  * Plain and short, and it asks for the one action that actually works: any message back. It
@@ -581,6 +598,16 @@ class WechatRuntime {
    * the cost of being wrong is one refused send, handled exactly like reaching the limit.
    */
   readonly #quota = new Map<string, { token: string | undefined; used: number; warned: boolean }>()
+  /**
+   * Fragments held for a merge, per conversation.
+   *
+   * Only ever populated by a caller that asked for it: a timed series must keep arriving one
+   * message at a time, so nothing is merged unless it says so.
+   */
+  readonly #mergeBuf = new Map<
+    string,
+    { target: NotifyTarget; lines: string[]; first: number; timer: NodeJS.Timeout }
+  >()
   /** Observations already written to the log, bucketed so each distinct value logs once. */
   readonly #seenShapes = new Map<string, Set<string>>()
   /**
@@ -1999,7 +2026,7 @@ class WechatRuntime {
     const notify = tools.register({
       name: 'notify_wechat',
       description:
-        'Push a message, and optionally a file, to the user\'s WeChat. Unlike send_to_wechat this works from any session, including one the WeChat conversation is not currently bound to, which is what makes "tell me when it is done" possible. Always reaches the conversation the user is currently in; there is no way to choose another. Use it to report a finished task, or to send a file the user asked to receive. Keep text short — it is read on a phone.',
+        'Push a message, and optionally a file, to the user\'s WeChat. Unlike send_to_wechat this works from any session, including one the WeChat conversation is not currently bound to, which is what makes "tell me when it is done" possible. Always reaches the conversation the user is currently in; there is no way to choose another. Use it to report a finished task, or to send a file the user asked to receive. **WeChat allows only ten messages per reply window, and the window reopens only when the user writes: after ten, everything else waits for their next message.** So when you have several things to say, say them in one message as a list rather than as several messages - each separate message spends one of the ten. Keep text short — it is read on a phone.',
       parameters: {
         type: 'object',
         properties: {
@@ -2011,6 +2038,11 @@ class WechatRuntime {
             type: 'string',
             description:
               'Optional absolute path of a file to send after the text. Images arrive as photos, videos as playable clips, everything else as a file attachment.',
+          },
+          merge: {
+            type: 'boolean',
+            description:
+              'Set true only when this text is a fragment of one thought and the next few seconds may bring more - fragments then arrive as a single message. Leave it unset for a notice that stands on its own, and never set it for a series meant to arrive one message at a time (a timed reminder, a countdown): merging those is the opposite of what was asked.',
           },
         },
         required: ['text'],
@@ -2028,7 +2060,12 @@ class WechatRuntime {
         ],
       },
       execute: async (args, exec) => ({
-        detail: await this.#notifyWechat(String(args.text ?? ''), args.path, exec),
+        detail: await this.#notifyWechat(
+          String(args.text ?? ''),
+          args.path,
+          exec,
+          args.merge === true,
+        ),
       }),
     })
 
@@ -2053,6 +2090,7 @@ class WechatRuntime {
     text: string,
     path: unknown,
     exec: { readonly signal?: AbortSignal; readonly agent?: unknown },
+    merge = false,
   ): Promise<string> {
     if (text.trim() === '' && typeof path !== 'string') {
       throw new Error('至少要给 text 或 path 其中一个。')
@@ -2071,11 +2109,13 @@ class WechatRuntime {
           '这个会话没有绑定微信对话，而「允许其他会话推送到微信」是关闭的。请让用户在设置里打开它，或先在微信里发一条消息。',
         )
       }
+      if (merge && typeof path !== 'string') return this.#mergePush(own, text)
       return await this.#deliverTo(own, text, path, exec.signal)
     }
 
     const bound = await this.#boundConversation()
     if (!bound.ok) throw new Error(bound.reason)
+    if (merge && typeof path !== 'string') return this.#mergePush(bound.target, text)
     return await this.#deliverTo(bound.target, text, path, exec.signal)
   }
 
@@ -2092,6 +2132,53 @@ class WechatRuntime {
    * @param signal - Cancellation from the caller, when there is one.
    * @returns What was sent, for the agent to report.
    */
+  /**
+   * Hold one fragment for the merge window instead of sending it now.
+   *
+   * A file is never merged: the path is dropped from the buffered branch, because appending a
+   * file to a line of text is not a thing the platform can do.
+   *
+   * @param target - Where the merged message will go.
+   * @param text - The fragment.
+   * @returns A note for the caller, which is what the tool reports back.
+   */
+  #mergePush(target: NotifyTarget, text: string): string {
+    const key = target.conversationId
+    const existing = this.#mergeBuf.get(key)
+    const entry = existing ?? {
+      target,
+      lines: [] as string[],
+      first: Date.now(),
+      timer: undefined as unknown as NodeJS.Timeout,
+    }
+    entry.lines.push(text)
+    if (existing !== undefined) clearTimeout(existing.timer)
+    // Held until the stream goes quiet, but never past the cap: fragments arriving every second
+    // would otherwise postpone delivery for as long as they keep coming.
+    const age = Date.now() - entry.first
+    const wait = Math.max(200, Math.min(MERGE_WINDOW_MS, MERGE_MAX_HOLD_MS - age))
+    entry.timer = setTimeout(() => {
+      void this.#flushMerge(key)
+    }, wait)
+    entry.timer.unref?.()
+    this.#mergeBuf.set(key, entry)
+    return `已并入合并窗口（第 ${String(entry.lines.length)} 条），稍后作为一条消息发出。`
+  }
+
+  /** Send whatever a merge has collected, as one message. */
+  async #flushMerge(conversationId: string): Promise<void> {
+    const entry = this.#mergeBuf.get(conversationId)
+    if (entry === undefined) return
+    this.#mergeBuf.delete(conversationId)
+    try {
+      await this.#deliverTo(entry.target, entry.lines.join('\n'), undefined)
+    } catch (error) {
+      this.#recordError(
+        `合并消息发送失败：${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+  }
+
   async #deliverTo(
     target: { account: WeixinAccount; peerId: string; conversationId: string; contextToken?: string },
     text: string,
