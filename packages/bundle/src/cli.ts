@@ -25,7 +25,7 @@
  * @module dsh-wechat-plugin/cli
  */
 
-import { appendFileSync, mkdirSync } from 'node:fs'
+import { appendFileSync, mkdirSync, realpathSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
@@ -662,7 +662,19 @@ export function defaultCliProvider(stateFile?: string): CliProvider {
  */
 export function isDirectRun(entry: string | undefined = process.argv[1]): boolean {
   if (entry === undefined) return false
-  return import.meta.url === pathToFileURL(entry).href
+  if (import.meta.url === pathToFileURL(entry).href) return true
+  /*
+   * A package manager installs `bin` entries as symlinks on Unix, so `argv[1]` is the link while
+   * `import.meta.url` is the file it points at. Comparing the two directly answers "not the program"
+   * and the command exits having done nothing — which is exactly what happened on the CI runner
+   * while passing on Windows, where the entry is a `.cmd` shim whose path happens to match.
+   */
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(entry)).href
+  } catch {
+    // An entry that cannot be resolved is not this module.
+    return false
+  }
 }
 
 /**
