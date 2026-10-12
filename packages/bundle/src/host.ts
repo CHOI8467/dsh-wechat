@@ -102,6 +102,28 @@ const REPLY_SETTLE_MS = 1_200
 /** Upper bound on one outbound WeChat message. The service rejects very long bodies. */
 const MAX_REPLY_CHARS = 4_000
 
+/**
+ * Outbound messages one reply token allows, and where to start asking for a new one.
+ *
+ * Measured, not documented: the platform refuses the eleventh send of a window with
+ * `prepare failed`, and every implementation that has looked has found the same ten. The warning
+ * fires two short of the limit so that the ask itself still has a slot — a warning sent at the
+ * limit would be a warning into a closed window.
+ */
+const QUOTA_PER_TOKEN = 10
+const QUOTA_WARN_AT = QUOTA_PER_TOKEN - 2
+
+/**
+ * What the user is told when the window is nearly spent.
+ *
+ * Plain and short, and it asks for the one action that actually works: any message back. It
+ * deliberately does not promise that everything queued will follow — it will, but only after
+ * they write, and saying so up front is what keeps the next silence from looking like a failure.
+ */
+const QUOTA_WARNING =
+  `📮 微信这边一个回复窗口最多连发 ${String(QUOTA_PER_TOKEN)} 条，我快到上限了。\n` +
+  `你随便回我一句，我就能把剩下的接着发过来。`
+
 /** How long a finished login result stays visible before a new attempt is allowed. */
 const LOGIN_RESULT_TTL_MS = 30_000
 
@@ -551,6 +573,14 @@ class WechatRuntime {
    * the code: a stale session and a real rate limit are told apart by `errmsg` alone.
    */
   #lastRefusal = ''
+  /**
+   * Sends charged against the reply token in use, per conversation.
+   *
+   * Keyed by conversation and stamped with the token, because a fresh token carries a fresh ten
+   * and comparing the stamp is how that is noticed. Not persisted: a restart loses the count, and
+   * the cost of being wrong is one refused send, handled exactly like reaching the limit.
+   */
+  readonly #quota = new Map<string, { token: string | undefined; used: number; warned: boolean }>()
   /** Observations already written to the log, bucketed so each distinct value logs once. */
   readonly #seenShapes = new Map<string, Set<string>>()
   /**
@@ -2938,6 +2968,47 @@ class WechatRuntime {
    * @param text - Already-limited text.
    * @param contextToken - Reply token, when one is stored.
    */
+  /**
+   * Charge one send against the reply token, and ask for a new one as the window runs low.
+   *
+   * The warning goes out on the low-level send rather than through this method, so charging a
+   * send cannot charge another one and recurse.
+   *
+   * @param account - Account the message went through.
+   * @param conversationId - Conversation the token belongs to.
+   * @param peerId - Counterparty, for the warning.
+   * @param contextToken - Token this send used; a change means a fresh quota.
+   */
+  async #noteQuota(
+    account: WeixinAccount,
+    conversationId: string,
+    peerId: string,
+    contextToken: string | undefined,
+  ): Promise<void> {
+    const entry = this.#quota.get(conversationId)
+    if (entry === undefined || entry.token !== contextToken) {
+      this.#quota.set(conversationId, { token: contextToken, used: 1, warned: false })
+      return
+    }
+    entry.used += 1
+    if (entry.used < QUOTA_WARN_AT || entry.warned) return
+    entry.warned = true
+    try {
+      await this.#send({
+        account,
+        to: peerId,
+        text: QUOTA_WARNING,
+        ...(contextToken === undefined ? {} : { contextToken }),
+      })
+      // The warning is a message too, and counting it is what keeps the arithmetic honest.
+      entry.used += 1
+      this.#recordBoot(`quota: 窗口已用 ${String(entry.used)}/${String(QUOTA_PER_TOKEN)}，已提醒续期`)
+    } catch {
+      // A warning nobody receives is not worth a thrown error; the next send queues regardless.
+      this.#recordBoot(`quota: 窗口已用 ${String(entry.used)}/${String(QUOTA_PER_TOKEN)}，提醒未能发出`)
+    }
+  }
+
   async #sendText(
     account: WeixinAccount,
     conversationId: string,
@@ -2960,6 +3031,7 @@ class WechatRuntime {
       `outbound text id=${typeof id === 'string' ? id : '(none)'} len=${String(text.length)}` +
         ` body=${preview}`,
     )
+    await this.#noteQuota(account, conversationId, peerId, contextToken)
     if (typeof id === 'string') {
       // Retained so a quote of this message can be turned back into content. A quote carries
       // only an id, so without this the agent sees "elaborate on this" and nothing else.
