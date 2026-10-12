@@ -14,7 +14,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -301,6 +301,9 @@ test('a refused message with a file keeps the path, so the plugin can send the a
   const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-cli-'))
   try {
     const file = join(home, '报告.pdf')
+    // Created, because this path is sent for real now: a stubbed uploader used to accept a
+    // path that did not exist, which hid the fact that the file was never there.
+    await writeFile(file, 'report')
     const { provider } = await makeProvider(home, { refuse: true })
     const result = await run(['报告如下', '--file', file], provider)
 
@@ -447,6 +450,9 @@ test('a file-only send uploads and charges the window', async () => {
   const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-cli-'))
   try {
     const path = join(home, 'report.pdf')
+    // On disk, because the command checks readability before it asks for an uploader: a
+    // stubbed attach used to accept any path, so a file that never existed went unnoticed.
+    await writeFile(path, 'report')
     const { provider, file, charges } = await makeProvider(home)
     const attached: string[] = []
     provider.attach = async ({ path: target }) => {
@@ -471,6 +477,9 @@ test('a file sent with a caption sends the text first, then the attachment', asy
   const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-cli-'))
   try {
     const path = join(home, 'photo.png')
+    // On disk, for the same reason as the file-only case: the command now reads before it
+    // asks for an uploader, so a path that was never created is a failure rather than a stub.
+    await writeFile(path, 'png')
     const { provider, sent, charges } = await makeProvider(home)
     provider.attach = async () => ({ fileName: 'photo.png', size: 3 })
     const result = await run(['照片来啦', '--file', path], provider)
@@ -489,10 +498,21 @@ test('a missing file fails with the path named, and sends nothing', async () => 
   // whether the failure can be acted on.
   const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-cli-'))
   try {
+    /*
+     * A provider built from the temporary home, and never the default one.
+     *
+     * The default provider reads the state file of whoever is running the tests. On a developer's
+     * machine that file exists and has a binding, so the run gets as far as reading the file and
+     * fails with EXIT_FAILED. On a CI runner there is no such file, the command stops earlier at
+     * "no bound conversation", and the exit code is EXIT_USAGE — the same assertion, failing only
+     * where nobody had bound WeChat. Passing the provider is what makes the test about the missing
+     * file rather than about the machine it runs on.
+     */
+    const { provider } = await makeProvider(home)
     const missing = join(home, '已经不在了.docx')
     // File-only, so nothing is sent before the attachment is read: the order is what makes the
     // failure land on the file rather than on a caption that went out first.
-    const result = await run(['--file', missing])
+    const result = await run(['--file', missing], provider)
 
     assert.equal(result.code, EXIT_FAILED)
     assert.match(result.err, /读不到文件/)

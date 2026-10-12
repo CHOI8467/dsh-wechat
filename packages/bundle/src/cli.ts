@@ -25,7 +25,7 @@
  * @module dsh-wechat-plugin/cli
  */
 
-import { appendFileSync, mkdirSync, realpathSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, realpathSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
@@ -352,6 +352,16 @@ async function deliver(params: {
   }
 
   if (params.file !== undefined) {
+    /*
+     * Readable first, capability second.
+     *
+     * A path that is wrong and a deployment that cannot upload are different problems with different
+     * fixes, and only the first is the caller's to correct. Checking the capability first reported
+     * "this deployment cannot upload files" for a path that simply had a typo in it, which sends the
+     * reader looking in the wrong place — and made a test about a missing file depend on whether the
+     * machine running it happened to be able to upload at all.
+     */
+    if (!existsSync(params.file)) throw new Error(`读不到文件：${params.file}`)
     if (params.attach === undefined) throw new Error('这个部署没有文件上传能力。')
     const attached = await params.attach({ target, path: params.file })
     /*
