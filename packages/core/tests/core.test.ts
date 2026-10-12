@@ -18,6 +18,8 @@ import { DEFAULT_SETTINGS, StateStore, SESSION_LIST_HISTORY, SESSION_LIST_TITLE_
 import {
   SessionRouter,
   SHORT_ID_LENGTH,
+  LIST_ALL_GROUP_LIMIT,
+  LIST_ALL_LIMIT,
   ambiguousTargetMessage,
   flattenSessionGroups,
   groupSessionRows,
@@ -436,6 +438,155 @@ test('a listing groups by workspace, and numbers the rows it prints', async () =
     ],
     'own workspace first, then the others newest first',
   )
+})
+
+/**
+ * The workspace headings of a rendered listing, with the rows printed under each.
+ *
+ * Read back out of the message rather than out of the renderer's own structures, because the bug this
+ * is used to catch was visible only in the text the user receives.
+ *
+ * @param text - A rendered listing.
+ * @returns Headings in display order, each mapped to its numbered rows.
+ */
+function listingGroups(text: string): Map<string, string[]> {
+  const groups = new Map<string, string[]>()
+  let current: string[] | undefined
+  for (const line of text.split('\n')) {
+    const heading = /^【(.+)】$/.exec(line)
+    if (heading) {
+      current = []
+      groups.set(heading[1]!, current)
+      continue
+    }
+    if (current !== undefined && /^\d+\. /.test(line)) current.push(line)
+  }
+  return groups
+}
+
+test('/list all gives every workspace a share, so the busiest one cannot crowd the others out', async () => {
+  /*
+   * The failure this exists for: the row limit was applied to the whole machine *before* the rows were
+   * grouped, and this workspace is almost always the busiest one. So `/list all` printed rows from this
+   * workspace alone, grouping then produced a single heading, and the reply was indistinguishable from
+   * plain `/list` — the user asked to see every conversation and was shown one workspace twice.
+   *
+   * The assertion is therefore about the number of *headings*. Under a single global cut this test sees
+   * one, whatever the row count says.
+   */
+  const gateway = new FakeGateway()
+  const router = new SessionRouter({
+    gateway,
+    store: memoryStore(),
+    ownWorkspace: 'C:\\Users\\me\\dsh_wechat',
+  })
+
+  // The other workspaces are seeded first, and are therefore older than everything this workspace
+  // holds: a global top ten would be nothing but this workspace, which is the state being reproduced.
+  gateway.foreign.push(
+    {
+      sessionId: 'session-ffff9999-ffff9999-x',
+      title: '别处的工作',
+      updatedAt: gateway.nextStamp(),
+      workspace: 'C:\\Users\\me\\some_project',
+    },
+    {
+      sessionId: 'session-eeee8888-eeee8888-x',
+      title: '另一个项目',
+      updatedAt: gateway.nextStamp(),
+      workspace: 'C:\\Users\\me\\dsh_orb',
+    },
+  )
+  for (let index = 0; index < 12; index += 1) {
+    gateway.sessions.push({
+      sessionId: `session-${String(index).padStart(4, '0')}aaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa`,
+      title: `本工作区 ${String(index)}`,
+      updatedAt: gateway.nextStamp(),
+      workspace: 'C:\\Users\\me\\dsh_wechat',
+    })
+  }
+
+  const all = await router.route({ ...conversation, text: '/list all' })
+  assert.equal(all.kind, 'reply')
+  if (all.kind !== 'reply') return
+
+  const groups = listingGroups(all.text)
+  assert.ok(groups.size >= 2, `expected rows from several workspaces, got:\n${all.text}`)
+  assert.ok(groups.has('some_project'), 'a workspace other than this one has to be visible')
+  assert.ok(groups.has('dsh_orb'))
+  // Every workspace gets the same share, this one included — that equality is what makes room for the
+  // others; a larger share here would put the bug back.
+  assert.equal(groups.get('微信会话')?.length, LIST_ALL_GROUP_LIMIT)
+  // A workspace with a single conversation is still shown in full.
+  assert.equal(groups.get('some_project')?.length, 1)
+
+  // The total stays bounded, so "see every workspace" cannot turn into an unreadable message.
+  const rows = all.text.split('\n').filter((line) => /^\d+\. /.test(line))
+  assert.equal(rows.length, LIST_ALL_GROUP_LIMIT + 1 + 1)
+  assert.ok(rows.length <= LIST_ALL_LIMIT)
+  // Truncation is counted rather than silent, and the wording is the quota's rather than "older":
+  // rows dropped by a share can be newer than rows still on screen.
+  assert.match(all.text, new RegExp(`每个工作区最多显示 ${String(LIST_ALL_GROUP_LIMIT)} 个`))
+  assert.match(all.text, /（还有 9 个对话未显示）/)
+  // The trailing id is explained as a way to switch, with an example taken from this very listing —
+  // printing it without saying what it is for is what left it looking like decoration.
+  const newestOwn = gateway.sessions.at(-1)!
+  assert.match(all.text, /行尾那个 6 位 id/)
+  assert.match(all.text, new RegExp(`如第 1 行的 ${shortId(newestOwn.sessionId)}`))
+
+  // And the default list is unchanged: this workspace only, still up to its own ten rows.
+  const own = await router.route({ ...conversation, text: '/list' })
+  assert.equal(own.kind, 'reply')
+  if (own.kind !== 'reply') return
+  const ownGroups = listingGroups(own.text)
+  assert.deepEqual(
+    [...ownGroups.keys()],
+    ['微信会话'],
+    'the default list is still this workspace only',
+  )
+  assert.equal(ownGroups.get('微信会话')?.length, 10)
+  assert.doesNotMatch(own.text, /别处的工作|另一个项目/)
+  assert.match(own.text, /另有 2 个对话在其它工作区/)
+})
+
+test('/list all stops at a readable length however many workspaces there are', () => {
+  /*
+   * The other half of the requirement: a share per workspace is not a bound on its own. Six workspaces
+   * at four rows each is twenty-four rows, which is a wall of text on a phone — so the total is capped
+   * as well, and what does not fit is counted out loud.
+   */
+  const rows: ListedSession[] = []
+  for (let group = 0; group < 6; group += 1) {
+    for (let row = 0; row < 4; row += 1) {
+      rows.push({
+        sessionId: `session-${String(group)}${String(row)}aaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa`,
+        title: `项目 ${String(group)} 的第 ${String(row)} 个`,
+        updatedAt: 1_800_000_000_000 - group * 1_000 - row,
+        workspace: `C:\\Users\\me\\project${String(group)}`,
+      })
+    }
+  }
+
+  const groups = groupSessionRows(rows, {
+    ownLabel: '微信会话',
+    limit: LIST_ALL_LIMIT,
+    groupLimit: LIST_ALL_GROUP_LIMIT,
+  })
+  assert.equal(flattenSessionGroups(groups).length, LIST_ALL_LIMIT, 'the cap is the cap')
+  assert.equal(groups.length, LIST_ALL_LIMIT / LIST_ALL_GROUP_LIMIT, 'four whole workspaces fit')
+  assert.deepEqual(
+    groups.map((group) => group.label),
+    ['project0', 'project1', 'project2', 'project3'],
+    'the budget goes to the most recently active workspaces',
+  )
+
+  const text = renderSessionList(groups, undefined, {
+    total: rows.length,
+    groupLimit: LIST_ALL_GROUP_LIMIT,
+  })
+  // 24 conversations, 12 printed, so 12 are owed an explanation.
+  assert.match(text, /（还有 12 个对话未显示）/)
+  assert.match(text, /共 24 个对话（每个工作区最多显示 3 个）/)
 })
 
 test('the same listing is byte-identical however the store hands the rows over', () => {

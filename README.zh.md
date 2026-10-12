@@ -143,8 +143,8 @@ dsh plugin --profile desktop add silk-wasm
 | 指令 | 作用 |
 |---|---|
 | `/new` | 开一个新对话。**后面跟的字会成为标题**：`/new 修复登录` 就是开一个叫「修复登录」的对话。不跟字的话，标题取自你的第一条消息 |
-| `/list` | 只列微信工作区的对话，按工作区分组，新的在前 |
-| `/list all` | 列出全部，也按工作区分组 |
+| `/list` | 只列微信工作区的对话，按工作区分组，新的在前（最多 10 行） |
+| `/list all` | 列出全部，也按工作区分组（每个工作区最多 3 个，整条最多 12 行，其余数量写在末尾） |
 | `/switch 3` | 切到那份列表里的第 3 个 |
 | `/switch e716f0` | 按**行尾那个短 id** 切——跟编号无关，永远不会过期 |
 | 引用列表消息 → `/switch 3` | 按**那条列表**的编号切，编号冻结在那条消息里 |
@@ -194,7 +194,7 @@ pnpm install
 pnpm build              # 只编译，保留 @dsh-wechat/core 引用（pack 要靠它改写）
 pnpm run dist           # build + 内嵌 core，产出可直接加载的形态
 pnpm typecheck
-pnpm test               # 249 项
+pnpm test               # 252 项
 pnpm check              # build + typecheck + test
 pnpm run pack           # 需要先 dist
 pnpm run verify-pack    # 解包、校验清单文件、按 DSH 的方式挂载一次

@@ -317,6 +317,11 @@ export class SessionRouter {
          *
          * "Only", not "first": the rest are held back and counted, with the sentence that says how to
          * see them. A user who is never told cannot ask.
+         *
+         * `/list all` is cut per workspace, never globally — see {@link LIST_ALL_GROUP_LIMIT}. A single
+         * global cut is what made this command useless: this workspace is the busiest one, so the ten
+         * rows were all its own, grouping then produced a single heading, and the reply was
+         * indistinguishable from plain `/list`.
          */
         const all = await this.#gateway.listSessions()
         const own = await this.#ownSessions(all)
@@ -334,12 +339,14 @@ export class SessionRouter {
         const groups = groupSessionRows(rows, {
           ...(this.#ownWorkspace === undefined ? {} : { ownWorkspace: this.#ownWorkspace }),
           ownLabel: this.#ownWorkspaceLabel,
+          ...(wantsAll ? { limit: LIST_ALL_LIMIT, groupLimit: LIST_ALL_GROUP_LIMIT } : {}),
         })
         const numbered = flattenSessionGroups(groups)
         const text = renderSessionList(groups, bindings[params.conversationId]?.sessionId, {
           total: rows.length + held.length,
           ...(held.length === 0 ? {} : { held: { count: held.length, names: heldNames(held) } }),
           ...(params.heldHint === undefined ? {} : { heldHint: params.heldHint }),
+          ...(wantsAll ? { groupLimit: LIST_ALL_GROUP_LIMIT } : {}),
         })
         return { kind: 'reply', text, numbered }
       }
@@ -796,6 +803,28 @@ export function resolveModelOption(
 /** How many rows the list shows. Beyond this, older sessions are out of reach by number. */
 const LIST_LIMIT = 10
 
+/**
+ * How many rows one workspace gets when `/list all` lists the whole machine.
+ *
+ * A share per workspace rather than one cut over everything, because the cut used to be applied
+ * *before* the rows were grouped: the channel's own workspace is almost always the most recently
+ * active one, so a global top ten went to it in full and every other workspace disappeared. `/list all`
+ * then printed exactly what `/list` prints — one heading, the same rows — and the user had no way to
+ * tell that other workspaces existed at all. A per-workspace share makes several headings a property
+ * of the listing rather than a coincidence of who happened to be busy.
+ */
+export const LIST_ALL_GROUP_LIMIT = 3
+
+/**
+ * Ceiling on `/list all` in total.
+ *
+ * The share alone is not a bound: ten workspaces at three rows each is thirty rows, and a WeChat
+ * message is read on a phone. Four workspaces' worth is about the length of the ten rows it replaces,
+ * so listing everything costs the user no more scrolling than before — while still guaranteeing that
+ * more than one workspace is visible.
+ */
+export const LIST_ALL_LIMIT = 12
+
 /** How much of a conversation title a row prints before it is cut. */
 const TITLE_LIMIT = 24
 
@@ -854,22 +883,27 @@ function truncateTitle(title: string): string {
  * shows. The channel's own workspace leads, because those are the conversations this chat created;
  * the rest follow, most recently active first.
  *
- * The limit is applied **before** grouping, to the whole machine's most recent conversations, so the
- * heading's `最近 N 个` counts the rows actually printed rather than one workspace's share of them. A
- * per-workspace cut would print forty rows under a heading that promised ten.
+ * Two cuts apply, in this order. First every workspace is cut to `groupLimit` rows
+ * ({@link LIST_ALL_GROUP_LIMIT}), which is what makes a whole-machine listing show more than one
+ * workspace instead of handing every row to the busiest one. Then the groups are walked in display
+ * order and rows are taken until `limit` is reached, so the total stays readable on a phone and what
+ * survives is the most recently active workspaces. The channel's own workspace is walked first and
+ * therefore always keeps its share.
  *
  * @param rows - Every row the listing could show.
  * @param options.ownWorkspace - Directory the channel's own sessions live in.
  * @param options.ownLabel - Heading for that directory.
- * @param options.limit - How many rows to keep in total.
+ * @param options.limit - Ceiling on the total number of rows.
+ * @param options.groupLimit - Per-workspace ceiling, or undefined for a plain recency cut.
  * @returns Non-empty groups, in display order.
  */
 export function groupSessionRows(
   rows: readonly ListedSession[],
-  options: { ownWorkspace?: string; ownLabel: string; limit?: number },
+  options: { ownWorkspace?: string; ownLabel: string; limit?: number; groupLimit?: number },
 ): SessionGroup[] {
-  const limit = options.limit ?? LIST_LIMIT
-  const ordered = [...rows].sort(compareSessionsNewestFirst).slice(0, Math.max(limit, 0))
+  const limit = Math.max(options.limit ?? LIST_LIMIT, 0)
+  const groupLimit = options.groupLimit === undefined ? undefined : Math.max(options.groupLimit, 0)
+  const ordered = [...rows].sort(compareSessionsNewestFirst)
 
   const own: ListedSession[] = []
   const byPath = new Map<string, ListedSession[]>()
@@ -896,9 +930,20 @@ export function groupSessionRows(
       return a.path < b.path ? -1 : 1
     })
 
+  const inDisplayOrder: { label: string; list: ListedSession[] }[] = []
+  if (own.length > 0) inDisplayOrder.push({ label: options.ownLabel, list: own })
+  for (const group of others) inDisplayOrder.push({ label: workspaceLabel(group.path), list: group.list })
+
   const groups: SessionGroup[] = []
-  if (own.length > 0) groups.push({ label: options.ownLabel, sessions: own })
-  for (const group of others) groups.push({ label: workspaceLabel(group.path), sessions: group.list })
+  let budget = limit
+  for (const group of inDisplayOrder) {
+    if (budget <= 0) break
+    const withinShare = groupLimit === undefined ? group.list : group.list.slice(0, groupLimit)
+    const sessions = withinShare.slice(0, budget)
+    if (sessions.length === 0) continue
+    groups.push({ label: group.label, sessions })
+    budget -= sessions.length
+  }
   return groups
 }
 
@@ -927,6 +972,9 @@ export function flattenSessionGroups(groups: readonly SessionGroup[]): ListedSes
  *   of those workspaces. Naming them is the whole point: a user who is never told cannot ask.
  * @param options.heldHint - How to reach the held conversations. Typed and spoken requests need
  *   different wording, because a spoken request cannot be told to type a command it never mentions.
+ * @param options.groupLimit - The per-workspace share the caller cut the rows with, when it used one.
+ *   It changes how truncation is described: a plain cut drops the *oldest* rows, while a share drops
+ *   rows that can be newer than the ones still on screen, so calling those "更早的" would be false.
  * @param options.now - Current time, so every row of one message agrees on what "3 分钟前" means.
  * @returns The message body.
  */
@@ -937,6 +985,7 @@ export function renderSessionList(
     total?: number
     held?: { count: number; names?: readonly string[] }
     heldHint?: string
+    groupLimit?: number
     now?: number
   } = {},
 ): string {
@@ -944,10 +993,14 @@ export function renderSessionList(
   const shown = flattenSessionGroups(groups)
   const held = options.held ?? { count: 0 }
   const total = options.total ?? shown.length + held.count
+  const missing = total - shown.length
+  const share = options.groupLimit
   const heading =
-    shown.length < total
-      ? `最近 ${String(shown.length)} 个对话（共 ${String(total)} 个）`
-      : `共 ${String(shown.length)} 个对话`
+    missing <= 0
+      ? `共 ${String(shown.length)} 个对话`
+      : share === undefined
+        ? `最近 ${String(shown.length)} 个对话（共 ${String(total)} 个）`
+        : `共 ${String(total)} 个对话（每个工作区最多显示 ${String(share)} 个）`
 
   const sections: string[] = []
   let index = 0
@@ -961,9 +1014,11 @@ export function renderSessionList(
   }
 
   const more =
-    shown.length < total && held.count === 0
-      ? `（还有 ${String(total - shown.length)} 个更早的对话未显示）`
-      : ''
+    missing <= 0 || held.count > 0
+      ? ''
+      : share === undefined
+        ? `（还有 ${String(missing)} 个更早的对话未显示）`
+        : `（还有 ${String(missing)} 个对话未显示）`
   const names = held.names ?? []
   const elsewhere =
     held.count === 0
@@ -972,13 +1027,27 @@ export function renderSessionList(
           names.length === 0 ? '' : `（${names.join('、')}）`
         }，${options.heldHint ?? '一起看就发 /list all。'}`
 
+  /*
+   * The row's trailing id is named here, with a real example from this very listing.
+   *
+   * Printing an id without saying what it is for left it looking like decoration: users read the
+   * number, replied with the number, and never knew the id was also a way to switch — which is the
+   * one form that cannot expire. The example is taken from row 1 rather than written into the string,
+   * so it is always a row the user can see and check against.
+   */
+  const first = shown[0]
+  const switchHint =
+    first === undefined
+      ? '回复 /switch 编号，或 /switch 行尾那个 6 位 id 切换。'
+      : `回复 /switch 编号，或 /switch 行尾那个 6 位 id（如第 1 行的 ${shortId(first.sessionId)}）切换。`
+
   return [
     `${heading}：`,
     ...sections,
     ...(more === '' ? [] : ['', more]),
     ...(elsewhere === '' ? [] : ['', elsewhere]),
     '',
-    '回复 /switch 编号或 /switch id 切换；',
+    switchHint,
     '引用这条消息再回编号，可以避免编号过期。',
   ].join('\n')
 }
@@ -1118,9 +1187,9 @@ export const HELP_TEXT = [
   '可用指令：',
   '/new [标题]      新建对话',
   '/list            列出本工作区的最近对话',
-  '/list all        连其它工作区一起列出',
+  `/list all        连其它工作区一起列出（每个工作区最多 ${String(LIST_ALL_GROUP_LIMIT)} 个）`,
   '/switch <编号>   切换（引用列表消息再回编号，编号不会过期）',
-  '/switch <id>     按 id 切换，例如 /switch e716f0',
+  '/switch <id>     按列表行尾那个 6 位 id 切换，例如 /switch e716f0',
   '/model <编号>    查看或切换模型',
   '/current         显示当前对话',
   '/cancel          中断当前任务',

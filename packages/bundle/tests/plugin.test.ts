@@ -1259,7 +1259,10 @@ test('the session tool lists conversations with the number to answer', async () 
     assert.match(body, /2\. /)
     assert.match(body, /← 当前/)
     assert.match(body, /【微信会话】/, 'the rows are grouped under the workspace they belong to')
-    assert.match(body, /回复 \/switch 编号或 \/switch id 切换/)
+    // Both ways to answer are named, including the short id: the row prints it, so nothing else tells
+    // the user what it is for, and it is the one form that cannot expire.
+    assert.match(body, /回复 \/switch 编号，或 \/switch 行尾那个 6 位 id/)
+    assert.match(body, /如第 1 行的 [0-9a-f]{1,6}/, 'the hint uses a row from this very listing')
     assert.match(body, /引用这条消息再回编号/, 'the quote trick is explained where it is needed')
     // Every row closes with the short id `/switch <id>` accepts, within the six-character bound.
     for (const row of body.split('\n').filter((line) => /^\d+\. /.test(line))) {
@@ -1676,6 +1679,49 @@ test('another workspace is counted and named as reachable, not listed by default
       // the name the user knows it by, and the other by its folder.
       assert.match(wider, /【微信会话】/)
       assert.match(wider, /【some_project】/)
+    } finally {
+      harness.dispose()
+    }
+  } finally {
+    await removeHome(home)
+  }
+})
+
+test('a spoken full list shows more than one workspace even when this one is the busiest', async () => {
+  /*
+   * The spoken route groups and cuts the rows itself, so the per-workspace share has to be applied
+   * there too. Fixing only the typed command would leave the same question answered two ways — the
+   * divergence this repository has already been bitten by once.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
+  try {
+    await seedState(home, { ...DEFAULT_SETTINGS, requireConfirmation: false })
+    const workspace = join(home, 'dsh_wechat')
+    // Seeded first, so it is older than everything this workspace holds: a single global cut of the
+    // newest rows would be this workspace alone.
+    await seedStoredSession(home, join(home, 'some_project'), 'session-ffff9999-ffff9999-x', '别处的工作')
+    for (let index = 0; index < 12; index += 1) {
+      await seedStoredSession(
+        home,
+        workspace,
+        `session-${String(index).padStart(4, '0')}aaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa`,
+        `本工作区 ${String(index)}`,
+      )
+    }
+
+    const harness = await mount({ home, seedAccount: false, hostReportsNoSessions: true })
+    try {
+      await harness.runtime.ingest(inbound('第一条'))
+      const result = await control(harness, 'list', 'all')
+      assert.equal(result.ok, true, result.detail)
+
+      const body = harness.sent.at(-1)?.text ?? ''
+      const headings = [...body.matchAll(/^【(.+)】$/gm)].map((match) => match[1])
+      assert.ok(
+        headings.includes('some_project'),
+        `asked to see everything, the reply must not be this workspace alone:\n${body}`,
+      )
+      assert.ok(headings.length >= 2, `expected several workspaces:\n${body}`)
     } finally {
       harness.dispose()
     }

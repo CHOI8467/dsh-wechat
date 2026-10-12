@@ -26,6 +26,8 @@ import {
   groupSessionRows,
   heldNames,
   latestSessionList,
+  LIST_ALL_GROUP_LIMIT,
+  LIST_ALL_LIMIT,
   login as loginHandshake,
   isSameWorkspace,
   listAllStoredSessions,
@@ -364,6 +366,8 @@ function quotedMessageId(message: InboundMessage): string | undefined {
  * @param total - How many conversations the message is about, including any not shown.
  * @param held - Conversations in other workspaces this listing left out.
  * @param heldHint - Wording for reaching them, which differs between typed and spoken requests.
+ * @param groupLimit - The per-workspace share the rows were cut with, when one was used, so the
+ *   message describes truncation the way it actually happened.
  * @returns The message body.
  */
 function renderTable(
@@ -372,11 +376,13 @@ function renderTable(
   total: number,
   held: { count: number; names?: readonly string[] },
   heldHint?: string,
+  groupLimit?: number,
 ): string {
   return renderSessionList(groups, currentId, {
     total,
     ...(held.count === 0 ? {} : { held }),
     ...(heldHint === undefined ? {} : { heldHint }),
+    ...(groupLimit === undefined ? {} : { groupLimit }),
   })
 }
 
@@ -898,6 +904,7 @@ class WechatRuntime {
               table.total,
               { count: otherWorkspaces, names: otherNames },
               '说「看全部对话」就能一起看，也可以直接切过去。',
+              includeAll ? LIST_ALL_GROUP_LIMIT : undefined,
             )
       const sentId = await this.#notify(conversationId, body)
       /*
@@ -1160,10 +1167,15 @@ class WechatRuntime {
 
     // `all` shows everything; otherwise the wider list is only counted, so the default stays short
     // and the user is told the rest is there.
+    //
+    // The whole-machine list is cut per workspace, exactly as the typed `/list all` cuts it: a single
+    // global cut went entirely to this workspace, which is the busiest, leaving one heading and no
+    // sign that other workspaces existed.
     const rows = includeAll ? all : own
     const groups = groupSessionRows(rows, {
       ownWorkspace: this.#workspace,
       ownLabel: WORKSPACE_TITLE,
+      ...(includeAll ? { limit: LIST_ALL_LIMIT, groupLimit: LIST_ALL_GROUP_LIMIT } : {}),
     })
     const ordered = flattenSessionGroups(groups)
     return {

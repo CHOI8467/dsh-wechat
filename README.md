@@ -162,8 +162,8 @@ Type these to control which DSH conversation you are talking to:
 | Command | What it does |
 |---|---|
 | `/new` | Start a fresh conversation. Anything after it becomes the title: `/new 修复登录` starts a conversation called 「修复登录」. Without one, the conversation gets a name from your first message |
-| `/list` | Conversations in the WeChat workspace only, grouped by workspace, newest first |
-| `/list all` | Every conversation, grouped by workspace too |
+| `/list` | Conversations in the WeChat workspace only, grouped by workspace, newest first (up to 10 rows) |
+| `/list all` | Every conversation, grouped by workspace too — at most 3 rows per workspace and 12 in total, with the number left out printed at the end |
 | `/switch 3` | Move to number 3 in that list |
 | `/switch e716f0` | Move by the **short id printed at the end of the row** — independent of numbering, so it never goes stale |
 | quote the list, then `/switch 3` | Move to number 3 **of that listing**, frozen in the message you quoted |
@@ -231,7 +231,7 @@ pnpm install
 pnpm build              # compiles only, leaving @dsh-wechat/core imports for pack to rewrite
 pnpm run dist           # build + inline core: the loadable form a Git install needs
 pnpm typecheck
-pnpm test               # 249 tests
+pnpm test               # 252 tests
 pnpm check              # build + typecheck + test
 pnpm run pack           # run dist first
 pnpm run verify-pack    # unpack, check the manifest's files, mount it as DSH would
