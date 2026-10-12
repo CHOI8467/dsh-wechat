@@ -24,6 +24,7 @@ import {
   login as loginHandshake,
   isSameWorkspace,
   listAllStoredSessions,
+  quotaLedgerFor,
   storedSessionWorkspace,
   rememberSentMessage,
   resolveSettings,
@@ -37,6 +38,8 @@ import {
   SendRefusedError,
   queuePendingNotification,
   expirePendingNotifications,
+  QUOTA_PER_TOKEN as QUOTA_LIMIT,
+  QUOTA_WARNING as QUOTA_WARNING_TEXT,
   type BindingStore,
   type CDNMedia,
   type ChannelSettings,
@@ -45,6 +48,7 @@ import {
   type InboundMessage,
   type LoginEvent,
   type MessageItem,
+  type QuotaLedger,
   type RouteDecision,
   type SessionBinding,
   type SessionGateway,
@@ -103,15 +107,15 @@ const REPLY_SETTLE_MS = 1_200
 const MAX_REPLY_CHARS = 4_000
 
 /**
- * Outbound messages one reply token allows, and where to start asking for a new one.
+ * The reply-window quota, aliased on import so the arithmetic below reads the way it did.
  *
- * Measured, not documented: the platform refuses the eleventh send of a window with
- * `prepare failed`, and every implementation that has looked has found the same ten. The warning
- * fires two short of the limit so that the ask itself still has a slot — a warning sent at the
- * limit would be a warning into a closed window.
+ * Both values live in `@dsh-wechat/core` because `dsh-wechat-send` charges the same count: a script
+ * the agent writes and the plugin's own replies have to add up to one ten, and a second copy of these
+ * constants is exactly how the two would drift apart. The warning's wording travels with them for the
+ * same reason.
  */
-const QUOTA_PER_TOKEN = 10
-const QUOTA_WARN_AT = QUOTA_PER_TOKEN - 2
+const QUOTA_PER_TOKEN = QUOTA_LIMIT
+const QUOTA_WARNING = QUOTA_WARNING_TEXT
 
 /**
  * How long an opt-in merge waits for more, and the longest it may wait in total.
@@ -129,17 +133,6 @@ interface NotifyTarget {
   conversationId: string
   contextToken?: string
 }
-
-/**
- * What the user is told when the window is nearly spent.
- *
- * Plain and short, and it asks for the one action that actually works: any message back. It
- * deliberately does not promise that everything queued will follow — it will, but only after
- * they write, and saying so up front is what keeps the next silence from looking like a failure.
- */
-const QUOTA_WARNING =
-  `📮 微信这边一个回复窗口最多连发 ${String(QUOTA_PER_TOKEN)} 条，我快到上限了。\n` +
-  `你随便回我一句，我就能把剩下的接着发过来。`
 
 /** How long a finished login result stays visible before a new attempt is allowed. */
 const LOGIN_RESULT_TTL_MS = 30_000
@@ -591,13 +584,14 @@ class WechatRuntime {
    */
   #lastRefusal = ''
   /**
-   * Sends charged against the reply token in use, per conversation.
+   * Sends charged against the reply token in use, per conversation, **on disk**.
    *
-   * Keyed by conversation and stamped with the token, because a fresh token carries a fresh ten
-   * and comparing the stamp is how that is noticed. Not persisted: a restart loses the count, and
-   * the cost of being wrong is one refused send, handled exactly like reaching the limit.
+   * Keyed by conversation and stamped with the token, because a fresh token carries a fresh ten and
+   * comparing the stamp is how that is noticed. Persistent so a restart does not lose the count, and
+   * shared with `dsh-wechat-send` so a script the agent writes and this plugin add up to one ten
+   * instead of two — the whole reason the count moved out of memory.
    */
-  readonly #quota = new Map<string, { token: string | undefined; used: number; warned: boolean }>()
+  readonly #quota: QuotaLedger
   /**
    * Fragments held for a merge, per conversation.
    *
@@ -645,6 +639,12 @@ class WechatRuntime {
         }))
     this.#store = new StateStore(options.stateFile)
     this.#stateFilePath = options.stateFile
+    /*
+     * Built over the store rather than over a local map, so the count is read from the file on every
+     * send and written back before the send's caller continues. That is what makes a restart, and a
+     * `dsh-wechat-send` running in another process, see the same arithmetic.
+     */
+    this.#quota = quotaLedgerFor(this.#store)
     const bindings: BindingStore = {
       load: async () => (await this.#store.read()).bindings,
       save: async (next: Record<string, SessionBinding>) => {
@@ -2026,7 +2026,7 @@ class WechatRuntime {
     const notify = tools.register({
       name: 'notify_wechat',
       description:
-        'Push a message, and optionally a file, to the user\'s WeChat. Unlike send_to_wechat this works from any session, including one the WeChat conversation is not currently bound to, which is what makes "tell me when it is done" possible. Always reaches the conversation the user is currently in; there is no way to choose another. Use it to report a finished task, or to send a file the user asked to receive. **WeChat allows only ten messages per reply window, and the window reopens only when the user writes: after ten, everything else waits for their next message.** So when you have several things to say, say them in one message as a list rather than as several messages - each separate message spends one of the ten. **Send through this tool even for a timed series - one call per message - because only then can the plugin count the window, warn the user before the ten run out, and queue whatever the window refuses. A script that calls the API directly gets none of that: the plugin never sees those sends, cannot warn, and the eleventh message is refused and lost.** Keep text short — it is read on a phone.',
+        'Push a message, and optionally a file, to the user\'s WeChat. Unlike send_to_wechat this works from any session, including one the WeChat conversation is not currently bound to, which is what makes "tell me when it is done" possible. Always reaches the conversation the user is currently in; there is no way to choose another. Use it to report a finished task, or to send a file the user asked to receive. **WeChat allows only ten messages per reply window, and the window reopens only when the user writes: after ten, everything else waits for their next message.** So when you have several things to say, say them in one message as a list rather than as several messages - each separate message spends one of the ten. **Send through this tool even for a timed series - one call per message - because only then can the plugin count the window, warn the user before the ten run out, and queue whatever the window refuses. A script that calls the API directly gets none of that: the plugin never sees those sends, cannot warn, and the eleventh message is refused and lost.** **When a script has to do the sending - a timed loop, a countdown, anything that runs outside this turn - have it run the `dsh-wechat-send "<text>"` command instead of talking to the iLink API itself; add `--file <path>` to attach a file, and `--help` for the exit codes. That command counts the same window as this tool, warns the user at the same point, and queues what the window refuses. Reaching the API directly is the one thing that loses messages.** Keep text short — it is read on a phone.',
       parameters: {
         type: 'object',
         properties: {
@@ -2671,6 +2671,19 @@ class WechatRuntime {
       ...(target.contextToken === undefined ? {} : { contextToken: target.contextToken }),
       ...(signal === undefined ? {} : { signal }),
     })
+    /*
+     * An attachment is a message like any other and spends a slot of the same ten.
+     *
+     * Charged *after* the send, so a refusal — which throws out of `sender` — queues the file without
+     * its slot having been counted. Charging before the attempt would make the arithmetic say one more
+     * than the service saw for every message the closed window refused.
+     */
+    await this.#noteQuota(
+      target.account,
+      target.conversationId,
+      target.peerId,
+      target.contextToken,
+    )
 
     // The assigned id, next to the message it names: a quoted attachment is resolved by this
     // id alone, and an attachment's content cannot be recovered from the quote itself.
@@ -3058,8 +3071,11 @@ class WechatRuntime {
   /**
    * Charge one send against the reply token, and ask for a new one as the window runs low.
    *
-   * The warning goes out on the low-level send rather than through this method, so charging a
-   * send cannot charge another one and recurse.
+   * The arithmetic and the persistence both live in `@dsh-wechat/core`; what stays here is the only
+   * part that needs the injected sender — delivering the warning. It goes out on the low-level
+   * `#send` rather than through `#sendText`, so charging a send cannot charge another one and
+   * recurse; the warning is charged as part of the same write, which is what keeps the stored count
+   * equal to the number of messages the service actually accepted.
    *
    * @param account - Account the message went through.
    * @param conversationId - Conversation the token belongs to.
@@ -3072,14 +3088,8 @@ class WechatRuntime {
     peerId: string,
     contextToken: string | undefined,
   ): Promise<void> {
-    const entry = this.#quota.get(conversationId)
-    if (entry === undefined || entry.token !== contextToken) {
-      this.#quota.set(conversationId, { token: contextToken, used: 1, warned: false })
-      return
-    }
-    entry.used += 1
-    if (entry.used < QUOTA_WARN_AT || entry.warned) return
-    entry.warned = true
+    const charge = await this.#quota.charge(conversationId, contextToken)
+    if (!charge.warn) return
     try {
       await this.#send({
         account,
@@ -3087,12 +3097,10 @@ class WechatRuntime {
         text: QUOTA_WARNING,
         ...(contextToken === undefined ? {} : { contextToken }),
       })
-      // The warning is a message too, and counting it is what keeps the arithmetic honest.
-      entry.used += 1
-      this.#recordBoot(`quota: 窗口已用 ${String(entry.used)}/${String(QUOTA_PER_TOKEN)}，已提醒续期`)
+      this.#recordBoot(`quota: 窗口已用 ${String(charge.used)}/${String(QUOTA_PER_TOKEN)}，已提醒续期`)
     } catch {
       // A warning nobody receives is not worth a thrown error; the next send queues regardless.
-      this.#recordBoot(`quota: 窗口已用 ${String(entry.used)}/${String(QUOTA_PER_TOKEN)}，提醒未能发出`)
+      this.#recordBoot(`quota: 窗口已用 ${String(charge.used)}/${String(QUOTA_PER_TOKEN)}，提醒未能发出`)
     }
   }
 
@@ -3118,6 +3126,14 @@ class WechatRuntime {
       `outbound text id=${typeof id === 'string' ? id : '(none)'} len=${String(text.length)}` +
         ` body=${preview}`,
     )
+    /*
+     * Charged here, after the send, and only on the path that actually sent.
+     *
+     * This is the one place a text reply is charged, and it matters that it comes after `#send`:
+     * a refused send throws first, so the closed window's queue never counts slots the service did
+     * not accept. That is what keeps the stored count equal to the number of messages the user
+     * actually received — the number that decides whether the ask for a new window comes in time.
+     */
     await this.#noteQuota(account, conversationId, peerId, contextToken)
     if (typeof id === 'string') {
       // Retained so a quote of this message can be turned back into content. A quote carries

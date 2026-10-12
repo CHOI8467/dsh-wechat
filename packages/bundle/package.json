@@ -25,11 +25,15 @@
   },
   "main": "lib/host.js",
   "types": "lib/host.d.ts",
+  "bin": {
+    "dsh-wechat-send": "./cli.js"
+  },
   "exports": {
     ".": {
       "types": "./lib/host.d.ts",
       "default": "./lib/host.js"
     },
+    "./cli": "./cli.js",
     "./client": "./client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
@@ -37,6 +41,7 @@
   "files": [
     "lib",
     "dist",
+    "cli.js",
     "client.js",
     "cordis.patch.yml",
     "README.md",

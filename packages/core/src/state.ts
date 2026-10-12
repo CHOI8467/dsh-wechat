@@ -23,6 +23,7 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 import type { WeixinAccount } from './types.ts'
+import { normalizeQuota, type QuotaEntry } from './quota.ts'
 import type { SessionBinding } from './router.ts'
 
 /** Everything persisted for one channel deployment. */
@@ -61,6 +62,17 @@ export interface ChannelState {
    * both count and age so a long silence cannot grow the file without limit.
    */
   pendingNotifications?: PendingNotification[]
+  /**
+   * Sends charged against the reply token in use, per conversation.
+   *
+   * Persisted rather than counted in memory, and that is the point of the field: the count decides
+   * when the user is asked for a new window, and the ask has to arrive *before* the last slot is
+   * spent. A restart used to lose the count, so a process that came back mid-window believed the ten
+   * were untouched and spent the remainder on messages that were refused instead of on warning the
+   * user first. `dsh-wechat-send` reads and writes the same entries, so a script and the plugin add
+   * up to one count rather than two.
+   */
+  quota?: Record<string, QuotaEntry>
   /** Whether the channel should reconnect on boot. */
   autoStart?: boolean
   /**
@@ -450,6 +462,16 @@ function normalize(parsed: Partial<ChannelState>): ChannelState {
     ...(Array.isArray(parsed.pendingNotifications)
       ? { pendingNotifications: parsed.pendingNotifications.filter(isPendingNotification) }
       : {}),
+    /*
+     * Always written, even when empty, and validated entry by entry.
+     *
+     * This field is the reason the omission it prevents was worth a handbook section: `normalize` is
+     * an allowlist, so a field added to `ChannelState` but not here is silently discarded on the next
+     * write. The count decides whether the user is asked for a new window in time, so losing it
+     * quietly is the same failure the settings page had — data that saves fine and is gone after a
+     * restart.
+     */
+    quota: normalizeQuota(parsed.quota),
     ...(isRecord(parsed.settings) ? { settings: normalizeSettings(parsed.settings) } : {}),
     ...(typeof parsed.autoStart === 'boolean' ? { autoStart: parsed.autoStart } : {}),
   }

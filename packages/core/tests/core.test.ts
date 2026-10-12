@@ -25,6 +25,7 @@ import {
 } from '../src/router.ts'
 import type { SessionBinding, SessionGateway } from '../src/router.ts'
 import type { ChannelState } from '../src/state.ts'
+import { chargeQuota, quotaLedgerFor, type QuotaEntry } from '../src/quota.ts'
 import type { WeixinAccount, WeixinMessage } from '../src/types.ts'
 
 /** A state with nothing in it, for exercising the queue helpers. */
@@ -821,6 +822,167 @@ test('a malformed pending entry is dropped when the state is read back', async (
 
     const read = await new StateStore(join(home, 'state.json')).read()
     assert.deepEqual(read.pendingNotifications, [good], 'only the well-formed entry survives')
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Reply-window quota
+// ---------------------------------------------------------------------------
+
+/** One conversation's quota entry, as the state file stores it. */
+function quotaOf(state: ChannelState, conversationId: string): QuotaEntry | undefined {
+  return state.quota?.[conversationId]
+}
+
+test('the quota count survives a write, a fresh read, and another write', async () => {
+  /*
+   * The reason this test exists at all: `normalize()` is an allowlist, and a field added to
+   * `ChannelState` without a line there is discarded by the very next write. That is exactly how the
+   * settings page spent several releases losing everything the user saved (`HANDBOOK-DEV.md` §4.9) —
+   * saved fine, gone after a restart.
+   *
+   * The count is now the same kind of data and matters more than most: it decides whether the user is
+   * asked for a new window *before* the last slot is spent, so silently resetting it to zero on every
+   * write means the ask comes too late and the tail of a series is refused.
+   *
+   * The second `update` is the step that used to eat things: every write re-reads and re-normalizes
+   * the file first.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-quota-'))
+  try {
+    const file = join(home, 'state.json')
+    const wanted: QuotaEntry = { token: 'ctx-token-1', used: 9, warned: true }
+    const store = new StateStore(file)
+    await store.update((state) => {
+      state.quota = { 'bot@im.bot:peer@im.wechat': wanted }
+    })
+    await store.update(() => {})
+
+    const stored = quotaOf(await new StateStore(file).read(), 'bot@im.bot:peer@im.wechat')
+    assert.deepEqual(stored, wanted, 'the count is still there after a reload and a rewrite')
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('a malformed quota entry is dropped when the state is read back', async () => {
+  // `used` reaches arithmetic that decides whether to ask for a new window. A string there would
+  // compare as false forever, so the warning would silently never fire; an entry with no `warned`
+  // would make the same ask repeat on every send and spend the remaining slots on asking.
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-quota-'))
+  try {
+    const file = join(home, 'state.json')
+    const good: QuotaEntry = { token: 'ctx', used: 3, warned: false }
+    const store = new StateStore(file)
+    await store.update((state) => {
+      state.quota = {
+        good,
+        'used-is-a-string': { token: 'ctx', used: '3', warned: false },
+        'warned-missing': { token: 'ctx', used: 3 },
+        'used-is-negative': { token: 'ctx', used: -1, warned: false },
+        'token-is-a-number': { token: 7, used: 1, warned: false },
+      } as never
+    })
+
+    assert.deepEqual(
+      Object.keys((await new StateStore(file).read()).quota ?? {}),
+      ['good'],
+      'only the well-formed entry survives',
+    )
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('the count starts at one and asks for a new window two short of the limit', () => {
+  /*
+   * Three things are pinned here, and each of them is a way the ask can fail to arrive in time:
+   *
+   * 1. A conversation with no stored entry is a fresh window, counted from one rather than two.
+   * 2. The ask happens at eight, not at ten — the warning is itself a message, so an ask at the limit
+   *    would be an ask with no slot left to carry it.
+   * 3. The warning is charged in the same step, so the count matches what the service actually saw.
+   */
+  const first = chargeQuota({ token: 'ctx' })
+  assert.deepEqual(first.entry, { token: 'ctx', used: 1, warned: false })
+  assert.equal(first.warn, false, 'nothing to ask for on the first send of a window')
+
+  const seventh = chargeQuota({ stored: { token: 'ctx', used: 6, warned: false }, token: 'ctx' })
+  assert.equal(seventh.warn, false, 'seven sends is still quiet')
+
+  const eighth = chargeQuota({ stored: { token: 'ctx', used: 7, warned: false }, token: 'ctx' })
+  assert.equal(eighth.warn, true, 'the eighth send is the one that carries the ask')
+  assert.equal(eighth.used, 9, 'the ask itself spends a slot, so the count reflects it')
+  assert.equal(eighth.entry.warned, true)
+})
+
+test('the ask happens once per window, never twice', () => {
+  // The ninth and every later send must stay quiet. Repeating the ask would spend the remaining slots
+  // on asking, which is the loop this flag exists to break.
+  const ninth = chargeQuota({ stored: { token: 'ctx', used: 9, warned: true }, token: 'ctx' })
+  assert.equal(ninth.warn, false)
+  assert.equal(ninth.used, 10)
+
+  const tenth = chargeQuota({ stored: { token: 'ctx', used: 10, warned: true }, token: 'ctx' })
+  assert.equal(tenth.warn, false, 'a spent window is not asked about again')
+  assert.equal(tenth.used, 11, 'countermanding nothing here: the arithmetic keeps counting')
+})
+
+test('a new token resets both the count and the ask', () => {
+  /*
+   * The platform issues a fresh ten with every inbound message, and nothing tells this side when that
+   * happens except the token changing. A conversation stamped with the previous window therefore has
+   * to start over completely — count *and* flag, or the second window would never ask.
+   */
+  const fresh = chargeQuota({ stored: { token: 'ctx-1', used: 10, warned: true }, token: 'ctx-2' })
+  assert.deepEqual(fresh.entry, { token: 'ctx-2', used: 1, warned: false })
+  assert.equal(fresh.warn, false)
+})
+
+test('a window with no stored token is its own window', () => {
+  // What a restart before the first inbound message looks like. Treating `undefined` as a value rather
+  // than as "no window" is what keeps the arithmetic honest when the token later appears.
+  const none = chargeQuota({ token: undefined })
+  assert.deepEqual(none.entry, { used: 1, warned: false })
+
+  const stamped = chargeQuota({ stored: none.entry, token: 'ctx' })
+  assert.deepEqual(stamped.entry, { token: 'ctx', used: 1, warned: false }, 'a real token is a new window')
+})
+
+test('the ledger charges the entry it read from the file', async () => {
+  // The end-to-end shape of the thing: a charge read from disk, written back, and read again by a
+  // second reader. This is the property the command line depends on — it is a separate process, so
+  // its charges have to be visible to the plugin through the file and nothing else.
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-quota-'))
+  try {
+    const file = join(home, 'state.json')
+    const ledger = quotaLedgerFor(new StateStore(file))
+    // Seven sends, so the next charge is the eighth — the one that carries the ask.
+    for (let index = 0; index < 7; index += 1) await ledger.charge('conv', 'ctx')
+
+    const charge = await ledger.charge('conv', 'ctx')
+    assert.equal(charge.warn, true, 'the eighth send of a window asks for a new one')
+    assert.equal(charge.used, 9)
+
+    const stored = quotaOf(await new StateStore(file).read(), 'conv')
+    assert.deepEqual(stored, { token: 'ctx', used: 9, warned: true }, 'and it is on disk, not in memory')
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('a changed token makes the next charge start from one again', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-quota-'))
+  try {
+    const file = join(home, 'state.json')
+    const ledger = quotaLedgerFor(new StateStore(file))
+    for (let index = 0; index < 9; index += 1) await ledger.charge('conv', 'ctx-1')
+
+    const charge = await ledger.charge('conv', 'ctx-2')
+    assert.equal(charge.used, 1, 'the inbound message that carried ctx-2 opened a fresh window')
+    assert.equal(charge.warn, false)
   } finally {
     await rm(home, { recursive: true, force: true })
   }

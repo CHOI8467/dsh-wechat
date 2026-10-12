@@ -72,7 +72,12 @@ console.log(`入口    : ${manifest.exports['.']}`)
 // that installs cleanly and then fails at load time, so assert it here.
 const entryExport = manifest.exports['.']
 const entryRelative = typeof entryExport === 'string' ? entryExport : entryExport.default
-const advertised = [entryRelative, manifest.exports['./client'], manifest.exports['./cordis.patch.yml']]
+const advertised = [
+  entryRelative,
+  manifest.exports['./client'],
+  manifest.exports['./cli'],
+  manifest.exports['./cordis.patch.yml'],
+]
 const missing = advertised.filter((relative) => !existsSync(join(pkgDir, relative)))
 if (missing.length > 0) {
   console.error(`❌ 打包产物缺少清单声明的文件: ${missing.join(', ')}`)

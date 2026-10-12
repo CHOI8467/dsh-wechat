@@ -2618,11 +2618,13 @@ function notifyTool(harness: Harness): {
  * @param home - DSH home to write into.
  * @param settings - Extra settings to store alongside the defaults.
  * @param pending - Notifications to seed the unsent queue with.
+ * @param quotaUsed - Sends to record as already charged against the stored reply token.
  */
 async function seedBoundConversation(
   home: string,
   settings: Record<string, unknown> = {},
   pending: unknown[] = [],
+  quotaUsed = 0,
 ): Promise<void> {
   await mkdir(join(home, 'wechat'), { recursive: true })
   await writeFile(
@@ -2653,6 +2655,18 @@ async function seedBoundConversation(
         },
         sentMessages: {},
         ...(pending.length > 0 ? { pendingNotifications: pending } : {}),
+        /*
+         * Seeded so a test can stand mid-window rather than counting up to it. Written with the same
+         * token as `contextTokens` above, which is what makes it the *current* window rather than a
+         * spent one.
+         */
+        ...(quotaUsed > 0
+          ? {
+              quota: {
+                'test@im.bot:peer@im.wechat': { token: 'ctx-token-1', used: quotaUsed, warned: false },
+              },
+            }
+          : {}),
         settings: { ...DEFAULT_SETTINGS, ...settings },
       },
       null,
@@ -3222,5 +3236,224 @@ test('every distinct stream chunk kind is written to the log once', async () => 
     }
     assert.equal(log.split('stream frame shape:').length - 1, 1, 'the frameless shape, once')
   })
+})
+
+// ---------------------------------------------------------------------------
+// Reply-window quota: shared with `dsh-wechat-send`
+// ---------------------------------------------------------------------------
+
+/** Read one conversation's persisted reply-window quota. */
+async function quotaOnDisk(
+  stateFile: string,
+  conversationId: string,
+): Promise<{ token?: string; used: number; warned: boolean } | undefined> {
+  const state = JSON.parse(await readFile(stateFile, 'utf8')) as {
+    quota?: Record<string, { token?: string; used: number; warned: boolean }>
+  }
+  return state.quota?.[conversationId]
+}
+
+/** Count how many times the "write me back" warning went out. */
+function warningsSent(harness: Harness): number {
+  return harness.sent.filter((entry) => entry.text.startsWith(QUOTA_WARNING_PREFIX)).length
+}
+
+/** The warning constant, matched by its own text rather than by a copy of it here. */
+const QUOTA_WARNING_PREFIX = '📮 微信这边一个回复窗口最多连发'
+
+/**
+ * Deliver one complete assistant reply through the stream, the way the host does.
+ *
+ * `ingest` hands the message to the agent and returns; nothing is sent back to WeChat until the
+ * assistant stream ends. So a test that cares about what the *channel sent* — its reply, and the
+ * reply-window charge that follows it — has to drive that frame too.
+ *
+ * @param harness - Mounted plugin.
+ * @param text - The assistant's answer for this turn.
+ */
+async function deliverReply(harness: Harness, text: string): Promise<void> {
+  const sessionId = harness.prompted.at(-1)?.sessionId
+  assert.ok(sessionId, 'the message must have reached the agent first')
+  const listener = harness.listeners.get('agent/assistant-stream')
+  assert.ok(listener, 'apply must subscribe to agent/assistant-stream')
+  // Two frames, in the shape the host sends them: the text, then the one frame that closes the turn.
+  // An `end` frame flushes immediately instead of waiting out the settle window, which is what keeps
+  // these tests free of a timeout guessed from a constant someone may later change.
+  listener({
+    agent: { session: { id: sessionId } },
+    frame: { type: 'chunk', revision: 2, chunk: { type: 'text-delta', index: 0, text } },
+  })
+  listener({ agent: { session: { id: sessionId } }, frame: { type: 'end', revision: 3 } })
+  // The flush is asynchronous; give it the turns it needs to reach the state file.
+  await new Promise((resolve) => setTimeout(resolve, 80))
+}
+
+test('a reply is charged to the reply window, on disk, and the next one continues it', async () => {
+  /*
+   * The count used to live in a map inside the process, so every restart began again at zero — and the
+   * count is what decides whether the user is asked for a new window *before* the last slot is spent.
+   * A process that came back mid-window therefore spent the remainder on messages the platform refused
+   * instead of on the one message that would have asked for more.
+   *
+   * It is on disk now, and it has to stay there: `dsh-wechat-send` is a separate process that reads and
+   * writes the same entry, which is the only way a script's sends and the plugin's add up to one ten.
+   * The second reply is the part that proves it — each charge is read back from the store rather than
+   * accumulated in a field the plugin owns.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
+  try {
+    await seedBoundConversation(home)
+    const harness = await mount({ home, seedAccount: false })
+    try {
+      await harness.runtime.ingest(inbound('第一条'))
+      await deliverReply(harness, '好的')
+      assert.deepEqual(
+        await quotaOnDisk(harness.stateFile, 'test@im.bot:peer@im.wechat'),
+        { token: 'ctx-token-1', used: 1, warned: false },
+        'the charge is stamped with the token it belongs to and written to the state file',
+      )
+
+      await harness.runtime.ingest(inbound('第二条'))
+      await deliverReply(harness, '还是我')
+      assert.equal(
+        (await quotaOnDisk(harness.stateFile, 'test@im.bot:peer@im.wechat'))?.used,
+        2,
+        'the second charge continues the stored count instead of starting a new window',
+      )
+    } finally {
+      harness.dispose()
+    }
+  } finally {
+    await removeHome(home)
+  }
+})
+
+test('a send already counted on disk is continued rather than replaced', async () => {
+  /*
+   * What a `dsh-wechat-send` run leaves behind, seen from the plugin's side: the file says six sends of
+   * this window, and the plugin's own reply has to be the seventh. Counted separately, the script and
+   * the plugin would each believe they had ten, the user would never be warned in time, and the tail of
+   * a series would be refused with nothing having said so — which is the failure the command exists to
+   * prevent.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
+  try {
+    await seedBoundConversation(home, {}, [], 6)
+    const harness = await mount({ home, seedAccount: false })
+    try {
+      await harness.runtime.ingest(inbound('接着发'))
+      await deliverReply(harness, '第七条')
+
+      assert.equal(
+        (await quotaOnDisk(harness.stateFile, 'test@im.bot:peer@im.wechat'))?.used,
+        7,
+        'the plugin continues the count somebody else wrote',
+      )
+    } finally {
+      harness.dispose()
+    }
+  } finally {
+    await removeHome(home)
+  }
+})
+
+test('a message from the user opens a new window and resets the count', async () => {
+  // The platform issues a fresh ten with every inbound message, and the token is the only signal this
+  // side gets. A count that survived the token change would ask for a window the user has already
+  // opened.
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
+  try {
+    await seedBoundConversation(home)
+    const harness = await mount({ home, seedAccount: false })
+    try {
+      await harness.runtime.ingest(inbound('第一条'))
+      await deliverReply(harness, '好的')
+
+      await harness.runtime.ingest(inbound('第二条', { contextToken: 'ctx-token-2' }))
+      await deliverReply(harness, '又是我')
+      assert.deepEqual(await quotaOnDisk(harness.stateFile, 'test@im.bot:peer@im.wechat'), {
+        token: 'ctx-token-2',
+        used: 1,
+        warned: false,
+      })
+    } finally {
+      harness.dispose()
+    }
+  } finally {
+    await removeHome(home)
+  }
+})
+
+test('the eighth reply asks the user for a new window, once', async () => {
+  /*
+   * The warning has to fire two short of the limit, because it is itself a message: an ask at the tenth
+   * would be an ask with no slot left to carry it. And it has to fire exactly once — repeating it on
+   * every later send would spend the remaining slots on asking.
+   *
+   * It goes out on the low-level sender rather than through the text path, which is what stops charging
+   * a send from charging another one and recursing; the count still reflects it, because a message the
+   * user received is a message the window spent.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
+  try {
+    await seedBoundConversation(home, {}, [], 7)
+    const harness = await mount({ home, seedAccount: false })
+    try {
+      assert.equal(warningsSent(harness), 0, 'nothing to warn about yet')
+
+      await harness.runtime.ingest(inbound('第八条'))
+      await deliverReply(harness, '第八次回复')
+      assert.equal(warningsSent(harness), 1, 'the eighth send carries the ask')
+      assert.equal(
+        harness.sent.at(-1)?.text.startsWith(QUOTA_WARNING_PREFIX),
+        true,
+        'and the ask is the last thing to go out — the reply was sent before the charge',
+      )
+      assert.deepEqual(await quotaOnDisk(harness.stateFile, 'test@im.bot:peer@im.wechat'), {
+        token: 'ctx-token-1',
+        used: 9,
+        warned: true,
+      })
+
+      await harness.runtime.ingest(inbound('第九条'))
+      await deliverReply(harness, '第九次回复')
+      assert.equal(warningsSent(harness), 1, 'the ask is not repeated within the same window')
+    } finally {
+      harness.dispose()
+    }
+  } finally {
+    await removeHome(home)
+  }
+})
+
+test('a refused send does not charge the window it could not use', async () => {
+  /*
+   * The count is only ever advanced after the service accepted the message. Charging first would make
+   * every refused send of a closed window add one that never happened, so the arithmetic would claim
+   * slots were spent that the user never received — and the ask for a new window would arrive early,
+   * or the count would be wrong the moment the window reopened.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
+  try {
+    await seedBoundConversation(home, {}, [], 5)
+    const refuse: SendFunction = async () => {
+      throw new SendRefusedError('微信会话已超时（session timeout）。', -14)
+    }
+    const harness = await mountWith({ home, seedAccount: false, send: refuse })
+    try {
+      await harness.runtime.ingest(inbound('这条会被拒'))
+      await deliverReply(harness, '这条回复发不出去')
+
+      assert.equal(
+        (await quotaOnDisk(harness.stateFile, 'test@im.bot:peer@im.wechat'))?.used,
+        5,
+        'a refused send leaves the count where it was',
+      )
+    } finally {
+      harness.dispose()
+    }
+  } finally {
+    await removeHome(home)
+  }
 })
 

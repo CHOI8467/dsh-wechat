@@ -71,6 +71,13 @@ try {
   // `dsh.client`, so leaving it out silently ships a bundle with no settings page.
   await cp(join(bundleDir, 'client.js'), join(pkgDir, 'client.js'))
 
+  /*
+   * The command line half. It is what an agent's own script is told to call instead of reaching the
+   * iLink API, and it is a `bin` entry — both of which mean a tarball without it installs fine and
+   * then fails the moment the script runs.
+   */
+  await cp(join(bundleDir, 'cli.js'), join(pkgDir, 'cli.js'))
+
   // Core client, vendored as built JavaScript so the tarball has no workspace
   // dependencies and needs no type stripping at load time.
   const coreOut = join(pkgDir, 'dist', 'core')
@@ -139,6 +146,8 @@ try {
   // about to write.
   for (const required of [
     'lib/host.js',
+    'lib/cli.js',
+    'cli.js',
     'client.js',
     'cordis.patch.yml',
     'dist/core/lib/index.js',

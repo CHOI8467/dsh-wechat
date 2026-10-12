@@ -200,6 +200,7 @@ POST ilink/bot/getconfig  {}   →  {"ret":-2,"errmsg":"ilink_user_id required"}
 | **0.36.5** | 修正配图：同一句话出现在多张图时，选它是最新一条的那张 | —— |
 | ~~0.36.6~~ | **从未发布** | 备好了版本号和首图，下一版直接并进 0.37.0 |
 | **0.37.0** | **修：设置改完存了也会丢，重启即重置**；删掉已废弃的工具卡片接口（日志一直在刷错）；会话工作目录可在设置页图形化选择；新增 `/model` 切模型（命令 + 自然语言）；发送被拒时记录服务返回的原始 `ret`/`errcode`/`errmsg` | 见 4.9 |
+| **0.38.x** | 回复窗口计数改为持久化；新增命令行 `dsh-wechat-send`，让 agent 的脚本不再直连 iLink | 见 4.10.1 |
 
 ### 4.9 手抄的白名单一定会漏
 
@@ -532,7 +533,7 @@ npm view dsh-wechat-plugin versions --registry=https://registry.npmjs.org
 pnpm build              # 只编译，保留 @dsh-wechat/core 引用（pack 要靠它改写）
 pnpm run dist           # build + 内嵌 core：Git 安装要的可直接加载形态
 pnpm typecheck          # 含 examples/
-pnpm test               # 195 项
+pnpm test               # 233 项
 pnpm run check:install  # 两条安装路径的约束
 pnpm run pack           # 需要先 build，不能先 dist
 pnpm run verify-pack    # 解包、校验清单、按 DSH 的方式挂载一次
