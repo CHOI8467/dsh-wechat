@@ -1380,6 +1380,20 @@ class WechatRuntime {
 
   /** Route one inbound WeChat message. */
   async #handleInbound(message: InboundMessage): Promise<void> {
+    /*
+     * Every inbound message is logged, and it is the only window marker there is.
+     *
+     * The reply window opens here and nowhere else, so this line is what lets the log answer the two
+     * questions the platform will not: how many sends a window survives before it is refused, and how
+     * long a silence it survives. Counting outbound lines back to the nearest one of these gives the
+     * first; the timestamp difference gives the second. Deliberately just the peer and the kind —
+     * the text is already in the transcript, and a log that grows with every message becomes
+     * unreadable exactly when it is needed.
+     */
+    this.#recordBoot(
+      `inbound: ${message.conversationId} media=${String(message.media?.length ?? 0)} text=${String(message.text.length)}`,
+    )
+
     // Remember the reply token for this conversation before anything can fail.
     if (message.contextToken !== undefined) {
       const token = message.contextToken

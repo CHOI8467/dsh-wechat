@@ -733,6 +733,35 @@ test('a send refused with ret throws, naming the code the service gave', () => {
   )
 })
 
+test('a refusal records every field the service gave, without inventing one', () => {
+  /*
+   * The log is the only instrument for telling the two shared-code refusals apart, so what it carries
+   * decides whether the next investigation is even possible. Three things have to hold:
+   *
+   * - the `errmsg` is kept, because `-2 prepare failed` (a session needing an inbound message) and
+   *   `-2 rate limited` (a session needing a pause) share a code and differ only here;
+   * - `ret` is kept when present, since the send path has been seen populating `ret` while the
+   *   polling path populates `errcode`;
+   * - an absent field is omitted rather than printed as `undefined`, which reads as a value and sends
+   *   the next reader looking for a `ret` that was never sent.
+   */
+  assert.throws(
+    () => assertSendAccepted({ ret: -2, errmsg: 'prepare failed' }),
+    (error: unknown) =>
+      error instanceof SendRefusedError &&
+      /ret=-2 errcode=-2 errmsg=prepare failed/.test(error.message) &&
+      !/undefined/.test(error.message),
+  )
+  // The other shape: `errcode` alone, which must not grow a phantom `ret=`.
+  assert.throws(
+    () => assertSendAccepted({ errcode: -2, errmsg: 'rate limited' }),
+    (error: unknown) =>
+      error instanceof SendRefusedError &&
+      /errcode=-2 errmsg=rate limited/.test(error.message) &&
+      !/ret=/.test(error.message),
+  )
+})
+
 test('a send the service accepted is left alone', () => {
   // Both the plain success and an explicit zero must pass: a strict `errmsg === undefined` check
   // would reject a perfectly good delivery.

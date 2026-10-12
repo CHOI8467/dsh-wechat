@@ -62,18 +62,30 @@ export function assertSendAccepted(response: SendMessageResp): void {
   const errcode = response.errcode ?? response.ret
   if (errcode === undefined || errcode === 0) return
 
+  /*
+   * Every field the service gave, on every refusal.
+   *
+   * The code alone cannot classify a refusal: a stale session and a real rate limit share one, so the
+   * `errmsg` is what separates them — "prepare failed" is a session that needs an inbound message,
+   * "rate limited" is one that needs a pause.
+   *
+   * `ret` is printed only when the response actually carried it, because a literal `ret=undefined`
+   * reads as a value rather than as an absence. The resolved code is always printed as `errcode`,
+   * which is what the classification above uses, so the line can be read without re-deriving it.
+   */
+  const detail =
+    (response.ret === undefined ? '' : `ret=${String(response.ret)} `) +
+    `errcode=${String(errcode)} errmsg=${response.errmsg ?? '(none)'}`
+
   if (errcode === STALE_TOKEN_ERRCODE) {
     // Specifically actionable, unlike a generic failure: the conversation has gone quiet long enough
     // that the reply context expired, and only an inbound message from the user can revive it.
     throw new SendRefusedError(
-      '微信会话已超时（session timeout）。需要用户先在微信里给机器人发一条消息，之后才能主动推送。',
+      `微信会话已超时（session timeout）。需要用户先在微信里给机器人发一条消息，之后才能主动推送。 ${detail}`,
       errcode,
     )
   }
-  throw new SendRefusedError(
-    `发送被微信拒绝：errcode=${String(errcode)} errmsg=${response.errmsg ?? '(无)'}`,
-    errcode,
-  )
+  throw new SendRefusedError(`发送被微信拒绝：${detail}`, errcode)
 }
 
 /**
