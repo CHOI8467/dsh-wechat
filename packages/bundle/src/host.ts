@@ -544,6 +544,13 @@ class WechatRuntime {
    * answer on their behalf: the prompt goes out over WeChat and the next reply settles it.
    */
   readonly #interactions = new Map<string, PendingInteraction>()
+  /**
+   * The last refusal logged, so one closed window is reported once rather than once per message.
+   *
+   * Reset by a successful send. See the catch in `#sendOrQueue` for why the reason matters more than
+   * the code: a stale session and a real rate limit are told apart by `errmsg` alone.
+   */
+  #lastRefusal = ''
   /** Observations already written to the log, bucketed so each distinct value logs once. */
   readonly #seenShapes = new Map<string, Set<string>>()
   /**
@@ -2136,9 +2143,25 @@ class WechatRuntime {
           target.contextToken,
         )
       }
+      this.#lastRefusal = ''
       return true
     } catch (error) {
       if (!(error instanceof SendRefusedError)) throw error
+      /*
+       * The reason the service gave, recorded once per closed window.
+       *
+       * A closed window stays closed until the user writes, so every send in between is refused with
+       * the same text. Logging each one would bury everything else; logging none — which is what this
+       * did — left the *reason* for a failed push nowhere at all, and the reason is the whole
+       * question: a stale session and a real rate limit are told apart by `errmsg`, not by the code
+       * they share. Reset on a successful send so the next closure reports afresh.
+       */
+      const reason = error.message
+      const key = `${target.conversationId}\u0000${reason}`
+      if (this.#lastRefusal !== key) {
+        this.#lastRefusal = key
+        this.#recordBoot(`发送被拒: ${reason}`)
+      }
       await this.#store.update((state) => {
         const dropped = queuePendingNotification(state, {
           conversationId: target.conversationId,
@@ -2212,7 +2235,19 @@ class WechatRuntime {
           // A refusal means the window closed again between the token and this send, which is odd but
           // possible; keeping the entry is the whole point of the queue. Anything else cannot succeed
           // on a later attempt either, so it is reported and dropped rather than retried forever.
-          if (!(error instanceof SendRefusedError)) {
+          if (error instanceof SendRefusedError) {
+            /*
+             * Recorded here as well as in `#sendOrQueue`, because this loop sends directly and would
+             * otherwise be the one place a refusal leaves no trace at all. That is exactly how the
+             * tenth-and-later message of a burst disappeared: the first ten went out, the rest were
+             * refused, and the log showed a successful flush of ten with nothing about the others.
+             */
+            const key = `${conversationId}\u0000${error.message}`
+            if (this.#lastRefusal !== key) {
+              this.#lastRefusal = key
+              this.#recordBoot(`补发被拒: ${error.message}`)
+            }
+          } else {
             this.#recordError(
               `补发失败：${error instanceof Error ? error.message : String(error)}`,
             )
