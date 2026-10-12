@@ -806,12 +806,23 @@ class WechatRuntime {
       }
     }
 
+    /*
+     * `list` with `all` has to reach the router as `/list all`, not as `/list`.
+     *
+     * The rows the router numbers are the rows that get frozen under the message id, and a quote of
+     * that message is answered from them. A bare `/list` made the router number *this workspace's*
+     * conversations while the message below printed every workspace's, so quoting a full list and
+     * replying with a number moved the chat to a row that message never showed. The body itself is
+     * rendered by {@link #sessionTable} either way, so this changes only which numbering is pinned.
+     */
     const text =
       action === 'switch'
         ? `/switch ${target ?? ''}`
         : action === 'new' && target !== undefined && target !== ''
           ? `/new ${target}`
-          : `/${action}`
+          : action === 'list' && target === 'all'
+            ? '/list all'
+            : `/${action}`
     const result = await this.#router.route({
       conversationId,
       accountId: binding.accountId,

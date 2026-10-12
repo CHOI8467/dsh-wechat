@@ -1354,7 +1354,16 @@ test('a failed switch tells the user, because the agent may claim it worked', as
     await harness.runtime.ingest(inbound('第一条'))
     const before = harness.sent.length
 
-    const missed = await control(harness, 'switch', '99')
+    /*
+     * A target no session can carry — deliberately not the `99` this used to send.
+     *
+     * `99` is a legal hex prefix, so on a run where a session's short id happened to begin with
+     * those two digits the switch *succeeded*, `ok` came back true, and this test failed for a
+     * reason that had nothing to do with the behaviour it checks: roughly one run in 256. A target
+     * containing a character outside the hex alphabet cannot match an id at all, so the failure
+     * path is reached on every run instead of on most of them.
+     */
+    const missed = await control(harness, 'switch', 'zzzzzzz')
     assert.equal(missed.ok, false)
 
     /*
@@ -1366,7 +1375,7 @@ test('a failed switch tells the user, because the agent may claim it worked', as
     assert.equal(harness.sent.length, before + 1, 'the failure is announced')
     const body = harness.sent.at(-1)?.text ?? ''
     assert.match(body, /没有成功/)
-    assert.match(body, /99/, 'the message names what was asked for')
+    assert.match(body, /zzzzzzz/, 'the message names what was asked for')
     // And how to succeed instead.
     assert.match(body, /\/list/)
   })
@@ -1722,6 +1731,83 @@ test('a spoken full list shows more than one workspace even when this one is the
         `asked to see everything, the reply must not be this workspace alone:\n${body}`,
       )
       assert.ok(headings.length >= 2, `expected several workspaces:\n${body}`)
+    } finally {
+      harness.dispose()
+    }
+  } finally {
+    await removeHome(home)
+  }
+})
+
+test('a quoted spoken full list answers with the rows it printed', async () => {
+  /*
+   * The failure this guards: the spoken "show me every conversation" ran the router with a bare
+   * `/list`, so the numbering frozen under the sent message was *this workspace's* while the message
+   * itself printed every workspace's. Quoting it and replying with a number then moved the chat to a
+   * row that message never showed — the drift the quote exists to remove, reintroduced by the two
+   * halves of the same feature disagreeing about which list they were numbering.
+   *
+   * The two numberings are made to differ at the row under test on purpose: with thirteen
+   * conversations in this workspace and one elsewhere, that row is a workspace conversation in a
+   * plain `/list` and the foreign one in the full list. A test whose two sources happened to agree
+   * would pass with the bug still in place, so the disagreement is asserted rather than assumed.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
+  try {
+    await seedState(home, { ...DEFAULT_SETTINGS, requireConfirmation: false })
+    const workspace = join(home, 'dsh_wechat')
+    const foreignId = 'session-ffff9999-ffff9999-x'
+    // Seeded first, so it is the oldest of all and can only appear after every workspace row.
+    await seedStoredSession(home, join(home, 'some_project'), foreignId, '别处的工作')
+    for (let index = 0; index < 12; index += 1) {
+      await seedStoredSession(
+        home,
+        workspace,
+        `session-${String(index).padStart(4, '0')}aaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa`,
+        `本工作区 ${String(index)}`,
+      )
+    }
+
+    const harness = await mount({ home, seedAccount: false, hostReportsNoSessions: true })
+    try {
+      await harness.runtime.ingest(inbound('第一条'))
+
+      const listed = await control(harness, 'list', 'all')
+      assert.equal(listed.ok, true, listed.detail)
+      const body = harness.sent.at(-1)?.text ?? ''
+      // The id the service assigned to that very message, which is what a quote of it carries.
+      const listId = `msg-${String(harness.sent.length)}`
+
+      const rows = body.split('\n').filter((line) => /^\d+\. /.test(line))
+      const foreignRow = rows.findIndex((line) => line.includes('别处的工作')) + 1
+      assert.ok(foreignRow > 3, `the foreign row sits past this workspace's share:\n${body}`)
+
+      /*
+       * What that number would have meant had the full list been numbered as a plain `/list` — a
+       * workspace conversation. Asserted, because the test below is only able to detect the bug if
+       * the two numberings really do disagree here.
+       */
+      await harness.runtime.ingest(inbound('/list'))
+      const ownRows = (harness.sent.at(-1)?.text ?? '')
+        .split('\n')
+        .filter((line) => /^\d+\. /.test(line))
+      const ownRow = ownRows[foreignRow - 1] ?? ''
+      assert.match(ownRow, /本工作区/, `the plain list has a row ${String(foreignRow)}`)
+      assert.doesNotMatch(
+        ownRow,
+        /别处的工作/,
+        'the two numberings must differ at this row, or the quote is untested',
+      )
+
+      // Quoting the full list and answering with its own number still means that row: the row the
+      // message printed, not the row this workspace's numbering would put there.
+      await harness.runtime.ingest(quoting(`/switch ${String(foreignRow)}`, listId))
+      assert.match(harness.sent.at(-1)?.text ?? '', /已切换到「别处的工作」/)
+      assert.equal(
+        (await harness.runtime.bindings())[0]?.sessionId,
+        foreignId,
+        'the quoted full list decided what the number meant',
+      )
     } finally {
       harness.dispose()
     }
