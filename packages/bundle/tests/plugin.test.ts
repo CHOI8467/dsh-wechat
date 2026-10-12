@@ -1261,9 +1261,9 @@ test('the session tool lists conversations with the number to answer', async () 
     assert.match(body, /【微信会话】/, 'the rows are grouped under the workspace they belong to')
     assert.match(body, /回复 \/switch 编号或 \/switch id 切换/)
     assert.match(body, /引用这条消息再回编号/, 'the quote trick is explained where it is needed')
-    // Every row closes with the short id `/switch <id>` accepts, within the five-character bound.
+    // Every row closes with the short id `/switch <id>` accepts, within the six-character bound.
     for (const row of body.split('\n').filter((line) => /^\d+\. /.test(line))) {
-      assert.ok(/  [0-9a-f]{1,5}$/.test(row), `no short id at the end of the row: ${row}`)
+      assert.ok(/  [0-9a-f]{1,6}$/.test(row), `no short id at the end of the row: ${row}`)
     }
     // Rendered once. A duplicated table reads as two separate lists.
     assert.equal(body.match(/1\. /g)?.length, 1, 'the rows appear once')
@@ -1523,7 +1523,7 @@ test('quoting a listing pins the numbers it printed', async () => {
 
 test('an id two conversations share is reported rather than guessed', async () => {
   /*
-   * The printed id is four hex characters, so a collision is possible on a large machine. The reply
+   * The printed id is six hex characters, so a collision is possible on a large machine. The reply
    * has to say the id was too short and name the candidates: picking one silently would move the
    * user's work into a conversation they never named.
    */
@@ -1531,24 +1531,24 @@ test('an id two conversations share is reported rather than guessed', async () =
   try {
     await seedState(home, { ...DEFAULT_SETTINGS, requireConfirmation: false })
     const workspace = join(home, 'dsh_wechat')
-    // Same first four hex characters, so `/list` prints the same short id twice.
-    await seedStoredSession(home, workspace, 'session-e716fd64-e716fd64-47fd-4e61-bec6-d21d19457f37', '写周报')
-    await seedStoredSession(home, workspace, 'session-e716aaaa-e716aaaa-47fd-4e61-bec6-d21d19457f37', '查天气')
+    // Same first six hex characters, so `/list` prints the same short id twice.
+    await seedStoredSession(home, workspace, 'session-e716f0aa-e716f0aa-47fd-4e61-bec6-d21d19457f37', '写周报')
+    await seedStoredSession(home, workspace, 'session-e716f0bb-e716f0bb-47fd-4e61-bec6-d21d19457f37', '查天气')
     const harness = await mount({ home, seedAccount: false, hostReportsNoSessions: true })
     try {
       await harness.runtime.ingest(inbound('第一条'))
-      await harness.runtime.ingest(inbound('/switch e716'))
+      await harness.runtime.ingest(inbound('/switch e716f0'))
       const reply = harness.sent.at(-1)?.text ?? ''
-      assert.match(reply, /有多个会话匹配「e716」/)
+      assert.match(reply, /有多个会话匹配「e716f0」/)
       assert.match(reply, /更长的 id/)
-      assert.match(reply, /e716fd64 · 写周报/)
-      assert.match(reply, /e716aaaa · 查天气/)
+      assert.match(reply, /e716f0aa · 写周报/)
+      assert.match(reply, /e716f0bb · 查天气/)
       // Nothing moved: the conversation this chat created is still the bound one.
       const bound = (await harness.runtime.bindings())[0]?.sessionId
       assert.ok(bound?.startsWith('session-') && !bound.includes('e716'))
 
       // A longer id settles it, which is what the message told the user to send.
-      await harness.runtime.ingest(inbound('/switch e716f'))
+      await harness.runtime.ingest(inbound('/switch e716f0a'))
       assert.match(harness.sent.at(-1)?.text ?? '', /已切换到「写周报」/)
     } finally {
       harness.dispose()
@@ -1774,7 +1774,7 @@ test('the session tool switches, and the move is real', async () => {
     const olderLine = rows[older] ?? ''
     // The id closes its own row, which is where the renderer puts it — one line per conversation, so
     // a listing of ten fits in one WeChat message.
-    const olderShort = /  ([0-9a-f]{1,5})$/.exec(olderLine)?.[1]
+    const olderShort = /  ([0-9a-f]{1,6})$/.exec(olderLine)?.[1]
     assert.ok(olderShort, `no short id on the older row: ${olderLine}`)
     assert.equal(shortId(String(harness.prompted.at(-1)?.sessionId)), olderShort)
     assert.ok(first !== undefined)

@@ -420,9 +420,9 @@ test('a listing groups by workspace, and numbers the rows it prints', async () =
   assert.match(rows[2]!, /^3\. /)
   // Every row ends with the short form of its own id, which is what `/switch <id>` accepts.
   for (const line of rows) {
-    const id = /  ([0-9a-f]{1,5})$/.exec(line)?.[1]
+    const id = /  ([0-9a-f]{1,6})$/.exec(line)?.[1]
     assert.ok(id, `no short id at the end of the row: ${line}`)
-    assert.ok(id.length <= 5, `short id longer than five characters: ${id}`)
+    assert.ok(id.length <= 6, `short id longer than six characters: ${id}`)
   }
 
   // And the numbering the reply reports is exactly what it printed, in the same order — this is what
@@ -993,12 +993,12 @@ test('a title is matched loosely, but never ambiguously', () => {
 test('a short id two conversations share fails instead of picking one', () => {
   /*
    * The printed id is the first few hex characters of the session id, so two conversations *can*
-   * share one — four hex digits is 65 536 values, and a machine with a few hundred sessions will
-   * eventually collide. The answer has to be "your id is too short", naming the candidates: silently
+   * share one — six hex digits is 16 777 216 values, and a machine with a few hundred sessions still
+   * collides eventually. The answer has to be "your id is too short", naming the candidates: silently
    * switching to whichever was found first would move the user's work somewhere they never asked for.
    */
-  const clashA = 'session-e716fd64-e716fd64-47fd-4e61-bec6-d21d19457f37'
-  const clashB = 'session-e716aaaa-e716aaaa-47fd-4e61-bec6-d21d19457f37'
+  const clashA = 'session-e716f0aa-e716f0aa-47fd-4e61-bec6-d21d19457f37'
+  const clashB = 'session-e716f0bb-e716f0bb-47fd-4e61-bec6-d21d19457f37'
   const sessions = [row(clashA, '写周报'), row(clashB, '查北京天气')]
 
   assert.equal(shortId(clashA), shortId(clashB), 'the fixtures really do collide')
@@ -1011,24 +1011,24 @@ test('a short id two conversations share fails instead of picking one', () => {
   )
 
   // A longer id identifies one, which is exactly what the failure message tells the user to send.
-  assert.equal(found(resolveTarget('e716f', sessions))?.title, '写周报')
-  assert.equal(found(resolveTarget('e716a', sessions))?.title, '查北京天气')
+  assert.equal(found(resolveTarget('e716f0a', sessions))?.title, '写周报')
+  assert.equal(found(resolveTarget('e716f0b', sessions))?.title, '查北京天气')
   assert.equal(found(resolveTarget(clashA, sessions))?.title, '写周报')
 
   // And the message says so, in words, with both candidates printed.
   const message = ambiguousTargetMessage(shortId(clashA), resolution.candidates)
-  assert.match(message, /有多个会话匹配「e716」/)
+  assert.match(message, /有多个会话匹配「e716f0」/)
   assert.match(message, /更长的 id/)
-  assert.match(message, /e716fd64 · 写周报/)
-  assert.match(message, /e716aaaa · 查北京天气/)
+  assert.match(message, /e716f0aa · 写周报/)
+  assert.match(message, /e716f0bb · 查北京天气/)
 })
 
-test('shortId stays readable, stays within five characters, and round-trips', () => {
+test('shortId stays readable, stays within six characters, and round-trips', () => {
   const id = mintSessionId(() => '1a2b3c4d-9f8e-7d6c-5b4a-392817061524')
   assert.equal(id, 'session-1a2b3c4d-1a2b3c4d-9f8e-7d6c-5b4a-392817061524')
-  assert.equal(shortId(id), '1a2b')
+  assert.equal(shortId(id), '1a2b3c')
   // The bound is the requirement: an id the user has to copy is not one they will use.
-  assert.equal(SHORT_ID_LENGTH <= 5, true)
+  assert.equal(SHORT_ID_LENGTH <= 6, true)
   const sessions = [row(id, 'x')]
   assert.equal(found(resolveTarget(shortId(id), sessions))?.sessionId, id)
   // A foreign id still yields something printable rather than throwing — and still within the bound.

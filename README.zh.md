@@ -146,7 +146,7 @@ dsh plugin --profile desktop add silk-wasm
 | `/list` | 只列微信工作区的对话，按工作区分组，新的在前 |
 | `/list all` | 列出全部，也按工作区分组 |
 | `/switch 3` | 切到那份列表里的第 3 个 |
-| `/switch e716` | 按**行尾那个短 id** 切——跟编号无关，永远不会过期 |
+| `/switch e716f0` | 按**行尾那个短 id** 切——跟编号无关，永远不会过期 |
 | 引用列表消息 → `/switch 3` | 按**那条列表**的编号切，编号冻结在那条消息里 |
 | `/model` | 看有哪些模型，标出当前用的 |
 | `/model 2` | 切到列表里的第 2 个，也可以直接发模型名字 |
@@ -156,7 +156,7 @@ dsh plugin --profile desktop add silk-wasm
 
 **空格可以省**：`/switch3`、`/switch 3`、`/switch:3` 都一样。
 
-**编号会过期**：会话在你读列表时还在跑，等你回「3」时第 3 行可能已经换人了。所以每行末尾都带一个**最多 5 个字符的短 id**，`/switch` 直接收它；或者**引用那条列表消息**再回编号，编号就按那条消息印的算。
+**编号会过期**：会话在你读列表时还在跑，等你回「3」时第 3 行可能已经换人了。所以每行末尾都带一个**最多 6 个字符的短 id**，`/switch` 直接收它；或者**引用那条列表消息**再回编号，编号就按那条消息印的算。
 
 **说大白话也行**：「换个对话」「看下有哪些对话」「停一下」都认。判断意图的是 agent，不是死规则，并且切换成功或失败都会明确告诉你。
 
@@ -194,7 +194,7 @@ pnpm install
 pnpm build              # 只编译，保留 @dsh-wechat/core 引用（pack 要靠它改写）
 pnpm run dist           # build + 内嵌 core，产出可直接加载的形态
 pnpm typecheck
-pnpm test               # 248 项
+pnpm test               # 249 项
 pnpm check              # build + typecheck + test
 pnpm run pack           # 需要先 dist
 pnpm run verify-pack    # 解包、校验清单文件、按 DSH 的方式挂载一次

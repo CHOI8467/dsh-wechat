@@ -714,12 +714,14 @@ export function mintSessionId(random: () => string = randomUUID): string {
 /**
  * How many characters of a session id the list prints.
  *
- * Four hex digits is short enough to read and retype on a phone, and the printed form is a prefix of
- * the id, so a collision is answered by asking for more characters rather than by failing. The bound
- * is the requirement, not a preference: an identifier the user has to copy is not an identifier they
- * will use.
+ * Six hex digits is still short enough to read and retype on a phone, while the space it draws from
+ * is 16 777 216 values instead of the 65 536 four digits gave: a machine with a few hundred sessions
+ * collided often enough to be noticed, and the extra two characters are free to type. The printed
+ * form is a prefix of the id, so a collision is answered by asking for more characters rather than by
+ * failing. The bound is the requirement, not a preference: an identifier the user has to copy is not
+ * an identifier they will use.
  */
-export const SHORT_ID_LENGTH = 4
+export const SHORT_ID_LENGTH = 6
 
 /** Compact identifier shown to the user, and accepted back by `/switch`. */
 export function shortId(sessionId: string): string {
@@ -1118,7 +1120,7 @@ export const HELP_TEXT = [
   '/list            列出本工作区的最近对话',
   '/list all        连其它工作区一起列出',
   '/switch <编号>   切换（引用列表消息再回编号，编号不会过期）',
-  '/switch <id>     按 id 切换，例如 /switch e716',
+  '/switch <id>     按 id 切换，例如 /switch e716f0',
   '/model <编号>    查看或切换模型',
   '/current         显示当前对话',
   '/cancel          中断当前任务',
