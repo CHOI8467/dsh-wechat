@@ -21,10 +21,18 @@ import {
   UploadMediaType,
   downloadItemMedia,
   findSentMessage,
+  findSessionList,
+  flattenSessionGroups,
+  groupSessionRows,
+  heldNames,
+  latestSessionList,
   login as loginHandshake,
   isSameWorkspace,
   listAllStoredSessions,
   quotaLedgerFor,
+  rememberSessionList,
+  renderSessionList,
+  renderSessionRow,
   storedSessionWorkspace,
   rememberSentMessage,
   resolveSettings,
@@ -32,9 +40,9 @@ import {
   sendImage,
   sendText,
   sendVideo,
-  renderSessionRow,
   toDataUrl,
   uploadMedia,
+  workspaceLabel,
   SendRefusedError,
   queuePendingNotification,
   expirePendingNotifications,
@@ -46,12 +54,15 @@ import {
   type ChannelState,
   type DownloadedMedia,
   type InboundMessage,
+  type ListedSession,
   type LoginEvent,
   type MessageItem,
+  type NumberedSession,
   type QuotaLedger,
   type RouteDecision,
   type SessionBinding,
   type SessionGateway,
+  type SessionGroup,
   type UploadMediaTypeValue,
   type WeixinAccount,
 } from '@dsh-wechat/core'
@@ -321,42 +332,52 @@ function switchFailure(action: string, target: string | undefined, reason: strin
 }
 
 /**
- * Render the session rows the way the agent should present them.
+ * The message id a quote in this inbound message refers to.
  *
- * Every row goes through the core's own renderer, so what the channel sends for a spoken request is
- * byte-for-byte the same shape as what `/list` prints for a typed one — one implementation, two
- * callers, no third format for the user to reconcile.
+ * A quote arrives as an id and nothing else — no text, no conversation, and `type: 0` in the item —
+ * so this is the only thing that ties a reply to what it is replying to. Both spellings are read
+ * because the service uses `msg_id` for a message it has already delivered and `svr_id` for one it
+ * reports by server identity.
  *
- * @param sessions - Rows, already numbered.
- * @param currentId - Session the conversation is bound to, marked in the list.
- * @returns A newline-separated table.
+ * @param message - Inbound message, whose items may carry a quote.
+ * @returns The quoted id, or undefined when the message quotes nothing.
  */
-function renderTable(
-  sessions: readonly {
-    sessionId: string
-    title: string
-    updatedAt: number
-    current: boolean
-  }[],
-  currentId: string | undefined,
-): string {
-  return sessions
-    .map((row, index) => renderSessionRow(row, index, currentId))
-    .join('\n\n')
+function quotedMessageId(message: InboundMessage): string | undefined {
+  for (const item of message.raw.item_list ?? []) {
+    const quote = item.ref_msg
+    if (quote === undefined) continue
+    const messageId = quote.message_item?.msg_id ?? quote.svr_id
+    if (messageId !== undefined) return messageId
+  }
+  return undefined
 }
 
 /**
- * The name a user knows a workspace by.
+ * Render the session rows the way the agent should present them.
  *
- * The store records absolute directories, and a full path in a chat message is noise. The last
- * component is what the desktop sidebar shows, so it is what the user will recognise.
+ * A spoken request is sent the *same* body a typed `/list` produces — the router renders it and the
+ * channel delivers it — so there is one format and one numbering, and the agent's structured result
+ * is built from the same grouping. Anything else is a second list the user has to reconcile.
  *
- * @param path - Working directory recorded for a session.
- * @returns Its final path component, or the path itself when there is nothing to trim.
+ * @param groups - Workspaces and their rows, already ordered and cut to size.
+ * @param currentId - Session the conversation is bound to, marked in the list.
+ * @param total - How many conversations the message is about, including any not shown.
+ * @param held - Conversations in other workspaces this listing left out.
+ * @param heldHint - Wording for reaching them, which differs between typed and spoken requests.
+ * @returns The message body.
  */
-function workspaceLabel(path: string): string {
-  const parts = path.split(/[\\/]+/).filter((part) => part !== '')
-  return parts.at(-1) ?? path
+function renderTable(
+  groups: readonly SessionGroup[],
+  currentId: string | undefined,
+  total: number,
+  held: { count: number; names?: readonly string[] },
+  heldHint?: string,
+): string {
+  return renderSessionList(groups, currentId, {
+    total,
+    ...(held.count === 0 ? {} : { held }),
+    ...(heldHint === undefined ? {} : { heldHint }),
+  })
 }
 
 /** A state with nothing stored, so defaults can be resolved without reading the disk. */
@@ -653,7 +674,14 @@ class WechatRuntime {
         })
       },
     }
-    this.#router = new SessionRouter({ gateway: this.#gateway(), store: bindings })
+    this.#router = new SessionRouter({
+      gateway: this.#gateway(),
+      store: bindings,
+      // The directory and the name are both needed: the store records absolute paths, so knowing the
+      // path is what decides which rows go under the heading the user knows this workspace by.
+      ownWorkspace: this.#workspace,
+      ownWorkspaceLabel: WORKSPACE_TITLE,
+    })
   }
 
   /** Read the persisted state. */
@@ -736,6 +764,14 @@ class WechatRuntime {
     ok: boolean
     detail: string
     sessions: { index: number; sessionId: string; title: string; updatedAt: number; current: boolean }[]
+    /**
+     * The numbered rows exactly as the user received them.
+     *
+     * Rendered from the same grouping and numbering, so a number the agent repeats in its own words
+     * is the number the user is looking at. Built separately from the message body only because the
+     * agent needs the rows without the heading and the instructions.
+     */
+    rows: string
     /** Sessions in other workspaces, which the list does not show unless asked. */
     otherWorkspaces: number
     /** Folder names of those workspaces, so the hint can say which they are. */
@@ -747,6 +783,7 @@ class WechatRuntime {
         ok: false,
         detail: '这个会话没有绑定任何微信对话，无法操作。',
         sessions: [],
+        rows: '',
         otherWorkspaces: 0,
         otherNames: [],
       }
@@ -757,6 +794,7 @@ class WechatRuntime {
         ok: false,
         detail: '这个会话没有绑定任何微信对话，无法操作。',
         sessions: [],
+        rows: '',
         otherWorkspaces: 0,
         otherNames: [],
       }
@@ -773,12 +811,22 @@ class WechatRuntime {
       accountId: binding.accountId,
       peerId: binding.peerId,
       text,
+      // A spoken number is read against the same listing a typed one is: the newest `/list` this
+      // conversation received. Sessions run while the user reads, so re-deriving the numbering here
+      // would send "switch to 3" somewhere other than the row they are looking at.
+      ...(await this.#numberedRowsFor(conversationId, binding.accountId)),
+      // Typed and spoken listings need different words for "there are more elsewhere": a spoken
+      // request never mentions `/list all`, so telling the user to type it is not an instruction.
+      ...(action === 'list'
+        ? { heldHint: '说「看全部对话」就能一起看，也可以直接切过去。' }
+        : {}),
     })
     if (result.kind !== 'reply') {
       return {
         ok: false,
         detail: `不支持的操作：${action}`,
         sessions: [],
+        rows: '',
         otherWorkspaces: 0,
         otherNames: [],
       }
@@ -787,6 +835,11 @@ class WechatRuntime {
     const includeAll = target === 'all'
     const table = await this.#sessionTable(conversationId, includeAll)
     const { sessions, otherWorkspaces, otherNames } = table
+    const currentId = sessions.find((row) => row.current)?.sessionId
+    // The same numbering the user is reading, rendered for the agent's own words.
+    const rows = sessions
+      .map((session) => renderSessionRow(session, session.index - 1, currentId))
+      .join('\n')
     // A switch to something unknown answers with guidance rather than throwing, so the text has to
     // be read rather than assumed to mean success — otherwise the agent would report a move that
     // never happened.
@@ -817,6 +870,7 @@ class WechatRuntime {
         // contradict what they already read.
         detail: `切换失败，已直接告诉用户。原因：${result.text.split('\n')[0] ?? ''}`,
         sessions,
+        rows,
         otherWorkspaces,
         otherNames,
       }
@@ -830,40 +884,79 @@ class WechatRuntime {
      * own, in its own format, without the other workspaces and without the numbering the user is
      * meant to reply with.
      *
-     * So the channel sends it, and the agent is told not to repeat it. Each row is rendered by the
-     * same core helper `/list` uses, so the typed and spoken routes cannot show different things.
+     * So the channel sends it, and the agent is told not to repeat it. The body is the router's own
+     * rendering, which is what `/list` sends for a typed request — one format for both routes, and one
+     * numbering for the agent to repeat.
      */
     if (action === 'list' || action === 'current') {
-      const currentId = sessions.find((row) => row.current)?.sessionId
       const body =
-        sessions.length === 0
+        table.groups.length === 0
           ? '还没有其他对话。'
-          : [
-              includeAll
-                ? `共 ${String(sessions.length)} 个对话（含其它工作区）：`
-                : `共 ${String(sessions.length + otherWorkspaces)} 个对话${otherNames.length === 0 ? '' : `（这里显示 ${String(sessions.length)} 个）`}：`,
-              '',
-              renderTable(sessions, currentId),
-              otherNames.length === 0
-                ? ''
-                : `\n另有 ${String(otherWorkspaces)} 个对话在别的工作区（${otherNames.join('、')}）。说「看全部对话」就能一起看，也可以直接切过去。`,
-              '',
-              '回复数字即可切换，例如「3」。',
-            ]
-              .filter((part) => part !== '')
-              .join('\n')
-      await this.#notify(conversationId, body)
+          : renderTable(
+              table.groups,
+              currentId,
+              table.total,
+              { count: otherWorkspaces, names: otherNames },
+              '说「看全部对话」就能一起看，也可以直接切过去。',
+            )
+      const sentId = await this.#notify(conversationId, body)
+      /*
+       * The id the service assigned is what a later quote of this message refers to, so the numbering
+       * it just printed is frozen under it. Without this a spoken listing could be quoted and the
+       * number would still be read against live sessions — the drift the quote is meant to remove.
+       */
+      if (action === 'list' && sentId !== undefined && result.numbered !== undefined) {
+        await this.#rememberListedRows(binding.accountId, conversationId, sentId, result.numbered)
+      }
       return {
         ok: true,
         // The agent gets told what happened, not the list itself: repeating it would double every
         // request, and paraphrasing it is what produced a list the user could not act on.
         detail: `列表已直接发给用户（共 ${String(sessions.length)} 个对话）。不要重复这份列表。`,
         sessions,
+        rows,
         otherWorkspaces,
         otherNames,
       }
     }
-    return { ok: true, detail: result.text, sessions, otherWorkspaces, otherNames }
+    return { ok: true, detail: result.text, sessions, rows, otherWorkspaces, otherNames }
+  }
+
+  /**
+   * Freeze the numbering one sent message printed, so a quote of it resolves the same way twice.
+   *
+   * @param accountId - Account the message went out on.
+   * @param conversationId - Conversation it went to.
+   * @param messageId - Id the service assigned, which is what a quote carries.
+   * @param numbered - The rows, in the order the message numbered them.
+   */
+  async #rememberListedRows(
+    accountId: string,
+    conversationId: string,
+    messageId: string,
+    numbered: readonly NumberedSession[],
+  ): Promise<void> {
+    try {
+      await this.#store.update((state) => {
+        rememberSessionList(state, accountId, conversationId, {
+          messageId,
+          // Copied field by field: what is stored has to be exactly the two fields the reader
+          // validates, so a later change to the row shape cannot smuggle an unvalidated value in.
+          // Long titles are trimmed by the store, which owns that bound.
+          sessions: numbered.map((session) => ({
+            sessionId: session.sessionId,
+            title: session.title,
+          })),
+          at: Date.now(),
+        })
+      })
+    } catch (error) {
+      // A listing that cannot be remembered is still a listing the user is reading; the cost is that
+      // its numbering is not pinned, which the next `/list` fixes.
+      this.#recordError(
+        `会话清单编号未能保存: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
   }
 
   /**
@@ -953,65 +1046,95 @@ class WechatRuntime {
    *
    * @param conversationId - Conversation to notify.
    * @param text - Message body.
+   * @returns The id the service assigned, when it assigned one and the send went out. A listing needs
+   *   it: that id is what a later quote of the message refers to.
    */
-  async #notify(conversationId: string, text: string): Promise<void> {
+  async #notify(conversationId: string, text: string): Promise<string | undefined> {
     const state = await this.#store.read()
     const binding = state.bindings[conversationId]
-    if (binding === undefined) return
+    if (binding === undefined) return undefined
     const account = state.accounts[binding.accountId]
-    if (account === undefined) return
+    if (account === undefined) return undefined
     try {
-      await this.#send({
+      const sent = await this.#send({
         account,
         to: binding.peerId,
         text,
       })
       this.#recordBoot(`session notice sent: ${text.split('\n')[0] ?? ''}`)
+      const id = (sent as { serverMessageId?: unknown } | undefined)?.serverMessageId
+      return typeof id === 'string' ? id : undefined
     } catch (error) {
       this.#recordError(
         `发送会话通知失败: ${error instanceof Error ? error.message : String(error)}`,
       )
+      return undefined
     }
+  }
+
+  /**
+   * The rows a bare number in this conversation should be read against.
+   *
+   * A quoted listing wins, because the user pointed at it: its numbering was frozen when the message
+   * was sent, so "3" still means the row they can see however much the machine has moved since. With
+   * no quote — or a quote of something that was not a listing — the newest listing this conversation
+   * received is used, which is the one most likely to still be on their screen.
+   *
+   * Nothing is returned when this conversation has never been sent a listing. The router then falls
+   * back to the live list, which is the old behaviour and the only answer available.
+   *
+   * @param conversationId - Conversation the message arrived in.
+   * @param accountId - Account it arrived on.
+   * @param message - The inbound message, when there is one to quote.
+   * @returns The rows a number refers to, or an empty object when there are none.
+   */
+  async #numberedRowsFor(
+    conversationId: string,
+    accountId: string,
+    message?: InboundMessage,
+  ): Promise<{ numbered?: NumberedSession[] }> {
+    const state = await this.#store.read()
+    const quotedId = message === undefined ? undefined : quotedMessageId(message)
+    const quoted = quotedId === undefined ? undefined : findSessionList(state, accountId, quotedId)
+    const listing = quoted ?? latestSessionList(state, accountId, conversationId)
+    if (listing === undefined) return {}
+    this.#recordBoot(
+      `session numbering: ${quoted === undefined ? 'latest' : 'quoted'} listing ` +
+        `id=${listing.messageId} rows=${String(listing.sessions.length)}`,
+    )
+    return { numbered: listing.sessions }
   }
 
   /**
    * The sessions a conversation can move between, numbered the way the list presents them.
    *
    * The agent gets this alongside every result so it can offer the choice it just described
-   * without a second call.
+   * without a second call. The numbering comes from the same grouping and ordering the message itself
+   * was rendered from, so a number the agent repeats and a number the user reads are the same number.
    *
    * @param conversationId - Conversation whose current session is marked.
    * @param includeAll - Whether to include sessions from other workspaces.
-   * @returns Rows ready to relay, how many were held back, and where those live.
+   * @returns Rows ready to relay, the groups they were rendered from, and what was held back.
    */
   async #sessionTable(
     conversationId: string,
     includeAll: boolean,
   ): Promise<{
     sessions: { index: number; sessionId: string; title: string; updatedAt: number; current: boolean }[]
+    groups: SessionGroup[]
+    total: number
     otherWorkspaces: number
     otherNames: string[]
   }> {
     const state = await this.#store.read()
     const current = state.bindings[conversationId]
     const currentId = current?.sessionId ?? ''
-    const listed = await this.#gateway().listSessions()
+    const all = await this.#gateway().listSessions()
+    const own = (await this.#gateway().listOwnSessions?.()) ?? all
+    const ownIds = new Set(own.map((session) => session.sessionId))
+    const others = all.filter((session) => !ownIds.has(session.sessionId))
 
-    const own: typeof listed = []
-    const others: typeof listed = []
-    const otherPaths = new Set<string>()
-    for (const session of listed) {
-      // A session with no recorded directory, or one the store does not know, is treated as this
-      // chat's own: it is the only workspace this conversation can vouch for.
-      const path = await storedSessionWorkspace(this.#home, session.sessionId)
-      if (path === undefined || isSameWorkspace(path, this.#workspace)) own.push(session)
-      else {
-        others.push(session)
-        otherPaths.add(path)
-      }
-    }
-
-    if (listed.length === 0) {
+    if (all.length === 0) {
       // The host reports nothing, but this conversation is plainly on a session. Offering that one
       // is what keeps "list my conversations" from answering with silence — which is exactly how
       // the request failed in practice.
@@ -1028,6 +1151,8 @@ class WechatRuntime {
                   current: true,
                 },
               ],
+        groups: [],
+        total: 0,
         otherWorkspaces: 0,
         otherNames: [],
       }
@@ -1035,10 +1160,12 @@ class WechatRuntime {
 
     // `all` shows everything; otherwise the wider list is only counted, so the default stays short
     // and the user is told the rest is there.
-    const chosen = includeAll ? [...own, ...others] : own
-    // Newest first, so the cut-off at the display limit drops the oldest — an older conversation
-    // shown but unreachable by number would be worse than one not shown at all.
-    const ordered = [...chosen].sort((a, b) => b.updatedAt - a.updatedAt)
+    const rows = includeAll ? all : own
+    const groups = groupSessionRows(rows, {
+      ownWorkspace: this.#workspace,
+      ownLabel: WORKSPACE_TITLE,
+    })
+    const ordered = flattenSessionGroups(groups)
     return {
       sessions: ordered.map((session, index) => ({
         index: index + 1,
@@ -1047,10 +1174,12 @@ class WechatRuntime {
         updatedAt: session.updatedAt,
         current: session.sessionId === currentId,
       })),
+      groups,
+      total: rows.length + (includeAll ? 0 : others.length),
       otherWorkspaces: includeAll ? 0 : others.length,
       // Folder names, because they are what the user recognises from the desktop. Named rather than
       // counted so "which other lists are there" needs no second question.
-      otherNames: includeAll ? [] : [...otherPaths].map(workspaceLabel).sort(),
+      otherNames: includeAll ? [] : heldNames(others),
     }
   }
 
@@ -1099,6 +1228,8 @@ class WechatRuntime {
       delete state.syncBufs[accountId]
       delete state.contextTokens[accountId]
       delete state.sentMessages[accountId]
+      // The frozen listings go with it: they exist to resolve a quote that arrives on this account.
+      if (state.sessionLists !== undefined) delete state.sessionLists[accountId]
       for (const [key, binding] of Object.entries(state.bindings)) {
         if (binding.accountId === accountId) delete state.bindings[key]
       }
@@ -1894,9 +2025,18 @@ class WechatRuntime {
           accountId: message.accountId,
           peerId: message.peerId,
           text,
+          // The listing a bare number answers from: the one this message quotes, or the newest one
+          // this conversation was sent. Read before routing, so the router never has to guess.
+          ...(await this.#numberedRowsFor(message.conversationId, message.accountId, message)),
         })
         if (routed.kind === 'reply') {
-          await this.#reply(account, message.conversationId, message.peerId, routed.text)
+          await this.#reply(
+            account,
+            message.conversationId,
+            message.peerId,
+            routed.text,
+            routed.numbered,
+          )
           return false
         }
         await this.#prompt(routed.decision, message, [], quoted)
@@ -2519,9 +2659,9 @@ class WechatRuntime {
         )
         // The rows are appended so the agent can offer the numbered choice it just described
         // without a second call, which is what makes "switch to the 周报 one" work from one turn.
-        const rows = renderTable(result.sessions, result.sessions.find((row) => row.current)?.sessionId)
+        // They carry the same numbering the user was sent, so repeating one is safe.
         return {
-          detail: rows === '' ? result.detail : `${result.detail}\n\n${rows}`,
+          detail: result.rows === '' ? result.detail : `${result.detail}\n\n${result.rows}`,
           ok: result.ok,
           otherWorkspaces: result.otherWorkspaces,
         }
@@ -2973,6 +3113,7 @@ class WechatRuntime {
     conversationId: string,
     peerId: string,
     text: string,
+    numbered?: readonly NumberedSession[],
   ): Promise<void> {
     /*
      * Anything sent into a conversation ends the "typing…" state for it: the channel is speaking, so
@@ -2992,6 +3133,7 @@ class WechatRuntime {
         text,
         settings,
         contextToken,
+        numbered,
       )
     } catch (error) {
       this.#recordError(`发送失败: ${error instanceof Error ? error.message : String(error)}`)
@@ -3011,6 +3153,7 @@ class WechatRuntime {
    * @param text - Full reply text.
    * @param settings - Resolved settings, so one message sees one consistent limit.
    * @param contextToken - Reply token, when one is stored.
+   * @param numbered - Rows this reply numbered, recorded against the id the service assigns.
    */
   async #sendWithinLimit(
     account: WeixinAccount,
@@ -3019,14 +3162,24 @@ class WechatRuntime {
     text: string,
     settings: Required<ChannelSettings>,
     contextToken: string | undefined,
+    numbered?: readonly NumberedSession[],
   ): Promise<void> {
     const limit = settings.maxReplyChars
     if (limit <= 0 || text.length <= limit) {
-      await this.#sendText(account, conversationId, peerId, truncate(text, Math.max(limit, 1)), contextToken)
+      await this.#sendText(
+        account,
+        conversationId,
+        peerId,
+        truncate(text, Math.max(limit, 1)),
+        contextToken,
+        numbered,
+      )
       return
     }
 
-    // A caption so the file is not an unexplained attachment, then the file itself.
+    // A caption so the file is not an unexplained attachment, then the file itself. The numbering is
+    // deliberately *not* recorded here: a quote of this message would point at the caption, and the
+    // rows the user reads are inside the file — so there is nothing to pin the numbers to.
     await this.#sendText(
       account,
       conversationId,
@@ -3110,6 +3263,7 @@ class WechatRuntime {
     peerId: string,
     text: string,
     contextToken: string | undefined,
+    numbered?: readonly NumberedSession[],
   ): Promise<void> {
     const sent = await this.#send({
       account,
@@ -3148,6 +3302,16 @@ class WechatRuntime {
           settings.quoteHistory,
         )
       })
+      /*
+       * And, when this message *was* a listing, the numbering it printed is frozen under the same id.
+       *
+       * It has to be here rather than where the listing was built: the id is assigned by the service
+       * when the send succeeds, and that id is the only thing a quote of the message will carry. A
+       * listing that could not be sent has no numbering worth remembering.
+       */
+      if (numbered !== undefined) {
+        await this.#rememberListedRows(account.accountId, conversationId, id, numbered)
+      }
     }
   }
 
@@ -3302,26 +3466,21 @@ class WechatRuntime {
    * @returns A line to lead the prompt with, or undefined when there is no quote.
    */
   async #resolveQuote(message: InboundMessage): Promise<string | undefined> {
-    for (const item of message.raw.item_list ?? []) {
-      const quote = item.ref_msg
-      if (quote === undefined) continue
-      const messageId = quote.message_item?.msg_id ?? quote.svr_id
-      if (messageId === undefined) continue
+    const messageId = quotedMessageId(message)
+    if (messageId === undefined) return undefined
 
-      const state = await this.#store.read()
-      const found = findSentMessage(state, message.accountId, messageId)
-      this.#recordBoot(
-        `quote resolved: id=${messageId} ${found === undefined ? 'NOT FOUND' : `kind=${found.kind}`}`,
-      )
-      if (found === undefined) {
-        // The quoted text is not recoverable, but saying so keeps the agent from guessing.
-        return `[引用了一条我发出的消息，但内容已不在缓存中（id ${messageId}）]`
-      }
-      return found.kind === 'text'
-        ? `[引用我此前发送的消息]\n${found.preview}`
-        : `[引用我此前发送的${MEDIA_LABEL_BY_KIND[found.kind as 'image' | 'video' | 'file']}] ${found.preview}`
+    const state = await this.#store.read()
+    const found = findSentMessage(state, message.accountId, messageId)
+    this.#recordBoot(
+      `quote resolved: id=${messageId} ${found === undefined ? 'NOT FOUND' : `kind=${found.kind}`}`,
+    )
+    if (found === undefined) {
+      // The quoted text is not recoverable, but saying so keeps the agent from guessing.
+      return `[引用了一条我发出的消息，但内容已不在缓存中（id ${messageId}）]`
     }
-    return undefined
+    return found.kind === 'text'
+      ? `[引用我此前发送的消息]\n${found.preview}`
+      : `[引用我此前发送的${MEDIA_LABEL_BY_KIND[found.kind as 'image' | 'video' | 'file']}] ${found.preview}`
   }
 
   /**
@@ -3496,7 +3655,9 @@ class WechatRuntime {
        * what it read from disk, and it says nothing about *where* a session lives — the very field
        * that decides whether it can be adopted.
        *
-       * Own-workspace conversations lead in both methods, because those are the ones this chat made.
+       * Every row carries the directory it was read from, because that is what the listing groups by.
+       * Order is left to the reader: the router sorts and groups for display, and a gateway that also
+       * sorted would be a second opinion about what "newest first" means.
        */
       listOwnSessions: async () => {
         const { own } = await splitStoredSessions(this.#home, cwd)
@@ -3570,6 +3731,8 @@ class WechatRuntime {
  * a session lives — the split that decides whether it is shown by default and whether it can be
  * adopted at all.
  *
+ * Each row carries its own `workspace`, so the caller can group without a second read of the store.
+ *
  * @param home - DSH home directory.
  * @param cwd - The channel's own workspace directory.
  * @returns Own-workspace sessions and all others.
@@ -3578,16 +3741,21 @@ async function splitStoredSessions(
   home: string,
   cwd: string,
 ): Promise<{
-  own: { sessionId: string; title: string; updatedAt: number }[]
-  others: { sessionId: string; title: string; updatedAt: number }[]
+  own: ListedSession[]
+  others: ListedSession[]
 }> {
   const grouped = await listAllStoredSessions(home).catch(() => new Map())
-  const own: { sessionId: string; title: string; updatedAt: number }[] = []
-  const others: { sessionId: string; title: string; updatedAt: number }[] = []
+  const own: ListedSession[] = []
+  const others: ListedSession[] = []
   for (const [path, sessions] of grouped) {
     const target = isSameWorkspace(path, cwd) ? own : others
     for (const session of sessions) {
-      target.push({ sessionId: session.sessionId, title: session.title, updatedAt: session.updatedAt })
+      target.push({
+        sessionId: session.sessionId,
+        title: session.title,
+        updatedAt: session.updatedAt,
+        ...(path === '' ? {} : { workspace: path }),
+      })
     }
   }
   // A session whose directory was never recorded cannot be attributed, so it is offered as this

@@ -20,16 +20,45 @@
  * @module @dsh-wechat/core/session-index
  */
 
-import { readdir, readFile, stat } from 'node:fs/promises'
+import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 /** One session as the store describes it. */
 export interface StoredSession {
   sessionId: string
   title: string
+  /**
+   * When the conversation last ran a turn, according to the session's own record.
+   *
+   * Deliberately **not** a file timestamp. See {@link compareSessionsNewestFirst}.
+   */
   updatedAt: number
   /** Working directory the session belongs to, or empty when the record does not say. */
   cwd: string
+}
+
+/**
+ * Order sessions newest first, totally.
+ *
+ * The second key is not decoration. Without it the order of two sessions that share a timestamp is
+ * whatever order the filesystem handed their directories over in, so the same store printed two
+ * different lists on two consecutive runs — the instability this comparator exists to end. The tie
+ * is broken on the session id instead, which is a property of the data, so the same input always
+ * produces byte-identical output.
+ *
+ * @param a - One session.
+ * @param b - Another.
+ * @returns Negative when `a` should sort first.
+ */
+export function compareSessionsNewestFirst(
+  a: { sessionId: string; updatedAt: number },
+  b: { sessionId: string; updatedAt: number },
+): number {
+  if (a.updatedAt !== b.updatedAt) return b.updatedAt - a.updatedAt
+  // Plain `<`/`>` rather than `localeCompare`: collation depends on the runtime's locale data, and a
+  // locale-sensitive tie-break would be deterministic on one machine and not on the next.
+  if (a.sessionId === b.sessionId) return 0
+  return a.sessionId < b.sessionId ? -1 : 1
 }
 
 /**
@@ -124,29 +153,62 @@ export function indexNamesFor(sessionId: string): string[] {
  *
  * @param storeDir - Root of the index store.
  * @param sessionId - Session to read.
- * @returns The recorded title and working directory, either possibly empty.
+ * @returns The recorded title, working directory and last-prompt time.
  */
 async function readIndex(
   storeDir: string,
   sessionId: string,
-): Promise<{ title: string; cwd: string }> {
+): Promise<{ title: string; cwd: string; updatedAt: number }> {
   for (const name of indexNamesFor(sessionId)) {
     try {
       const raw = await readFile(join(storeDir, name), 'utf-8')
       const parsed = JSON.parse(raw) as {
-        record?: { identity?: { cwd?: unknown }; rows?: { title?: { val?: unknown } } }
+        record?: {
+          identity?: { cwd?: unknown; createdAt?: unknown }
+          rows?: { title?: { val?: unknown }; sessionListMetadata?: { val?: { lastPromptAt?: unknown } } }
+        }
       }
       const title = parsed.record?.rows?.title?.val
       const cwd = parsed.record?.identity?.cwd
       return {
         title: typeof title === 'string' ? title : '',
         cwd: typeof cwd === 'string' ? cwd : '',
+        updatedAt: recordedSessionTime(parsed),
       }
     } catch {
       // Try the next spelling.
     }
   }
-  return { title: '', cwd: '' }
+  return { title: '', cwd: '', updatedAt: 0 }
+}
+
+/**
+ * When a session record says the conversation last ran.
+ *
+ * Two fields are read, in the order the store itself prefers them: `sessionListMetadata.lastPromptAt`
+ * is the timestamp DSH's own session list shows, and `identity.createdAt` is the fallback for a
+ * record written before that row existed.
+ *
+ * **Why not the file's mtime**, which is what this used to read: mtime answers "when was this
+ * directory last written", and *anything* touching the session changes it — a background write, an
+ * unrelated tool call, the store compacting itself. The user saw a different "上次时间" every time
+ * they asked, and a different row order to go with it. A field inside the record changes only when
+ * the conversation itself moves, which is the question the list is answering.
+ *
+ * @param parsed - The parsed index entry.
+ * @returns Milliseconds since epoch, or 0 when the record carries no usable timestamp.
+ */
+export function recordedSessionTime(parsed: {
+  record?: {
+    identity?: { createdAt?: unknown }
+    rows?: { sessionListMetadata?: { val?: { lastPromptAt?: unknown } } }
+  }
+}): number {
+  const lastPromptAt = parsed.record?.rows?.sessionListMetadata?.val?.lastPromptAt
+  if (typeof lastPromptAt === 'number' && Number.isFinite(lastPromptAt)) return lastPromptAt
+  const createdAt = parsed.record?.identity?.createdAt
+  if (typeof createdAt === 'number' && Number.isFinite(createdAt)) return createdAt
+  return 0
 }
 
 /**
@@ -189,19 +251,21 @@ export async function listStoredSessions(
     }
 
     for (const sessionId of ids) {
-      const [index, updatedAt] = await Promise.all([
-        readIndex(indexDir, sessionId),
-        newestMtime(join(sessionsRoot, folder, sessionId)),
-      ])
+      const index = await readIndex(indexDir, sessionId)
       // The folder name is a lossy encoding, so a session is only offered when its own record says
       // it belongs here. Without this check a differently-spelled path could contribute sessions
       // that would fail the moment the user picked one.
       if (index.cwd !== '' && !isSameWorkspace(index.cwd, workspace)) continue
-      sessions.push({ sessionId, title: index.title, updatedAt, cwd: index.cwd })
+      sessions.push({
+        sessionId,
+        title: index.title,
+        updatedAt: index.updatedAt,
+        cwd: index.cwd,
+      })
     }
   }
 
-  return sessions.sort((a, b) => b.updatedAt - a.updatedAt)
+  return sessions.sort(compareSessionsNewestFirst)
 }
 
 /**
@@ -209,6 +273,11 @@ export async function listStoredSessions(
  *
  * Used when the user asks to see conversations beyond the channel's own: the store holds all of
  * them, and each record names its working directory, so the grouping is read rather than inferred.
+ *
+ * **The map's order is part of the answer.** A `Map` keeps insertion order, and this map is what the
+ * caller renders, so leaving the order to the directory walk would put the same workspaces in a
+ * different order on every run. Groups are therefore inserted most-recently-active first, with the
+ * workspace path as the tie-break.
  *
  * @param home - DSH home directory.
  * @returns Sessions per workspace path, each list newest first.
@@ -227,7 +296,7 @@ export async function listAllStoredSessions(
     return new Map()
   }
 
-  const byWorkspace = new Map<string, StoredSession[]>()
+  const collected = new Map<string, StoredSession[]>()
   for (const folder of folders) {
     let ids: string[]
     try {
@@ -240,22 +309,36 @@ export async function listAllStoredSessions(
     }
 
     for (const sessionId of ids) {
-      const [index, updatedAt] = await Promise.all([
-        readIndex(indexDir, sessionId),
-        newestMtime(join(sessionsRoot, folder, sessionId)),
-      ])
+      const index = await readIndex(indexDir, sessionId)
       // Grouped by the record, not the folder: the folder name is a lossy encoding and would merge
       // unrelated directories under one heading.
       const key = index.cwd
-      const list = byWorkspace.get(key)
-      const entry: StoredSession = { sessionId, title: index.title, updatedAt, cwd: index.cwd }
-      if (list === undefined) byWorkspace.set(key, [entry])
+      const list = collected.get(key)
+      const entry: StoredSession = {
+        sessionId,
+        title: index.title,
+        updatedAt: index.updatedAt,
+        cwd: index.cwd,
+      }
+      if (list === undefined) collected.set(key, [entry])
       else list.push(entry)
     }
   }
 
-  for (const list of byWorkspace.values()) list.sort((a, b) => b.updatedAt - a.updatedAt)
-  return byWorkspace
+  const ordered = [...collected.entries()]
+    .map(([path, list]) => {
+      list.sort(compareSessionsNewestFirst)
+      // A group's position is decided by its most recent conversation, which is the same fact the
+      // rows inside it are ordered by.
+      return { path, list, newest: list[0]?.updatedAt ?? 0 }
+    })
+    .sort((a, b) => {
+      if (a.newest !== b.newest) return b.newest - a.newest
+      if (a.path === b.path) return 0
+      return a.path < b.path ? -1 : 1
+    })
+
+  return new Map(ordered.map((group) => [group.path, group.list]))
 }
 
 /**
@@ -274,28 +357,4 @@ export async function storedSessionWorkspace(
 ): Promise<string | undefined> {
   const index = await readIndex(join(home, 'storages', 'session_projcache', 'sessions'), sessionId)
   return index.cwd === '' ? undefined : index.cwd
-}
-
-/**
- * When a session directory was last written.
- *
- * Used as the ordering key because a session's own transcript is compressed and reading it to find
- * a timestamp would cost far more than the ordering is worth.
- *
- * @param dir - Session directory.
- * @returns Milliseconds since epoch, or 0 when it cannot be read.
- */
-async function newestMtime(dir: string): Promise<number> {
-  try {
-    const entries = await readdir(dir, { withFileTypes: true })
-    let newest = 0
-    for (const entry of entries) {
-      const info = await stat(join(dir, entry.name))
-      const at = info.mtimeMs
-      if (Number.isFinite(at) && at > newest) newest = at
-    }
-    return newest
-  } catch {
-    return 0
-  }
 }

@@ -456,6 +456,46 @@ token 由**用户那条消息**签发，回信时必须原样带回。它过期�
 
 **仍然遵守的纪律**：被拒 = 排队等你发消息（不重试，重试无用）；`prepare failed` **绝不**计入任何熔断器（hermes 因为 `threshold=1` 连刷 13 小时 cooldown）。
 
+## 4.11 `/list all` 每次都不一样：时间取自会变的文件属性
+
+**现象**：用户在微信里发 `/list all`，**每次顺序不同**，同一个会话的「上次时间」每次显示也不同。同一份输入，两次输出不一样。
+
+**根因有两层，都在 `session-index.ts`**：
+
+| # | 问题 | 位置 |
+|---|---|---|
+| 1 | `updatedAt` 取自会话目录里**所有文件的最新 mtime**（`newestMtime()`） | 旧 `session-index.ts:288` 的 `newestMtime`，被两个列表函数调用 |
+| 2 | 排序只有**一个键**（`b.updatedAt - a.updatedAt`），**没有第二排序键** | 旧 `session-index.ts:204` 与 `:257` |
+
+**为什么这两条合起来就是"每次都不一样"**：
+
+- **mtime 回答的是错的问题**。它是"这个目录最后一次被写是什么时候"，而*任何*写入都会改它——后台跑一轮、工具碰一下文件、存储自己整理。用户看到的时间因此在两次提问之间凭空变了。
+- **时间撞车在真实数据里是常态**。实测这台机器上 `~/.dsh/storages/session_projcache/sessions/` 里**大量条目共享同一个时间戳**（同一次批量导入、同一个秒）。`Array.prototype.sort` 是稳定的，所以时间相等时顺序 = **输入顺序**，而输入顺序来自 `readdir`——一棵目录树给什么顺序就是什么顺序，不是数据的属性。
+- 分组列表还有第三个不稳定源：`listAllStoredSessions()` 返回 `Map`，而 `Map` 保持**插入顺序**，插入顺序又来自目录遍历。
+
+**修法**：
+
+1. 时间改读**会话记录里的字段**：`record.rows.sessionListMetadata.val.lastPromptAt`（DSH 自己的会话列表用的就是它），退回 `identity.createdAt`。它只在**这个对话真的动过**时才变。
+2. `compareSessionsNewestFirst()`：**主键结束时间倒序，第二键 sessionId 升序**（用 `<`/`>`，不用 `localeCompare`——collation 依赖运行时的 locale 数据，会变成"这台机器确定、那台不确定"）。
+3. 分组的 `Map` 按**组内最新时间 + 路径**重排后再插入。
+4. 每次都用 `stamp` 记录时间，`relativeTime()` 可注入 `now`，所以**一条消息里每一行对"3 分钟前"的理解一致**。
+
+**回归测试**（都在，且都做过反向验证）：`session-index.test.ts` 里"排序键是会话记录而不是最新写入的文件"（故意把 mtime 设成**相反**顺序）、"时间相等时仍然完全有序，同一份存储列两次结果一致"；`core.test.ts` 里"同一份列表无论存储以什么顺序交出各行，输出逐字节相同"。
+
+> **教训（和 §7.3 同一条）**：**"文件的时间"不是"事情发生的时间"。** 任何用 mtime 当业务时间的排序，都是一份会在用户眼皮底下变化的答案。
+
+### `/list` 重做（同一批需求）
+
+同一批需求里还改了三件事，都记在这里因为**取舍不在代码里**：
+
+| 改动 | 为什么 |
+|---|---|
+| **短 id 从 8 位缩到 4 位**（`SHORT_ID_LENGTH`）| 手机上要能读、能重打。**代价写清楚**：4 位十六进制只有 65 536 种，机器上几百个会话就会撞。所以**歧义是显式失败**：`resolveTarget()` 返回 `{kind:'ambiguous'}`,回复「有多个会话匹配，请用更长的 id」并列出候选（候选前面的 8 位就是"更长的 id"）。**绝不猜**——猜错是把用户的活儿切到别的对话 |
+| **`/switch <id>` 用前缀匹配** | 用户想打多长就打多长（`e716` → `e716f` → 完整 id）。`resolveTarget` 的尝试顺序是**精确优先**（编号 → 完整 id → 精确题目 → 前缀 → 后缀 → 模糊题目），否则一个像十六进制的题目会被前缀规则抢走 |
+| **引用锁定（quote pinning）** | 编号是"那份列表里的位置"，而列表拍的是一个还在动的机器。发出的列表按**服务端分配的 message id** 把编号存进 `state.json`（`sessionLists`，每个对话保留最近 5 份），引用那条消息回复编号就按那份解析。**新 state 字段同时改了 `normalize()`**（逐项校验、非法项丢弃）并配了往返测试——§4.9 那个"存了也会丢"的坑就靠这条纪律不再复发 |
+
+> **`/list` 的默认范围没有变**：仍然只列微信工作区，`/list all` 列全部。变的是**排版**（按工作区分组、编号跨组连续、行尾带短 id）和**编号的含义**（按用户看到的那份列表解析，而不是按此刻的实时列表）。
+
 ## 5. 认证：OIDC，不要用 token
 
 **工作流里没有任何密钥。** 用 GitHub 签发的 OIDC 身份向 npm 证明"我确实是这个仓库的这条工作流"。
@@ -533,7 +573,7 @@ npm view dsh-wechat-plugin versions --registry=https://registry.npmjs.org
 pnpm build              # 只编译，保留 @dsh-wechat/core 引用（pack 要靠它改写）
 pnpm run dist           # build + 内嵌 core：Git 安装要的可直接加载形态
 pnpm typecheck          # 含 examples/
-pnpm test               # 233 项
+pnpm test               # 248 项
 pnpm run check:install  # 两条安装路径的约束
 pnpm run pack           # 需要先 build，不能先 dist
 pnpm run verify-pack    # 解包、校验清单、按 DSH 的方式挂载一次

@@ -14,16 +14,22 @@ import { test } from 'node:test'
 
 import { parseWireJson, extractRawIds, baseInfo, buildHeaders, assertSendAccepted, SendRefusedError } from '../src/http.ts'
 import { conversationKey, extractText, toInbound, sendText } from '../src/channel.ts'
-import { DEFAULT_SETTINGS, StateStore, expirePendingNotifications, queuePendingNotification, type ChannelSettings } from '../src/state.ts'
+import { DEFAULT_SETTINGS, StateStore, SESSION_LIST_HISTORY, SESSION_LIST_TITLE_LIMIT, expirePendingNotifications, findSessionList, latestSessionList, queuePendingNotification, rememberSessionList, type ChannelSettings } from '../src/state.ts'
 import {
   SessionRouter,
+  SHORT_ID_LENGTH,
+  ambiguousTargetMessage,
+  flattenSessionGroups,
+  groupSessionRows,
   mintSessionId,
+  relativeTime,
+  renderSessionList,
   resolveTarget,
   shortId,
   splitCommand,
   HELP_TEXT,
 } from '../src/router.ts'
-import type { SessionBinding, SessionGateway } from '../src/router.ts'
+import type { ListedSession, NumberedSession, SessionBinding, SessionGateway, TargetResolution } from '../src/router.ts'
 import type { ChannelState } from '../src/state.ts'
 import { chargeQuota, quotaLedgerFor, type QuotaEntry } from '../src/quota.ts'
 import type { WeixinAccount, WeixinMessage } from '../src/types.ts'
@@ -196,9 +202,9 @@ test('group messages get their own conversation key', () => {
 class FakeGateway implements SessionGateway {
   readonly calls: string[] = []
   readonly prompts: { sessionId: string; text: string }[] = []
-  sessions: { sessionId: string; title: string; updatedAt: number }[] = []
+  sessions: ListedSession[] = []
   /** Sessions belonging to other workspaces, which `listOwnSessions` must exclude. */
-  readonly foreign: { sessionId: string; title: string; updatedAt: number }[] = []
+  readonly foreign: ListedSession[] = []
   /**
    * Clock for seeded sessions, advanced a second per session.
    *
@@ -226,13 +232,13 @@ class FakeGateway implements SessionGateway {
     this.prompts.push({ sessionId, text })
   }
 
-  async listSessions(): Promise<{ sessionId: string; title: string; updatedAt: number }[]> {
-    return [...this.sessions, ...this.foreign].sort((a, b) => b.updatedAt - a.updatedAt)
+  async listSessions(): Promise<ListedSession[]> {
+    return [...this.sessions, ...this.foreign]
   }
 
-  /** What `/list` shows by default: this workspace only, newest first. */
-  async listOwnSessions(): Promise<{ sessionId: string; title: string; updatedAt: number }[]> {
-    return [...this.sessions].sort((a, b) => b.updatedAt - a.updatedAt)
+  /** What `/list` shows by default: this workspace only. */
+  async listOwnSessions(): Promise<ListedSession[]> {
+    return [...this.sessions]
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -352,15 +358,20 @@ test('/list shows this workspace and mentions the rest, and /list all shows ever
   await router.route({ ...conversation, text: 'one' })
   const mine = await gateway.listSessions()
   // A session belonging to another project, which the gateway reports separately.
-  gateway.foreign.push({ sessionId: 'session-ffff9999-ffff9999-x', title: '别处的工作', updatedAt: gateway.nextStamp() })
+  gateway.foreign.push({
+    sessionId: 'session-ffff9999-ffff9999-x',
+    title: '别处的工作',
+    updatedAt: gateway.nextStamp(),
+    workspace: 'C:\\Users\\me\\some_project',
+  })
 
   const own = await router.route({ ...conversation, text: '/list' })
   assert.equal(own.kind, 'reply')
   if (own.kind !== 'reply') return
   // The count includes the held sessions, so the user knows the size of what they are not seeing.
-  assert.match(own.text, new RegExp(`共 ${String(mine.length + 1)} 个对话`))
+  assert.match(own.text, new RegExp(`共 ${String(mine.length + 1)} 个`))
   assert.doesNotMatch(own.text, /别处的工作/, 'the default list is this workspace only')
-  assert.match(own.text, /另有 1 个对话在其它工作区/)
+  assert.match(own.text, /另有 1 个对话在其它工作区（some_project）/)
   // And how to reach them, or the hint is useless.
   assert.match(own.text, /\/list all/)
 
@@ -369,6 +380,279 @@ test('/list shows this workspace and mentions the rest, and /list all shows ever
   if (all.kind !== 'reply') return
   assert.match(all.text, /别处的工作/, 'the wider list shows it')
   assert.doesNotMatch(all.text, /另有/, 'nothing is being held back now')
+  // Grouped rather than flat: each workspace gets its own heading, which is the only thing that says
+  // which project a row came from.
+  assert.match(all.text, /【微信会话】/)
+  assert.match(all.text, /【some_project】/)
+})
+
+test('a listing groups by workspace, and numbers the rows it prints', async () => {
+  const gateway = new FakeGateway()
+  const router = new SessionRouter({
+    gateway,
+    store: memoryStore(),
+    ownWorkspace: 'C:\\Users\\me\\dsh_wechat',
+  })
+  await router.route({ ...conversation, text: 'one' })
+  gateway.foreign.push(
+    {
+      sessionId: 'session-bbbb2222-bbbb2222-x',
+      title: '优化封面图',
+      updatedAt: gateway.nextStamp(),
+      workspace: 'C:\\Users\\me\\Desktop\\DH\\workplace',
+    },
+    {
+      sessionId: 'session-cccc3333-cccc3333-x',
+      title: '修 bug',
+      updatedAt: gateway.nextStamp(),
+      workspace: 'C:\\Users\\me\\Desktop\\DH\\workplace',
+    },
+  )
+
+  const listed = await router.route({ ...conversation, text: '/list all' })
+  assert.equal(listed.kind, 'reply')
+  if (listed.kind !== 'reply') return
+
+  const rows = listed.text.split('\n').filter((line) => /^\d+\. /.test(line))
+  assert.equal(rows.length, 3)
+  // The numbering runs on across headings, which is what makes a single number enough to reply with.
+  assert.match(rows[0]!, /^1\. /)
+  assert.match(rows[2]!, /^3\. /)
+  // Every row ends with the short form of its own id, which is what `/switch <id>` accepts.
+  for (const line of rows) {
+    const id = /  ([0-9a-f]{1,5})$/.exec(line)?.[1]
+    assert.ok(id, `no short id at the end of the row: ${line}`)
+    assert.ok(id.length <= 5, `short id longer than five characters: ${id}`)
+  }
+
+  // And the numbering the reply reports is exactly what it printed, in the same order — this is what
+  // the caller freezes so a quote can resolve against it later.
+  assert.deepEqual(
+    listed.numbered?.map((session) => session.sessionId),
+    [
+      gateway.sessions[0]!.sessionId,
+      gateway.foreign[1]!.sessionId,
+      gateway.foreign[0]!.sessionId,
+    ],
+    'own workspace first, then the others newest first',
+  )
+})
+
+test('the same listing is byte-identical however the store hands the rows over', () => {
+  /*
+   * The regression this exists for: `/list all` printed a different order on every run, and a
+   * different "上次时间" beside the same conversation. The order came from the directory walk and the
+   * time from a file's mtime, so neither was a property of the data — and with several sessions
+   * sharing a timestamp (imports, bulk runs) there was no tie-break to save it.
+   *
+   * Two things are checked together, because they are one bug: equal timestamps must still order
+   * deterministically, and the input order must not be able to reach the output at all.
+   */
+  const stamp = 1_700_000_000_000
+  const rows: ListedSession[] = [
+    { sessionId: 'session-aaaa1111-aaaa1111-x', title: '甲', updatedAt: stamp },
+    { sessionId: 'session-bbbb2222-bbbb2222-x', title: '乙', updatedAt: stamp },
+    { sessionId: 'session-cccc3333-cccc3333-x', title: '丙', updatedAt: stamp },
+    { sessionId: 'session-dddd4444-dddd4444-x', title: '丁', updatedAt: stamp - 1 },
+  ]
+  const render = (input: readonly ListedSession[]): string =>
+    renderSessionList(groupSessionRows(input, { ownLabel: '微信会话' }), undefined, {
+      now: stamp + 60_000,
+    })
+
+  const forward = render(rows)
+  const backward = render([...rows].reverse())
+  assert.equal(forward, backward, 'the input order must not survive into the output')
+  // Byte-for-byte, not merely "same rows": this is the assertion the pnpm test run makes on the
+  // rendered message, so any instability shows up here first.
+  assert.equal(render([...rows].reverse()), forward)
+
+  // The tie is broken on the id, ascending, so the equal-timestamp rows come out in a fixed order —
+  // and the older one still follows them, because time is still the first key.
+  const order = forward
+    .split('\n')
+    .filter((line) => /^\d+\. /.test(line))
+    .map((line) => /^\d+\. (\S+)/.exec(line)?.[1])
+  assert.deepEqual(order, ['甲', '乙', '丙', '丁'])
+})
+
+test('relative times read the way a person says them', () => {
+  const now = 1_800_000_000_000
+  assert.equal(relativeTime(now - 10_000, now), '刚刚')
+  assert.equal(relativeTime(now - 3 * 60_000, now), '3 分钟前')
+  assert.equal(relativeTime(now - 2 * 3_600_000, now), '2 小时前')
+  assert.equal(relativeTime(now - 25 * 3_600_000, now), '昨天')
+  assert.equal(relativeTime(now - 3 * 24 * 3_600_000, now), '3 天前')
+  // A week on, a date is more use than a count nobody converts in their head.
+  assert.doesNotMatch(relativeTime(now - 30 * 24 * 3_600_000, now), /前/)
+})
+
+test('a pinned listing decides what a number means', async () => {
+  /*
+   * Why this matters: a number identifies a row of a *listing*, and a listing is a photograph of a
+   * machine that keeps moving. Answering "2" from whatever is newest at that moment means the user
+   * can point at one conversation and land in another — which is the failure the quote-pinned
+   * numbering exists to remove.
+   *
+   * The same argument is deliberately read twice below, against two different listings, and it has to
+   * mean two different conversations.
+   */
+  const gateway = new FakeGateway()
+  const store = memoryStore()
+  const router = new SessionRouter({ gateway, store })
+
+  const first = await router.route({ ...conversation, text: '第一条' })
+  assert.equal(first.kind, 'prompt')
+  if (first.kind !== 'prompt') return
+  await router.route({ ...conversation, text: '/new 第二个' })
+  const newest = store.peek()[conversation.conversationId]?.sessionId
+  assert.ok(newest && newest !== first.decision.sessionId)
+
+  // What the user was shown: the older conversation on row 1, the newer one on row 2.
+  const pinned: NumberedSession[] = [
+    { sessionId: first.decision.sessionId, title: '第一条' },
+    { sessionId: newest, title: '第二个' },
+  ]
+
+  const toFirst = await router.route({ ...conversation, text: '/switch 1', numbered: pinned })
+  assert.equal(toFirst.kind, 'reply')
+  if (toFirst.kind === 'reply') assert.match(toFirst.text, /已切换到「第一条」/)
+  assert.equal(store.peek()[conversation.conversationId]?.sessionId, first.decision.sessionId)
+
+  const toSecond = await router.route({ ...conversation, text: '/switch 2', numbered: pinned })
+  assert.equal(toSecond.kind, 'reply')
+  if (toSecond.kind === 'reply') assert.match(toSecond.text, /已切换到「第二个」/)
+  assert.equal(store.peek()[conversation.conversationId]?.sessionId, newest)
+
+  // The live list is ordered the other way round, so the same "2" without a pin names the *other*
+  // conversation. Both behaviours are wanted: a pin is what makes the number mean what the user saw.
+  await router.route({ ...conversation, text: '/switch 2' })
+  assert.equal(
+    store.peek()[conversation.conversationId]?.sessionId,
+    first.decision.sessionId,
+    'unpinned numbers still come from the live list',
+  )
+})
+
+test('a numbered listing survives a save and a reload', async () => {
+  /*
+   * The field this covers is a new one in `state.json`, and the store's reader is an allowlist: a
+   * field added to `ChannelState` and forgotten in `normalize` saves perfectly and is gone after the
+   * next restart. That has happened here before, with settings, so the round trip is asserted rather
+   * than assumed.
+   *
+   * The extra `update(() => {})` is the part that matters: every write re-reads and re-normalizes,
+   * so a field the normalizer drops disappears on the *next* write and takes one more restart to
+   * notice.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-state-'))
+  try {
+    const file = join(home, 'state.json')
+    const store = new StateStore(file)
+    await store.update((state) => {
+      rememberSessionList(state, 'acct', 'acct:peer', {
+        messageId: 'msg-1',
+        sessions: [{ sessionId: 'session-aaaa1111-aaaa1111-x', title: '甲' }],
+        at: 1_700_000_000_000,
+      })
+      rememberSessionList(state, 'acct', 'acct:peer', {
+        messageId: 'msg-2',
+        sessions: [
+          { sessionId: 'session-aaaa1111-aaaa1111-x', title: '甲' },
+          { sessionId: 'session-bbbb2222-bbbb2222-x', title: '乙' },
+        ],
+        at: 1_700_000_001_000,
+      })
+    })
+    await store.update(() => {})
+
+    const reloaded = await new StateStore(file).read()
+    assert.deepEqual(findSessionList(reloaded, 'acct', 'msg-2')?.sessions, [
+      { sessionId: 'session-aaaa1111-aaaa1111-x', title: '甲' },
+      { sessionId: 'session-bbbb2222-bbbb2222-x', title: '乙' },
+    ])
+    // The older one is still there, keyed by its own message id.
+    assert.equal(findSessionList(reloaded, 'acct', 'msg-1')?.sessions.length, 1)
+    // And the conversation's newest listing is the one a bare number answers from.
+    assert.equal(latestSessionList(reloaded, 'acct', 'acct:peer')?.messageId, 'msg-2')
+    // Another account sees nothing, so a shared machine cannot resolve across bots.
+    assert.equal(findSessionList(reloaded, 'other', 'msg-2'), undefined)
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('a malformed numbered listing is dropped instead of resolving a number to nothing', async () => {
+  /*
+   * Read back and acted on: a row without a session id would reach the session controller as a
+   * request to adopt `undefined`. Dropping the entry costs one stale number; guessing at what the
+   * user was looking at costs a switch to the wrong conversation.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-state-'))
+  try {
+    const file = join(home, 'state.json')
+    await writeFile(
+      file,
+      JSON.stringify({
+        version: 1,
+        sessionLists: {
+          acct: {
+            'acct:peer': [
+              { messageId: 'msg-1', at: 1, sessions: [{ sessionId: 'session-aaaa-x', title: '甲' }] },
+              { messageId: '', at: 2, sessions: [{ sessionId: 'session-bbbb-x', title: '乙' }] },
+              { messageId: 'msg-3', at: 3, sessions: [] },
+              { messageId: 'msg-4', at: 4, sessions: [{ sessionId: 7, title: '丙' }] },
+              { messageId: 'msg-5', at: 'soon', sessions: [{ sessionId: 'session-eeee-x', title: '戊' }] },
+              'not an entry',
+            ],
+          },
+          'not-an-account': 'nope',
+        },
+      }),
+      'utf8',
+    )
+
+    const state = await new StateStore(file).read()
+    assert.equal(findSessionList(state, 'acct', 'msg-1')?.sessions.length, 1, 'the good one stays')
+    assert.equal(findSessionList(state, 'acct', 'msg-3'), undefined, 'an empty numbering is unusable')
+    assert.equal(findSessionList(state, 'acct', 'msg-4'), undefined, 'a non-string id is unusable')
+    assert.equal(findSessionList(state, 'acct', 'msg-5'), undefined, 'a non-numeric time is unusable')
+    assert.equal(state.sessionLists?.acct?.['acct:peer']?.length, 1)
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('a stored listing keeps its rows and trims a paragraph-long title', () => {
+  // The state file is rewritten whole on every change, and a session is named from the user's first
+  // sentence — so an untrimmed title would make every later write carry a paragraph times fifty.
+  const state = emptyState()
+  const paragraph = '请'.repeat(4_000)
+  rememberSessionList(state, 'acct', 'acct:peer', {
+    messageId: 'msg-1',
+    sessions: [{ sessionId: 'session-aaaa1111-aaaa1111-x', title: paragraph }],
+    at: 1_700_000_000_000,
+  })
+  const stored = latestSessionList(state, 'acct', 'acct:peer')?.sessions[0]
+  assert.equal(stored?.sessionId, 'session-aaaa1111-aaaa1111-x')
+  assert.equal(stored?.title.length, SESSION_LIST_TITLE_LIMIT)
+  assert.ok(paragraph.startsWith(stored?.title ?? ''), 'the head of the title, not a rewrite')
+})
+
+test('only the newest few listings are kept, so the state file cannot grow without bound', () => {
+  const state = emptyState()
+  for (let i = 0; i < SESSION_LIST_HISTORY + 4; i += 1) {
+    rememberSessionList(state, 'acct', 'acct:peer', {
+      messageId: `msg-${String(i)}`,
+      sessions: [{ sessionId: `session-${String(i)}-x`, title: `第 ${String(i)} 个` }],
+      at: 1_700_000_000_000 + i,
+    })
+  }
+  const kept = state.sessionLists?.acct?.['acct:peer'] ?? []
+  assert.equal(kept.length, SESSION_LIST_HISTORY)
+  // The newest survive, which is what matters: only a recent list is ever quoted.
+  assert.equal(latestSessionList(state, 'acct', 'acct:peer')?.messageId, `msg-${String(SESSION_LIST_HISTORY + 3)}`)
+  assert.equal(findSessionList(state, 'acct', 'msg-0'), undefined, 'the oldest is gone')
 })
 
 test('a binding moves on, and switching back points at that session again', async () => {
@@ -613,25 +897,36 @@ test('a missing separator still switches the session', async () => {
   assert.match(current.text, new RegExp(shortId(first.decision.sessionId)))
 })
 
+/** One row as the gateway hands it over. Times are irrelevant to resolution, so they stay zero. */
+function row(sessionId: string, title = '甲', workspace?: string): ListedSession {
+  return { sessionId, title, updatedAt: 0, ...(workspace === undefined ? {} : { workspace }) }
+}
+
+/**
+ * The session a resolution found, or undefined when it found none or several.
+ *
+ * @param resolution - What `resolveTarget` returned.
+ */
+function found(resolution: TargetResolution): NumberedSession | undefined {
+  return resolution.kind === 'found' ? resolution.session : undefined
+}
+
 test('resolveTarget accepts an index, a full id, the short id, and a title', () => {
   // Realistically shaped ids, minted the same way the router mints them.
   const first = mintSessionId(() => 'aaaa1111-2222-3333-4444-555566667777')
   const second = mintSessionId(() => 'bbbb1111-2222-3333-4444-555566667777')
-  const sessions = [
-    { sessionId: first, title: '甲', updatedAt: 2 },
-    { sessionId: second, title: '乙', updatedAt: 1 },
-  ]
-  assert.equal(resolveTarget('1', sessions)?.title, '甲')
-  assert.equal(resolveTarget('2', sessions)?.title, '乙')
-  assert.equal(resolveTarget(second, sessions)?.title, '乙')
+  const sessions = [row(first, '甲'), row(second, '乙')]
+  assert.equal(found(resolveTarget('1', sessions))?.title, '甲')
+  assert.equal(found(resolveTarget('2', sessions))?.title, '乙')
+  assert.equal(found(resolveTarget(second, sessions))?.title, '乙')
   // The short id `/list` prints is exactly what `/switch` accepts.
-  assert.equal(resolveTarget(shortId(second), sessions)?.title, '乙')
-  assert.equal(resolveTarget('甲', sessions)?.title, '甲')
-  assert.equal(resolveTarget('', sessions), undefined)
-  assert.equal(resolveTarget('9', sessions), undefined)
+  assert.equal(found(resolveTarget(shortId(second), sessions))?.title, '乙')
+  assert.equal(found(resolveTarget('甲', sessions))?.title, '甲')
+  assert.equal(resolveTarget('', sessions).kind, 'none')
+  assert.equal(resolveTarget('9', sessions).kind, 'none')
   // A suffix shared by several sessions is ambiguous and must not guess.
-  assert.equal(resolveTarget('4444-555566667777', sessions), undefined)
-  assert.equal(resolveTarget('session-', sessions), undefined)
+  assert.equal(resolveTarget('4444-555566667777', sessions).kind, 'ambiguous')
+  assert.equal(resolveTarget('session-', sessions).kind, 'none')
 })
 
 test('a number answers from the shown list while a name may reach any workspace', () => {
@@ -640,23 +935,20 @@ test('a number answers from the shown list while a name may reach any workspace'
    * unselectable: a session from another workspace shows up in `/list all`, but a number refers to a
    * row of that listing while a title has to be findable wherever it lives.
    */
-  const mine = [
-    { sessionId: 'session-aaaa1111-aaaa1111-x', title: '我的', updatedAt: 2 },
-  ]
-  const foreign = { sessionId: 'session-bbbb2222-bbbb2222-x', title: '别处的', updatedAt: 1 }
-  const every = [mine[0]!, foreign]
+  const mine = [row('session-aaaa1111-aaaa1111-x', '我的')]
+  const every = [mine[0]!, row('session-bbbb2222-bbbb2222-x', '别处的')]
 
   // A number counts the rows the user saw, so with only one own session, 2 is not a shown row.
-  assert.equal(resolveTarget('1', every, mine)?.title, '我的')
-  assert.equal(resolveTarget('2', every, mine), undefined)
+  assert.equal(found(resolveTarget('1', every, mine))?.title, '我的')
+  assert.equal(resolveTarget('2', every, mine).kind, 'none')
   // With everything shown, 2 is the foreign session.
-  assert.equal(resolveTarget('2', every, every)?.title, '别处的')
+  assert.equal(found(resolveTarget('2', every, every))?.title, '别处的')
   // A name is searched across everything, however few rows were displayed.
-  assert.equal(resolveTarget('别处的', every, mine)?.title, '别处的')
+  assert.equal(found(resolveTarget('别处的', every, mine))?.title, '别处的')
   // A short id likewise, which is the form `/list` prints beside each row.
-  assert.equal(resolveTarget('bbbb2222', every, mine)?.title, '别处的')
+  assert.equal(found(resolveTarget('bbbb', every, mine))?.title, '别处的')
   // Omitting the third argument keeps the old behaviour: one pool for both.
-  assert.equal(resolveTarget('2', every)?.title, '别处的')
+  assert.equal(found(resolveTarget('2', every))?.title, '别处的')
 })
 
 test('a title is matched loosely, but never ambiguously', () => {
@@ -665,18 +957,18 @@ test('a title is matched loosely, but never ambiguously', () => {
    * 「北京今天天气如何」. Exact matching alone loses to two characters the user added from habit.
    */
   const sessions = [
-    { sessionId: 'session-1111aaaa-1111aaaa-x', title: '北京今天天气如何', updatedAt: 3 },
-    { sessionId: 'session-2222bbbb-2222bbbb-x', title: '解题辅导会话', updatedAt: 2 },
-    { sessionId: 'session-3333cccc-3333cccc-x', title: '写周报', updatedAt: 1 },
+    row('session-1111aaaa-1111aaaa-x', '北京今天天气如何'),
+    row('session-2222bbbb-2222bbbb-x', '解题辅导会话'),
+    row('session-3333cccc-3333cccc-x', '写周报'),
   ]
 
   // The user's own wording, with a word appended.
-  assert.equal(resolveTarget('北京今天天气如何会话', sessions)?.title, '北京今天天气如何')
+  assert.equal(found(resolveTarget('北京今天天气如何会话', sessions))?.title, '北京今天天气如何')
   // A fragment they remember.
-  assert.equal(resolveTarget('北京', sessions)?.title, '北京今天天气如何')
-  assert.equal(resolveTarget('周报', sessions)?.title, '写周报')
+  assert.equal(found(resolveTarget('北京', sessions))?.title, '北京今天天气如何')
+  assert.equal(found(resolveTarget('周报', sessions))?.title, '写周报')
   // Exact still wins.
-  assert.equal(resolveTarget('写周报', sessions)?.title, '写周报')
+  assert.equal(found(resolveTarget('写周报', sessions))?.title, '写周报')
 
   /*
    * Ambiguity must fail rather than pick one. Both titles here contain 「会话」, so asking for it
@@ -684,28 +976,64 @@ test('a title is matched loosely, but never ambiguously', () => {
    * ask for, which is worse than the failure.
    */
   const ambiguous = [
-    { sessionId: 'session-5555eeee-5555eeee-x', title: '解题辅导会话', updatedAt: 2 },
-    { sessionId: 'session-6666ffff-6666ffff-x', title: '写周报会话', updatedAt: 1 },
+    row('session-5555eeee-5555eeee-x', '解题辅导会话'),
+    row('session-6666ffff-6666ffff-x', '写周报会话'),
   ]
-  assert.equal(resolveTarget('会话', ambiguous), undefined)
+  assert.equal(resolveTarget('会话', ambiguous).kind, 'none')
   // Nothing matches, so nothing moves.
-  assert.equal(resolveTarget('不存在的会话', sessions), undefined)
+  assert.equal(resolveTarget('不存在的会话', sessions).kind, 'none')
   // An untitled session must not be selected by every argument that contains nothing — a title of ''
   // is a substring of everything.
   assert.equal(
-    resolveTarget('随便什么', [{ sessionId: 'session-4444dddd-4444dddd-x', title: '', updatedAt: 0 }]),
-    undefined,
+    resolveTarget('随便什么', [{ sessionId: 'session-4444dddd-4444dddd-x', title: '' }]).kind,
+    'none',
   )
 })
 
-test('shortId stays readable and round-trips through resolveTarget', () => {
+test('a short id two conversations share fails instead of picking one', () => {
+  /*
+   * The printed id is the first few hex characters of the session id, so two conversations *can*
+   * share one — four hex digits is 65 536 values, and a machine with a few hundred sessions will
+   * eventually collide. The answer has to be "your id is too short", naming the candidates: silently
+   * switching to whichever was found first would move the user's work somewhere they never asked for.
+   */
+  const clashA = 'session-e716fd64-e716fd64-47fd-4e61-bec6-d21d19457f37'
+  const clashB = 'session-e716aaaa-e716aaaa-47fd-4e61-bec6-d21d19457f37'
+  const sessions = [row(clashA, '写周报'), row(clashB, '查北京天气')]
+
+  assert.equal(shortId(clashA), shortId(clashB), 'the fixtures really do collide')
+  const resolution = resolveTarget(shortId(clashA), sessions)
+  assert.equal(resolution.kind, 'ambiguous')
+  if (resolution.kind !== 'ambiguous') return
+  assert.deepEqual(
+    resolution.candidates.map((session) => session.title),
+    ['写周报', '查北京天气'],
+  )
+
+  // A longer id identifies one, which is exactly what the failure message tells the user to send.
+  assert.equal(found(resolveTarget('e716f', sessions))?.title, '写周报')
+  assert.equal(found(resolveTarget('e716a', sessions))?.title, '查北京天气')
+  assert.equal(found(resolveTarget(clashA, sessions))?.title, '写周报')
+
+  // And the message says so, in words, with both candidates printed.
+  const message = ambiguousTargetMessage(shortId(clashA), resolution.candidates)
+  assert.match(message, /有多个会话匹配「e716」/)
+  assert.match(message, /更长的 id/)
+  assert.match(message, /e716fd64 · 写周报/)
+  assert.match(message, /e716aaaa · 查北京天气/)
+})
+
+test('shortId stays readable, stays within five characters, and round-trips', () => {
   const id = mintSessionId(() => '1a2b3c4d-9f8e-7d6c-5b4a-392817061524')
   assert.equal(id, 'session-1a2b3c4d-1a2b3c4d-9f8e-7d6c-5b4a-392817061524')
-  assert.equal(shortId(id), '1a2b3c4d')
-  const sessions = [{ sessionId: id, title: 'x', updatedAt: 0 }]
-  assert.equal(resolveTarget(shortId(id), sessions)?.sessionId, id)
-  // A foreign id still yields something printable rather than throwing.
-  assert.equal(shortId('not-a-session-id'), 'not-a-se')
+  assert.equal(shortId(id), '1a2b')
+  // The bound is the requirement: an id the user has to copy is not one they will use.
+  assert.equal(SHORT_ID_LENGTH <= 5, true)
+  const sessions = [row(id, 'x')]
+  assert.equal(found(resolveTarget(shortId(id), sessions))?.sessionId, id)
+  // A foreign id still yields something printable rather than throwing — and still within the bound.
+  assert.ok(shortId('not-a-session-id').length <= SHORT_ID_LENGTH)
+  assert.ok(shortId('session-').length <= SHORT_ID_LENGTH)
 })
 
 /*

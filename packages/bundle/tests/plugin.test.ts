@@ -1258,7 +1258,13 @@ test('the session tool lists conversations with the number to answer', async () 
     assert.match(body, /1\. /)
     assert.match(body, /2\. /)
     assert.match(body, /← 当前/)
-    assert.match(body, /回复数字即可切换/)
+    assert.match(body, /【微信会话】/, 'the rows are grouped under the workspace they belong to')
+    assert.match(body, /回复 \/switch 编号或 \/switch id 切换/)
+    assert.match(body, /引用这条消息再回编号/, 'the quote trick is explained where it is needed')
+    // Every row closes with the short id `/switch <id>` accepts, within the five-character bound.
+    for (const row of body.split('\n').filter((line) => /^\d+\. /.test(line))) {
+      assert.ok(/  [0-9a-f]{1,5}$/.test(row), `no short id at the end of the row: ${row}`)
+    }
     // Rendered once. A duplicated table reads as two separate lists.
     assert.equal(body.match(/1\. /g)?.length, 1, 'the rows appear once')
     // And the agent is told not to repeat it, or every request would arrive twice.
@@ -1445,17 +1451,121 @@ test('the on-disk store supplies the list when the host reports nothing', async 
   }
 })
 
+test('quoting a listing pins the numbers it printed', async () => {
+  /*
+   * The request this exists for: with sessions running while the user reads, "reply 3" could mean a
+   * different conversation by the time the reply arrives, and there was no way to fix that by typing.
+   * Quoting the listing makes the number mean the row *that message* printed, for as long as the
+   * message can be quoted.
+   *
+   * Two listings are sent on purpose, with a different conversation in row 2 of each. If the quote
+   * were ignored and the newest listing used instead, this test would land on the wrong conversation —
+   * which is exactly what it has to be able to detect.
+   */
+  await withHarness(async (harness) => {
+    await harness.runtime.ingest(inbound('第一条'))
+    const first = harness.prompted[0]?.sessionId
+    assert.ok(first)
+    await harness.runtime.ingest(inbound('/new 第二个'))
+
+    // Listing one: row 2 is the first conversation.
+    await harness.runtime.ingest(inbound('/list'))
+    const firstListing = harness.sent.at(-1)?.text ?? ''
+    const firstListId = `msg-${String(harness.sent.length)}`
+    const firstRows = firstListing.split('\n').filter((line) => /^\d+\. /.test(line))
+    assert.equal(firstRows.length, 2, `expected two conversations, got: ${firstListing}`)
+    const position = firstRows.findIndex((line) => line.includes(shortId(String(first)))) + 1
+    assert.equal(position, 2, `the first conversation should be row 2: ${firstListing}`)
+    // The row closes with its own id, which is what the user could type instead.
+    assert.match(firstRows[position - 1] ?? '', new RegExp(`  ${shortId(String(first))}$`))
+
+    // A third conversation, and a second listing: the same row number now names a different one.
+    await harness.runtime.ingest(inbound('/new 第三个'))
+    await harness.runtime.ingest(inbound('/list'))
+    const secondListing = harness.sent.at(-1)?.text ?? ''
+    const secondRows = secondListing.split('\n').filter((line) => /^\d+\. /.test(line))
+    assert.equal(secondRows.length, 3)
+    assert.doesNotMatch(
+      secondRows[position - 1] ?? '',
+      new RegExp(shortId(String(first))),
+      'the newest listing must put a different conversation on that row, or this proves nothing',
+    )
+
+    // Quoting the *first* listing and answering with its own number still means that row.
+    await harness.runtime.ingest(quoting(`/switch ${String(position)}`, firstListId))
+    assert.match(harness.sent.at(-1)?.text ?? '', /已切换到/)
+    assert.equal(
+      (await harness.runtime.bindings())[0]?.sessionId,
+      first,
+      'the quoted listing decided what the number meant',
+    )
+
+    // Without the quote the same number means the newest listing's row, which is a different
+    // conversation — both behaviours are wanted, and neither may leak into the other.
+    await harness.runtime.ingest(inbound(`/switch ${String(position)}`))
+    assert.notEqual((await harness.runtime.bindings())[0]?.sessionId, first)
+
+    // By id, which needs no pinning at all, and works from the quoted context too.
+    await harness.runtime.ingest(quoting(`/switch ${shortId(String(first))}`, firstListId))
+    assert.equal((await harness.runtime.bindings())[0]?.sessionId, first)
+
+    // The numbering lives in the state file under the id the service assigned, so a restart does not
+    // lose it — a quote that arrives after a reboot has to resolve the same way.
+    const stored = JSON.parse(await readFile(harness.stateFile, 'utf8')) as {
+      sessionLists?: Record<string, Record<string, { messageId: string; sessions: unknown[] }[]>>
+    }
+    const history = stored.sessionLists?.['test@im.bot']?.['test@im.bot:peer@im.wechat'] ?? []
+    const entry = history.find((candidate) => candidate.messageId === firstListId)
+    assert.ok(entry, `the listing was not recorded: ${JSON.stringify(history)}`)
+    assert.equal(entry.sessions.length, 2)
+  })
+})
+
+test('an id two conversations share is reported rather than guessed', async () => {
+  /*
+   * The printed id is four hex characters, so a collision is possible on a large machine. The reply
+   * has to say the id was too short and name the candidates: picking one silently would move the
+   * user's work into a conversation they never named.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
+  try {
+    await seedState(home, { ...DEFAULT_SETTINGS, requireConfirmation: false })
+    const workspace = join(home, 'dsh_wechat')
+    // Same first four hex characters, so `/list` prints the same short id twice.
+    await seedStoredSession(home, workspace, 'session-e716fd64-e716fd64-47fd-4e61-bec6-d21d19457f37', '写周报')
+    await seedStoredSession(home, workspace, 'session-e716aaaa-e716aaaa-47fd-4e61-bec6-d21d19457f37', '查天气')
+    const harness = await mount({ home, seedAccount: false, hostReportsNoSessions: true })
+    try {
+      await harness.runtime.ingest(inbound('第一条'))
+      await harness.runtime.ingest(inbound('/switch e716'))
+      const reply = harness.sent.at(-1)?.text ?? ''
+      assert.match(reply, /有多个会话匹配「e716」/)
+      assert.match(reply, /更长的 id/)
+      assert.match(reply, /e716fd64 · 写周报/)
+      assert.match(reply, /e716aaaa · 查天气/)
+      // Nothing moved: the conversation this chat created is still the bound one.
+      const bound = (await harness.runtime.bindings())[0]?.sessionId
+      assert.ok(bound?.startsWith('session-') && !bound.includes('e716'))
+
+      // A longer id settles it, which is what the message told the user to send.
+      await harness.runtime.ingest(inbound('/switch e716f'))
+      assert.match(harness.sent.at(-1)?.text ?? '', /已切换到「写周报」/)
+    } finally {
+      harness.dispose()
+    }
+  } finally {
+    await removeHome(home)
+  }
+})
+
 /**
  * Session store writes made during this test file, in order.
  *
- * The list orders by a session directory's newest write time. A test creating two sessions in the
- * same millisecond gives them the same time, which makes the order depend on the filesystem's clock
- * granularity — so the store writes are spaced deliberately instead.
- *
- * The spacing counts **up** from the start of the run. Counting down from the current time looks
- * equivalent and is not: after enough writes the stamp goes negative, `utimes` throws on a negative
- * time, and the failure lands in whichever later test happens to be running. That is how this first
- * appeared — two tests that pass alone and fail in the full suite.
+ * The list orders by the timestamp *inside* each session record, so the record is what carries the
+ * order. Counting up from the start of the run: counting down from the current time looks equivalent
+ * and is not — after enough writes the stamp goes negative, `utimes` throws on a negative time, and
+ * the failure lands in whichever later test happens to be running. That is how this first appeared —
+ * two tests that pass alone and fail in the full suite.
  */
 let storeWriteSeq = 0
 const storeWriteBase = Date.now()
@@ -1463,10 +1573,16 @@ const storeWriteBase = Date.now()
 /**
  * Seed one session belonging to an arbitrary workspace.
  *
+ * The recorded last-prompt time is what makes "newest first" a fact rather than a tie to break. The
+ * file's mtime is stamped the same way and is deliberately not what the listing reads — the store
+ * uses the record, so a session's own history decides its place (see `session-index.test.ts` for the
+ * test that pins that).
+ *
  * @param home - Temporary DSH home.
  * @param workspace - Directory the session belongs to.
  * @param id - Session id.
  * @param title - Title the store should report.
+ * @param at - Recorded last-prompt time, defaulting to a stamp spaced a second after the last one.
  */
 async function seedStoredSession(
   home: string,
@@ -1480,14 +1596,20 @@ async function seedStoredSession(
   const transcript = join(folder, 'session.v4.jsonl.zstd')
   await writeFile(transcript, 'x')
   await mkdir(join(home, 'storages', 'session_projcache', 'sessions'), { recursive: true })
+  // A second apart, oldest first, so 「newest first」 is a fact rather than a tie to break.
+  const stamp = at ?? storeWriteBase + storeWriteSeq++ * 1_000
   await writeFile(
     join(home, 'storages', 'session_projcache', 'sessions', `${id}.json`),
     JSON.stringify({
-      record: { identity: { cwd: workspace }, rows: { title: { val: title } } },
+      record: {
+        identity: { cwd: workspace, createdAt: stamp },
+        rows: {
+          title: { val: title },
+          sessionListMetadata: { val: { blank: false, lastPromptAt: stamp } },
+        },
+      },
     }),
   )
-  // A second apart, oldest first, so 「newest first」 is a fact rather than a tie to break.
-  const stamp = at ?? storeWriteBase + storeWriteSeq++ * 1_000
   const seconds = stamp / 1_000
   await utimes(transcript, seconds, seconds)
 }
@@ -1544,12 +1666,16 @@ test('another workspace is counted and named as reachable, not listed by default
       assert.doesNotMatch(body, /解题辅导会话/)
       // But the user is told the rest exists, which workspaces they are in, and how to reach them —
       // otherwise they never learn that conversations from other projects can be switched to.
-      assert.match(body, /另有 1 个对话在别的工作区/)
-      assert.match(body, /some_project/, 'the workspace is named, not just counted')
+      assert.match(body, /另有 1 个对话在其它工作区（some_project）/)
       assert.match(body, /看全部对话/)
 
       await control(harness, 'list', 'all')
-      assert.match(harness.sent.at(-1)?.text ?? '', /解题辅导会话/, 'the wider list shows it')
+      const wider = harness.sent.at(-1)?.text ?? ''
+      assert.match(wider, /解题辅导会话/, 'the wider list shows it')
+      // Grouped, so a row's project is readable rather than inferred: the channel's own workspace by
+      // the name the user knows it by, and the other by its folder.
+      assert.match(wider, /【微信会话】/)
+      assert.match(wider, /【some_project】/)
     } finally {
       harness.dispose()
     }
@@ -1646,8 +1772,9 @@ test('the session tool switches, and the move is real', async () => {
     // printed beside that row. Comparing one prompt with the previous one would prove nothing: `/new`
     // does not prompt, so the previous prompt was the very session being left.
     const olderLine = rows[older] ?? ''
-    // The id sits on the line after its row, which is where the renderer puts it.
-    const olderShort = /([0-9a-f]{8})/.exec(body.split('\n')[body.split('\n').indexOf(olderLine) + 1] ?? '')?.[1]
+    // The id closes its own row, which is where the renderer puts it — one line per conversation, so
+    // a listing of ten fits in one WeChat message.
+    const olderShort = /  ([0-9a-f]{1,5})$/.exec(olderLine)?.[1]
     assert.ok(olderShort, `no short id on the older row: ${olderLine}`)
     assert.equal(shortId(String(harness.prompted.at(-1)?.sessionId)), olderShort)
     assert.ok(first !== undefined)

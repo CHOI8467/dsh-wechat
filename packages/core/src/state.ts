@@ -52,6 +52,19 @@ export interface ChannelState {
    */
   sentMessages: Record<string, Record<string, SentMessage[]>>
   /**
+   * Numbered session lists this channel has sent, so a quote of one still means what it meant.
+   *
+   * A number identifies a row of a listing, and a listing is a photograph of a machine that keeps
+   * moving: sessions run, others go quiet, and the same number means a different conversation a
+   * minute later. A quote names one exact message, so the numbering printed in it can be frozen here
+   * when it is sent and read back when the user replies — which is the difference between "switch to
+   * 3" meaning the row they are looking at and meaning whichever row happens to be third now.
+   *
+   * Keyed per account and then per conversation, like {@link ChannelState.sentMessages}, and bounded
+   * per conversation: only a recent list is ever quoted.
+   */
+  sessionLists?: Record<string, Record<string, SessionListMessage[]>>
+  /**
    * Proactive messages the service refused, waiting for the reply window to reopen.
    *
    * The window that allows a send is opened by an inbound message, so a push that arrives too late is
@@ -214,6 +227,115 @@ export interface SentMessage {
 
 /** How many sent messages to retain per conversation. */
 export const SENT_MESSAGE_HISTORY = 40
+
+/**
+ * One numbered session list the channel sent, kept so a quote of it resolves the same way twice.
+ *
+ * Only what a numbering needs is stored: the position of each row is its index in `sessions`, and the
+ * id and title are enough to switch to it. Times and workspace names are deliberately left out —
+ * they are what a *new* listing is for, and keeping them would make a frozen listing grow stale in
+ * ways the user could see.
+ */
+export interface SessionListMessage {
+  /** Server-assigned id of the message that printed this numbering. */
+  messageId: string
+  /** The rows in the order that message numbered them. */
+  sessions: { sessionId: string; title: string }[]
+  /** When it was sent, for pruning. */
+  at: number
+}
+
+/** How many numbered lists to retain per conversation. */
+export const SESSION_LIST_HISTORY = 5
+
+/**
+ * How much of a conversation title a stored listing keeps.
+ *
+ * A session is named from the user's first sentence, which is routinely a whole paragraph, and this
+ * file is rewritten in full on every change — a binding, a quota count, every reply. Five listings of
+ * ten paragraph-long titles would make that write megabytes. The title here only has to be recognisable
+ * in a switch confirmation, so the head of it is enough.
+ */
+export const SESSION_LIST_TITLE_LIMIT = 120
+
+/**
+ * Record one numbered listing, dropping the oldest when the record is full.
+ *
+ * @param state - State to mutate.
+ * @param accountId - Account the listing went out on.
+ * @param conversationId - Conversation it went to.
+ * @param entry - The listing: the message id and the rows it numbered.
+ * @param limit - How many listings to keep per conversation.
+ */
+export function rememberSessionList(
+  state: ChannelState,
+  accountId: string,
+  conversationId: string,
+  entry: SessionListMessage,
+  limit: number = SESSION_LIST_HISTORY,
+): void {
+  const perAccount = (state.sessionLists ??= {})
+  const perConversation = (perAccount[accountId] ??= {})
+  const history = (perConversation[conversationId] ??= [])
+  history.push({
+    messageId: entry.messageId,
+    sessions: entry.sessions.map((row) => ({
+      sessionId: row.sessionId,
+      title: row.title.slice(0, SESSION_LIST_TITLE_LIMIT),
+    })),
+    at: entry.at,
+  })
+  if (limit >= 0 && history.length > limit) history.splice(0, history.length - limit)
+}
+
+/**
+ * Find the listing a quoted message printed.
+ *
+ * Searched across every conversation of the account, for the same reason as
+ * {@link findSentMessage}: the quote carries an id and no conversation, and an id is unique.
+ *
+ * @param state - State to search.
+ * @param accountId - Account the quote arrived on.
+ * @param messageId - Id taken from the quote.
+ * @returns The recorded numbering, or undefined when that message was not a listing or has aged out.
+ */
+export function findSessionList(
+  state: ChannelState,
+  accountId: string,
+  messageId: string,
+): SessionListMessage | undefined {
+  for (const history of Object.values(state.sessionLists?.[accountId] ?? {})) {
+    // Newest first: a message id appears once, but scanning backwards costs nothing and matches the
+    // order the entries were written in.
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+      const entry = history[index]
+      if (entry?.messageId === messageId) return entry
+    }
+  }
+  return undefined
+}
+
+/**
+ * The newest listing sent into one conversation.
+ *
+ * Used when the user replies with a bare number and quotes nothing: the listing they most likely
+ * still have on screen is the one this conversation last received. Reading it rather than re-deriving
+ * the numbering from live sessions is what keeps a number from drifting onto a different conversation
+ * while the user is reading.
+ *
+ * @param state - State to search.
+ * @param accountId - Account the listing went out on.
+ * @param conversationId - Conversation it went to.
+ * @returns The recorded numbering, or undefined when none was sent.
+ */
+export function latestSessionList(
+  state: ChannelState,
+  accountId: string,
+  conversationId: string,
+): SessionListMessage | undefined {
+  const history = state.sessionLists?.[accountId]?.[conversationId]
+  return history?.[history.length - 1]
+}
 
 /**
  * A proactive message that could not be delivered, kept for the next open window.
@@ -422,6 +544,7 @@ export class StateStore {
       delete state.accounts[accountId]
       delete state.syncBufs[accountId]
       delete state.contextTokens[accountId]
+      if (state.sessionLists !== undefined) delete state.sessionLists[accountId]
       for (const [key, binding] of Object.entries(state.bindings)) {
         if (binding.accountId === accountId) delete state.bindings[key]
       }
@@ -455,6 +578,15 @@ function normalize(parsed: Partial<ChannelState>): ChannelState {
     sentMessages: isRecord(parsed.sentMessages)
       ? (parsed.sentMessages as Record<string, Record<string, SentMessage[]>>)
       : {},
+    /*
+     * Validated entry by entry, like the pending queue.
+     *
+     * This is the field the handbook warns about: `normalize` is an allowlist, so a field added to
+     * `ChannelState` and forgotten here is silently dropped on the next write — settings that save
+     * fine and are gone after a restart. It is also read back and *acted on*: a session list with a
+     * missing conversation or a row without an id would resolve a number to nothing at all.
+     */
+    ...(isRecord(parsed.sessionLists) ? { sessionLists: normalizeSessionLists(parsed.sessionLists) } : {}),
     /*
      * Filtered rather than trusted. This array is read back and sent to the user, so an entry with a
      * missing conversation or a non-string text would reach the send path as `undefined`.
@@ -491,6 +623,51 @@ function isPendingNotification(raw: unknown): raw is PendingNotification {
     typeof raw.text === 'string' &&
     typeof raw.queuedAt === 'number' &&
     (raw.path === undefined || typeof raw.path === 'string')
+  )
+}
+
+/**
+ * Keep only the numbered listings that are usable.
+ *
+ * A listing without a message id can never be found by a quote, and one with a malformed row would
+ * resolve a number to a session id of `undefined` — which reaches the session controller as a
+ * request to adopt nothing. Both are dropped rather than repaired: the cost is one stale number,
+ * and the alternative is guessing at what the user was looking at.
+ *
+ * @param raw - The stored `sessionLists` object.
+ * @returns The usable subset, in the stored order.
+ */
+function normalizeSessionLists(
+  raw: Record<string, unknown>,
+): Record<string, Record<string, SessionListMessage[]>> {
+  const result: Record<string, Record<string, SessionListMessage[]>> = {}
+  for (const [accountId, conversations] of Object.entries(raw)) {
+    if (!isRecord(conversations)) continue
+    const kept: Record<string, SessionListMessage[]> = {}
+    for (const [conversationId, history] of Object.entries(conversations)) {
+      if (!Array.isArray(history)) continue
+      const entries = history.filter(isSessionListMessage)
+      if (entries.length > 0) kept[conversationId] = entries
+    }
+    if (Object.keys(kept).length > 0) result[accountId] = kept
+  }
+  return result
+}
+
+/**
+ * Whether a stored entry is a usable numbered listing.
+ *
+ * @param raw - One entry from the state file.
+ * @returns True when it can resolve a number to a real session.
+ */
+function isSessionListMessage(raw: unknown): raw is SessionListMessage {
+  if (!isRecord(raw)) return false
+  if (typeof raw.messageId !== 'string' || raw.messageId === '') return false
+  if (typeof raw.at !== 'number' || !Number.isFinite(raw.at)) return false
+  if (!Array.isArray(raw.sessions) || raw.sessions.length === 0) return false
+  return raw.sessions.every(
+    (row: unknown) =>
+      isRecord(row) && typeof row.sessionId === 'string' && typeof row.title === 'string',
   )
 }
 

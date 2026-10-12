@@ -7,16 +7,18 @@
  * future change to either fails loudly here instead of quietly emptying the user's conversation list.
  */
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
 import {
+  compareSessionsNewestFirst,
   encodeWorkspaceDir,
   indexKeyFor,
   indexNamesFor,
   isSameWorkspace,
+  listAllStoredSessions,
   listStoredSessions,
 } from '../src/session-index.ts'
 
@@ -113,6 +115,168 @@ async function seedStore(
     await write(otherWorkspace.cwd, otherWorkspace.id, otherWorkspace.title)
   }
 }
+
+/**
+ * Record a session with an explicit last-prompt time, as the real store does.
+ *
+ * @param root - Temporary DSH home.
+ * @param cwd - Workspace the session belongs to.
+ * @param id - Session id.
+ * @param title - Title the store should report.
+ * @param lastPromptAt - Value for `sessionListMetadata.lastPromptAt`.
+ * @param mtimeSeconds - When to stamp the transcript file, to prove mtime is not read.
+ */
+async function seedRecorded(
+  root: string,
+  cwd: string,
+  id: string,
+  title: string,
+  lastPromptAt: number,
+  mtimeSeconds?: number,
+): Promise<void> {
+  const dir = join(root, 'sessions', encodeWorkspaceDir(cwd), id)
+  await mkdir(dir, { recursive: true })
+  const transcript = join(dir, 'session.v4.jsonl.zstd')
+  await writeFile(transcript, 'x')
+  await mkdir(join(root, 'storages', 'session_projcache', 'sessions'), { recursive: true })
+  await writeFile(
+    join(root, 'storages', 'session_projcache', 'sessions', `${id}.json`),
+    JSON.stringify({
+      version: 7,
+      record: {
+        identity: { cwd, createdAt: 1 },
+        rows: { title: { val: title }, sessionListMetadata: { val: { lastPromptAt } } },
+      },
+    }),
+  )
+  if (mtimeSeconds !== undefined) await utimes(transcript, mtimeSeconds, mtimeSeconds)
+}
+
+test('the ordering key is the session record, not the file that happens to be newest', async () => {
+  /*
+   * The bug this pins: `/list all` showed a different "上次时间" for the same conversation on every
+   * run, and a different order to match. The time came from the newest mtime in the session folder,
+   * which *any* write moves — a background turn, a tool call, the store compacting itself. The record
+   * inside the index moves only when the conversation does.
+   *
+   * The mtimes here are deliberately the wrong way round, so a listing that read them would come out
+   * backwards.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-store-'))
+  try {
+    const workspace = join(home, 'dsh_wechat')
+    const newerId = 'session-bbbb2222-bbbb2222-x'
+    const olderId = 'session-aaaa1111-aaaa1111-x'
+    await seedRecorded(home, workspace, newerId, '新的', 1_700_000_100_000, 1_000_000)
+    await seedRecorded(home, workspace, olderId, '旧的', 1_700_000_000_000, 2_000_000)
+
+    const listed = await listStoredSessions(home, workspace)
+    assert.deepEqual(
+      listed.map((session) => session.title),
+      ['新的', '旧的'],
+    )
+    // The value itself is the recorded one, not a file timestamp.
+    assert.equal(listed[0]?.updatedAt, 1_700_000_100_000)
+    assert.equal(listed[1]?.updatedAt, 1_700_000_000_000)
+  } finally {
+    await removeHome(home)
+  }
+})
+
+test('equal timestamps still order completely, and the same store lists identically twice', async () => {
+  /*
+   * The second half of the same bug. Timestamps collide in practice — a bulk import, a seeded
+   * profile, several sessions created in one second — and a sort with only one key leaves ties in
+   * whatever order the directory walk produced. The store must not be able to reach the output.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-store-'))
+  try {
+    const workspace = join(home, 'dsh_wechat')
+    const stamp = 1_700_000_000_000
+    await seedRecorded(home, workspace, 'session-cccc3333-cccc3333-x', '丙', stamp)
+    await seedRecorded(home, workspace, 'session-aaaa1111-aaaa1111-x', '甲', stamp)
+    await seedRecorded(home, workspace, 'session-bbbb2222-bbbb2222-x', '乙', stamp)
+
+    const first = await listStoredSessions(home, workspace)
+    const second = await listStoredSessions(home, workspace)
+    assert.deepEqual(
+      first.map((session) => session.sessionId),
+      second.map((session) => session.sessionId),
+    )
+    // Byte-for-byte on the rendered value, which is what the user sees.
+    assert.equal(JSON.stringify(first), JSON.stringify(second))
+    // The tie is broken on the session id, ascending.
+    assert.deepEqual(
+      first.map((session) => session.title),
+      ['甲', '乙', '丙'],
+    )
+  } finally {
+    await removeHome(home)
+  }
+})
+
+test('the groups of a full listing come out in a fixed order', async () => {
+  /*
+   * The map a grouped listing is rendered from keeps insertion order, so leaving it to the directory
+   * walk put the workspaces in a different order on every run — the same instability one level up.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-store-'))
+  try {
+    const alpha = join(home, 'alpha')
+    const beta = join(home, 'beta')
+    await seedRecorded(home, beta, 'session-bbbb2222-bbbb2222-x', '贝塔', 1_700_000_500_000)
+    await seedRecorded(home, alpha, 'session-aaaa1111-aaaa1111-x', '阿尔法', 1_700_000_500_000)
+    await seedRecorded(home, alpha, 'session-cccc3333-cccc3333-x', '阿尔法旧', 1_700_000_000_000)
+
+    const grouped = await listAllStoredSessions(home)
+    const order = [...grouped.keys()]
+    // Equal recency, so the path decides — and a path is a property of the store, not of the walk.
+    assert.deepEqual(order, [alpha, beta])
+    assert.deepEqual(
+      (grouped.get(alpha) ?? []).map((session) => session.title),
+      ['阿尔法', '阿尔法旧'],
+    )
+    // Asked twice, answered the same way.
+    assert.deepEqual([...(await listAllStoredSessions(home)).keys()], order)
+  } finally {
+    await removeHome(home)
+  }
+})
+
+test('a record with no last-prompt time falls back to when it was created', async () => {
+  // Older index entries predate `sessionListMetadata`, and a session created but never prompted has
+  // no prompt time at all. Reporting 0 for both would sink every old conversation to the bottom of
+  // the list, which is not what "when did I last use this" means.
+  const home = await mkdtemp(join(tmpdir(), 'dsh-store-'))
+  try {
+    const workspace = join(home, 'dsh_wechat')
+    const indexDir = join(home, 'storages', 'session_projcache', 'sessions')
+    await mkdir(indexDir, { recursive: true })
+    const id = 'session-dddd4444-dddd4444-x'
+    await mkdir(join(home, 'sessions', encodeWorkspaceDir(workspace), id), { recursive: true })
+    await writeFile(
+      join(indexDir, `${id}.json`),
+      JSON.stringify({ record: { identity: { cwd: workspace, createdAt: 1_700_000_123_456 } } }),
+    )
+
+    const listed = await listStoredSessions(home, workspace)
+    assert.equal(listed[0]?.updatedAt, 1_700_000_123_456)
+    assert.equal(listed[0]?.title, '')
+  } finally {
+    await removeHome(home)
+  }
+})
+
+test('the comparator is total, so it cannot leave a tie to the sort', () => {
+  const stamp = 1_700_000_000_000
+  const a = { sessionId: 'session-aaaa1111-aaaa1111-x', updatedAt: stamp }
+  const b = { sessionId: 'session-bbbb2222-bbbb2222-x', updatedAt: stamp }
+  assert.ok(compareSessionsNewestFirst(a, b) < 0)
+  assert.ok(compareSessionsNewestFirst(b, a) > 0)
+  assert.equal(compareSessionsNewestFirst(a, { ...a }), 0)
+  // Newer always wins, whatever the ids are.
+  assert.ok(compareSessionsNewestFirst({ ...b, updatedAt: stamp + 1 }, a) < 0)
+})
 
 test('sessions of the channel workspace are listed with their titles', async () => {
   const home = await mkdtemp(join(tmpdir(), 'dsh-store-'))

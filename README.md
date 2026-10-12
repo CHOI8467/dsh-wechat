@@ -162,9 +162,11 @@ Type these to control which DSH conversation you are talking to:
 | Command | What it does |
 |---|---|
 | `/new` | Start a fresh conversation. Anything after it becomes the title: `/new 修复登录` starts a conversation called 「修复登录」. Without one, the conversation gets a name from your first message |
-| `/list` | Conversations in the WeChat workspace, newest first |
-| `/list all` | Every conversation, including other workspaces |
+| `/list` | Conversations in the WeChat workspace only, grouped by workspace, newest first |
+| `/list all` | Every conversation, grouped by workspace too |
 | `/switch 3` | Move to number 3 in that list |
+| `/switch e716` | Move by the **short id printed at the end of the row** — independent of numbering, so it never goes stale |
+| quote the list, then `/switch 3` | Move to number 3 **of that listing**, frozen in the message you quoted |
 | `/model` | List the models, marking the one in use |
 | `/model 2` | Switch to number 2, or send a model name instead |
 | `/current` | Which conversation you are in |
@@ -172,6 +174,11 @@ Type these to control which DSH conversation you are talking to:
 | `/help` | This list |
 
 **Spaces are optional**: `/switch3`, `/switch 3` and `/switch:3` all work.
+
+**Numbers go stale.** Conversations run while you read the list, so by the time you reply "3" the third
+row may be a different one. That is why every row ends with a short id of **at most five characters** —
+`/switch` takes that instead — and why quoting the listing and replying with a number resolves against
+the numbers *that message* printed.
 
 **Plain language works too** — "switch to the other one", "what conversations do I have", "stop". The
 agent judges the intent rather than matching fixed rules, and a switch tells you whether it succeeded
@@ -224,7 +231,7 @@ pnpm install
 pnpm build              # compiles only, leaving @dsh-wechat/core imports for pack to rewrite
 pnpm run dist           # build + inline core: the loadable form a Git install needs
 pnpm typecheck
-pnpm test               # 233 tests
+pnpm test               # 248 tests
 pnpm check              # build + typecheck + test
 pnpm run pack           # run dist first
 pnpm run verify-pack    # unpack, check the manifest's files, mount it as DSH would
