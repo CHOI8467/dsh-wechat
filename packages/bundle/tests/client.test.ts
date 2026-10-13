@@ -16,6 +16,7 @@ import { readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { createContext, runInContext } from 'node:vm'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const clientPath = join(here, '..', 'client.js')
@@ -1089,4 +1090,67 @@ test('the page and the host agree on the route prefix', async () => {  // The pa
     PREFIX,
     'ROUTE_PREFIX in routes.ts must equal the page\'s PREFIX: it is what the host answers on',
   )
+})
+
+/**
+ * The bundle is a classic script, and the shell evaluates it again on every rebuild.
+ *
+ * It is not a module: the shell loads it as an external `<script src=…?rev=…>`, so every revision
+ * is a *new classic script* in the *same realm* and the *same global lexical scope*. A top-level
+ * `let`, `const` or `class` is therefore declared twice once a rebuild arrives, and the second
+ * script fails to parse:
+ *
+ *     Uncaught SyntaxError: Identifier 'PREFIX' has already been declared
+ *
+ * The failure is silent where it matters. Parsing happens before the file's first statement, so the
+ * registration never runs, no new copy replaces the entry, and the page keeps running the previous
+ * revision until it is reloaded — a rebuild that looks like it did nothing. The mechanics are in the
+ * shell's own packages: `dsh-client-modules` appends a `<script>` element for the bundle URL with
+ * the next revision, and `dsh-client-hmr` calls `entries.reload(id, rev)` for a `rebuilt` frame.
+ *
+ * Hence this test: run the file twice in one context and require *both* runs to parse and register.
+ * "Does not throw" alone would be satisfied by a guard that skips the second registration, which
+ * reproduces the very symptom — a rebuilt bundle that never takes effect.
+ */
+test('the bundle can be evaluated again after a rebuild, in the page\'s own scope', async () => {
+  const source = await readFile(clientPath, 'utf8')
+  const registrations = []
+  // The facade the shell installs, plus the globals a classic script in the page can see. Only
+  // `window` is read while this file evaluates today; the rest are present so that a top-level
+  // mention of one fails here as a name error instead of passing on a browser tolerance.
+  const context = createContext({
+    window: { __ModuleLoader__: { load: (registration) => registrations.push(registration) } },
+    navigator: { language: 'zh-CN' },
+    document: { documentElement: { lang: 'zh-CN' } },
+    fetch: () => Promise.resolve({}),
+    Blob: class {},
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+    console,
+  })
+
+  const evaluate = (revision) =>
+    runInContext(source, context, { filename: `client.js?rev=${revision}` })
+
+  assert.doesNotThrow(() => evaluate('first'), 'the first evaluation must succeed')
+  assert.doesNotThrow(
+    () => evaluate('rebuilt'),
+    'a rebuild evaluates the whole file again, in the scope the page already has',
+  )
+  assert.deepEqual(
+    registrations.map((registration) => registration.id),
+    ['dsh-wechat-plugin', 'dsh-wechat-plugin'],
+    'both copies register under the id whose entry they replace',
+  )
+
+  /*
+   * And the reason it works: the file declares nothing in the shared scope. `var` and `function`
+   * are tolerated by a second evaluation, but they still land in a realm the whole application
+   * shares, so a name as ordinary as `PREFIX` would be a collision waiting to happen.
+   */
+  const declared = runInContext(
+    'typeof PREFIX + "|" + typeof HANDBOOK_URL + "|" + typeof reportFailure',
+    context,
+  )
+  assert.equal(declared, 'undefined|undefined|undefined', 'the bundle must keep to its own scope')
 })

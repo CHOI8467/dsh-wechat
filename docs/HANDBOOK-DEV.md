@@ -850,6 +850,108 @@ DSH 自己的目录选择器插件（`dsh-client-ui-directory-picker-native`）�
    于是"重启才生效"这种**正常**行为在用户眼里与"保存失败"完全一样。诊断区现在并列两行，
    这不是冗余信息，是把两种故障分开的最小代价。
 
+## 4.16 重建后的客户端 bundle 永远不生效：classic script 的顶层绑定会被重复求值
+
+> 这是**用户报告的 bug**（issue #3），也是同一形状的第五次：**失败不带声音**。前四次分别在宿主与服务
+> 之间（§3.6 谎报成功、§3.7 best effort、§4.14 连日志都没有）和浏览器里（§4.15 按钮没反应），
+> 这一次在**加载器**里 —— 连一行日志都留不下，因为抛出它的是**解析器**，而解析发生在文件的第一句之前。
+
+**现象**：应用开着的时候重新构建客户端 bundle，壳推 `rebuilt` 帧并重新求值入口，控制台报：
+
+```
+Uncaught SyntaxError: Identifier 'PREFIX' has already been declared
+```
+
+**症状的另一半更重要**：**重建后的 bundle 永远不生效**，页面继续跑旧副本，直到整页刷新。报错只解释
+了原因，静默才是伤害。
+
+### 根因：两个顶层 `const`
+
+`client.js` 在**文件顶层**（loader factory 之外）声明了两个绑定（行号是修复前的位置）：
+
+| 位置 | 绑定 | 第二次求值会怎样 |
+|---|---|---|
+| `client.js:20` | `const PREFIX = '/.dsh-wechat-plugin'` | **SyntaxError** |
+| `client.js:31` | `const HANDBOOK_URL = 'https://github.com/…'` | **SyntaxError** |
+| `client.js:34` | `function reportFailure` | 无事 —— 函数声明可以重复声明，`var` 同理 |
+
+**页面里所有 classic script 共用一个全局词法作用域**（global lexical environment 属于 realm，不属于
+单个 script），所以同一个文件被求值第二次时，`const` 就是重复声明。顶层还有一句
+`window.__ModuleLoader__.load(…)`，那一句**必须**每次都跑 —— 它不是问题，是机制。
+
+### 为什么"重建过但什么都没发生"（每条都有出处）
+
+| 事实 | 出处（`app.asar` 内，用 `scripts/asar-extract.mjs --grep` 可复核） |
+|---|---|
+| 每个 revision 是**一个新的外链 classic script** | `@deepseek-ai/dsh-client-modules/lib/client.js`：`defaultLoadBundle` = `document.createElement("script")` + `document.head.append(el)`；URL 由 `atRevision()` 换掉 `rev=` 的值 |
+| `rebuilt` 帧会**重新求值整个文件** | `@deepseek-ai/dsh-client-hmr/lib/client.js`：`entries.reload(frame.id, frame.rev)` |
+| 重新求值 = 先作废旧工厂，再 import 新的 | `dsh-client-modules` 的 `reload()` → `replace()`：`invalidateForReplacement(id, rev)` → `modules.import(id, "", {})` |
+| **解析失败等于什么都没发生** | 同文件 `arrive()` 的注释原文：`a script that loaded without registering this row (a parse error registered nothing, …) is never re-executed` |
+| 旧条目继续服务，直到刷新 | 用户报告 |
+
+**关键在第四行**：语法错误发生在**第一句之前**，`window.__ModuleLoader__.load(…)` 根本没执行 ⇒ 没有新
+工厂注册 ⇒ 没有东西替换旧条目。
+
+### 修法：整个文件包一层 IIFE（而不是把那两个 `const` 搬进 factory）
+
+两种都能修，选了前者：
+
+| 理由 | 说明 |
+|---|---|
+| **结构上成立** | 把两个名字搬进 factory 只修了**这两个名字**；下次有人在顶层加一个 `const`（照抄官方模板很容易）就复发。给文件一个自己的作用域，**这一类**就不存在了 —— 与 §4.13「把第二份删掉」同一条思路 |
+| **零行为变化** | 与用户在本机的临时方案一致（两处各插一行）。不加 `'use strict'`，不改任何表达式 |
+| **diff 只有两行代码** | 不重排缩进：`scripts/preview.mjs` 是按**源码里 6 空格缩进**定位语言包的，而整文件重排会把这两行实质改动埋进 1600 行 diff。文件末尾留了一句注释说明为什么 body 停在 0 缩进 |
+
+### 验证
+
+| 测试 | 断言的是什么 |
+|---|---|
+| `client.test.ts`「the bundle can be evaluated again after a rebuild, in the page's own scope」 | 用 `node:vm` 在**同一个 context** 里把 `client.js` **连续求值两次**：两次都不抛；两次都注册（`id` 各一次）；求值后 `typeof PREFIX` / `typeof HANDBOOK_URL` / `typeof reportFailure` 全是 `undefined` |
+
+**为什么必须断言"注册了两次"，不能只断言"不抛错"**：一个"第二次跳过注册"的守卫也能让"不抛错"成立，
+而那恰好重现要修的症状 —— **重建不生效**。
+
+**反向验证**：只删掉那两行 wrapper（其余一字不动）→ 这条测试立刻变红，报的正是
+`Identifier 'PREFIX' has already been declared`，其余 27 条 client 测试仍全绿；恢复后 28/28 全绿。
+
+**等价性核对**（比"测试通过"更硬的那句话）：把两行 wrapper 从新文件里剥掉，再与 `HEAD` 逐行比对 ——
+差异只剩头部注释（纯文档）。**功能改动就是那两行。**
+
+全套 **291 项全绿**（基线 290）。
+
+### 同类检查：结论是只有 `client.js` 需要改
+
+| 产物 | 会被重复求值吗 | 判断依据 |
+|---|---|---|
+| `packages/bundle/client.js` | **会** | 壳按 revision 用 `<script src>` 加载（见上） |
+| `packages/bundle/cli.js`（`dsh-wechat-send`） | **不会，不改** | ① `packages/bundle/package.json` 是 `"type": "module"`（它还用了顶层 `await`），ESM 的顶层绑定在**模块作用域**，不进入全局词法作用域；② ESM 的模块表按 URL 缓存，同一个 realm 里第二次 `import()` 不再执行模块体；③ 它是 `bin`，由 Node 起**新进程**跑，末尾 `process.exit(code)` |
+| `lib/**`、`dist/core/**` 等构建产物 | 不会 | 都是 ESM，只被 `import` |
+| `scripts/preview.mjs` 产出的 `preview-*.html` | 不会 | 纯 HTML：只内联样式与标记，**没有脚本** |
+| pack 出来的 tarball | 不会 | 不是被求值的东西 |
+
+全仓 grep `__ModuleLoader__` **只命中 `client.js`** —— 它是本仓库唯一的 classic script 产物。
+
+> **顺带记录（不在本次改动范围）**：`packages/bundle/cli.js` 那 19 行启动器**没有任何测试** ——
+> `cli.test.ts` 直接 import 的是 `src/cli.ts` 的 `runCli`。它的结论靠配置与加载方式，不靠测试。
+
+### 教训
+
+1. **"同一个文件"不等于"同一个脚本"。** 壳每次换的是 **URL**，不是**作用域**；URL 一变就重新求值，
+   而全局词法作用域**每个 realm 只有一份，不随脚本重建**。
+2. **解析期的失败没有现场。** 这次连一行 `boot.log` 都留不下：语法错误发生在第一句之前，
+   `reportFailure` 还没来得及存在。**凡是"整份产物能在解析阶段失败"的加载方式，回归测试就必须真的
+   把产物求值两次。**
+3. **测试的接缝选错，等于没测。** 本仓库原有的 `client.test.ts` 用 `new Function(source)` 装载文件 ——
+   那层函数作用域**恰好把这个问题藏住了**，所以 27 条测试全绿而 bug 照样出门。用户的复现
+   （`vm.runInContext` 两次）之所以有效，是因为它复刻了壳的求值方式：**在同一个作用域里**。
+   **测试要按运行时的装载方式来装，不要按方便的方式来装。**
+4. **结构性的修法优于点状的修法**（同 §4.13）：搬两个名字只修两个名字；给文件一个作用域，这一类没了。
+   而"以后不要在顶层声明"这种纪律**不该靠人记**。
+5. **把结论落成"判断依据"，不要落成"我觉得不用改"。** `cli.js` 不改，是因为能列出三条可核对的依据
+   （模块作用域 / 模块缓存 / bin 新进程）；`preview.mjs` 不改，是因为去读了它写出来的 HTML。
+
+---
+
 ## 5. 认证：OIDC，不要用 token
 
 **工作流里没有任何密钥。** 用 GitHub 签发的 OIDC 身份向 npm 证明"我确实是这个仓库的这条工作流"。
@@ -927,7 +1029,7 @@ npm view dsh-wechat-plugin versions --registry=https://registry.npmjs.org
 pnpm build              # 只编译，保留 @dsh-wechat/core 引用（pack 要靠它改写）
 pnpm run dist           # build + 内嵌 core：Git 安装要的可直接加载形态
 pnpm typecheck          # 含 examples/
-pnpm test               # 290 项
+pnpm test               # 291 项
 pnpm run check:install  # 两条安装路径的约束
 pnpm run pack           # 需要先 build，不能先 dist
 pnpm run verify-pack    # 解包、校验清单、按 DSH 的方式挂载一次
@@ -1073,6 +1175,7 @@ README 中英两版、用户手册、以及 Hub 的提交，都写了这句话�
 | **设置改了没反应** | `boot.log` 里的 `settings:` 行：有 `saved … 旧值 -> 新值` 说明保存到了（再看**新旧值是否相同**，相同就是主机没收下）；**一行都没有**说明那次保存没发出来，问题在页面（见 §4.15） |
 | **设置存了但没生效** | 「会话工作目录」是启动时解析的：`/status` 的 `diagnostics.settingsWorkspace`（设置里存的）与 `diagnostics.workspace`（正在用的）不一致，就是**缺一次重启** |
 | 收不到回复 | `boot.log` 的 `outbound` 行；没有就是流解析问题 |
+| **改完插件、重建后设置页还用旧代码**（控制台报 `Identifier '…' has already been declared`） | 客户端 bundle 是不是又在**顶层**声明了 `let`/`const`/`class`：壳每个 revision 都把它当新脚本重新求值（见 §4.16） |
 | **发消息完全没有回复，而且日志里一行错都没有** | **绑定会话是不是被归档了**（`workspaceRegistry.archivedSessionIds`，持久副本在 `storages/workspace.json`）或磁盘上已经不存在；`boot.log` 里的 `session-state:` 行说的就是这件事（见 §4.14） |
 | 装完不生效 | profile 的 `bundles` 里有没有它；`dsh.profile.bundles` |
 | 用户装到旧版 | profile 里锁的版本；锁文件；pnpm 缓存 |

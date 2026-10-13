@@ -10,13 +10,26 @@
  * login handshake lives on the host: the page can be closed and reopened mid-scan
  * without losing the QR code.
  *
- * The registration call is deliberately bare and runs at module scope. Wrapping it
- * in a guard would swallow a failure at precisely the moment nothing else can report
- * it: a client entry that never registers simply fails activation, with no trace
- * anywhere. Diagnostics therefore live inside the factory and `apply`, after
- * registration has already happened.
+ * The registration call is deliberately bare and unguarded, and it runs the moment
+ * the file is evaluated. A guard would swallow a failure at precisely the moment
+ * nothing else can report it: a client entry that never registers simply fails
+ * activation, with no trace anywhere. Diagnostics therefore live inside the factory
+ * and `apply`, after registration has already happened.
+ *
+ * The whole file is one immediately-invoked function, and that is load-bearing
+ * rather than packaging taste. The shell loads this as an *external classic script* —
+ * a fresh `<script src=…?rev=…>` per revision — so a rebuild evaluates the file again
+ * in the realm the page already has. A top-level `let`, `const` or `class` would then
+ * be declared a second time, and the new copy would die with `Identifier '…' has
+ * already been declared` before reaching its first statement: nothing registers, the
+ * previous revision keeps running, and the rebuild looks like it did nothing at all.
+ * (`var` and `function` redeclare silently, which is why only lexical declarations
+ * break — but they still land in a scope the whole application shares, so a name as
+ * ordinary as `PREFIX` could collide with another plugin.) One function scope per
+ * evaluation makes the file safe to evaluate as many times as the shell likes.
  */
 
+(function () {
 const PREFIX = '/.dsh-wechat-plugin'
 
 /**
@@ -1613,3 +1626,7 @@ a.dsh-wechat-button { text-decoration: none; }
     return { name, inject, apply }
   },
 })
+})()
+
+// That closes the function opened beside the header comment. The body is left at column 0 so the
+// wrapper costs two lines instead of indenting the whole file.
