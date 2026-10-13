@@ -1089,6 +1089,93 @@ call after the declaration is committed*。也就是说，壳一旦声明了这�
 
 ---
 
+## 4.18 推理等级：`reasoningEffort`，模型选择里的第三个字段
+
+**需求**：用户说「现在切换模型不能换推理等级，加上这个功能」。所以先把机制查清（**依据全部来自
+`app.asar` 里的 DSH `0.2.0-rc.2`，与仓库 `_dsh-src` 解包一致**），再动手。
+
+### 机制（不是猜的，逐条给出处）
+
+**推理等级 = `reasoningEffort`，是「模型选择」三元组里的第三个字段**，不是模型 id 的一部分，也不是
+一个独立的全局设置：
+
+```ts
+// dsh-api-session-controller/lib/types/model-selection-projection.js
+const modelSelectionSchema = z.object({
+  provider: z.string().min(1),
+  model: z.string().min(1),
+  reasoningEffort: z.string().min(1).optional(),
+})
+```
+
+| 问题 | 答案 | 出处 |
+|---|---|---|
+| 有哪些合法取值 | **由 provider 适配器按「确切模型」公布**：`llm.resolveModelInfo(provider, model).reasoning = { efforts: [{id, name, description?}], defaultEffort? }` | `dsh-api-session-controller/lib/types/catalog.js`（`buildModelCatalog` 就是把它照搬给前端的）；`dsh-llm/lib/index.js` 的 `normalizeModelInfo` 校验（空集合、重复 id、未知 default 都会抛） |
+| 内置适配器给的是什么 | `off` / `low` / `high` / `max`，名字就是 `Off/Low/High/Max`；`thinking: disabled` 时**只公布 `off`** | `dsh-llm-deepseek/lib/index.js`：`REASONING_EFFORTS` / `OFF_ONLY_REASONING_EFFORTS`，以及 `modelInfo()` 里的 `reasoning:` |
+| 谁是权威 | 适配器。插件**不认识任何取值**——它只把列表里印过的 id 原样送回去 | 同上 |
+| 怎么读当前值 | `sessionController.projections({ sessionId })` → `values.modelSelection` = `{ lastUsed, next }`，三个字段就是上面那个 schema。**冷读**：不激活 agent；会话不存在时返回 `null` | `dsh-api-session-controller/lib/types/index.js` 的 `projections()`；投影本身在 `model-selection-projection.js`（`next = pending ?? lastUsed`，`lastUsed` 由 `request/header` 事件推进） |
+| 怎么设置 | `sessionController.selectModel({ sessionId, provider, model, reasoningEffort? })` → 校验后装给**下一次请求**，并在后台把整份选择存成部署默认 | `.../lib/types/commands.js` 的 `SessionCommandHandler.selectModel()` |
+| 取值不合法会怎样 | `llm.resolveCallConfig` 在**任何网络 I/O 之前**抛 `UNSUPPORTED_REASONING_EFFORT`；`selectModel` 把它包成 `session/model-unavailable`，`message` 就是原话 | `dsh-llm/lib/index.js` 的 `resolveCallWithInfo()`；`commands.js` 的 `catch` |
+| 省略等级时呢 | 适配器默认值**被显式填上**（`effective = requested ?? reasoning.defaultEffort`，不同才写回），所以 `selectModel` 的返回值里总是有个具体等级 | 同上。桌面选择器读的就是这个值：`dsh-client-ui-model-selection/lib/client.js`（`state.current?.reasoningEffort ?? reasoning?.defaultEffort`） |
+| 只改等级、不改模型 | 同一个 provider/model 再调一次 `selectModel`，只是 `reasoningEffort` 变了。**路由没变，不会追加「model changed」的历史提示**；只改等级本来也不该有 | `dsh-agent/lib/types/model-selection.js`（只在 provider/model 变化时 `modelSwitchNotice`），并写明「An absent selected effort clears any inherited effort」 |
+
+**一句话**：换等级 = 拿当前 `{provider, model}` 再调一次 `selectModel`，把 `reasoningEffort` 换成
+目标等级。所以这个功能完全不需要新的宿主服务。
+
+### 我们的做法
+
+| 决定 | 为什么 |
+|---|---|
+| 命令做成 `/model 等级 <等级>`，以及 `/model <模型> 等级 <等级>` | 一个**关键字**切开两半，不做位置猜测。`/model 2 等级 high` 里「哪一段是模型名」不需要判断，而模型名可以带空格。按**后缀**认 `等级`（所以 `推理等级`、`思考等级` 一并可用），英文认 `level`/`effort`/`reasoning` |
+| 为什么不做成 `/model 2 high`（按位置） | `Max` 是真实存在的模型名后缀（`Qwen2.5-Max`）。按位置切会让 `/model Qwen Max` 变成「切到 Qwen、等级 max」，而用户说的是模型叫 `Qwen Max`。显式关键字没有这个歧义 |
+| 列表里**同时**印出每个模型的等级，并标出「当前」 | 等级在手机上**没有别的地方能看到**。`（当前）` 只给会话真正在用的那个模型；别的模型标 `（默认）`，因为那是切过去会落到的等级——把别人的默认叫「当前」是假话 |
+| 普通 `/model 2` 仍然使用**目标模型自己的默认等级** | 与桌面选择器一致（那里的 `select(...)` 也是 `reasoningEffort ?? 该模型 defaultEffort`）。而且**回复里现在会明说等级**，所以这个决定不再是不可见的：`已把「X」切换到 Y（Z）。\n推理等级：中\n<id>` |
+| `/model` 的「当前」从**会话自己的投影**读 | 目录是部署级的，而选择是会话级的。此前标的是部署默认，桌面里给某个会话单独选的模型会被标错——用户会照着错的那一行读等级。**可选**：`projections?` 用 `?.()` 调用，方法不在、返回 `null`、或抛错时一律退回部署默认（旧行为），抛错额外写一行 `boot.log`。绝不因为读不到而让 `/model` 失败 |
+| 工具沿用 `model_control`，新增 `set_level`，`switch` 多一个可选 `level` | 与既有形状一致（`action` + 参数）。分成两个动作而不是一个，因为「换模型」和「只换等级」是两件不同的事，一个动作兼顾两者就得猜用户要哪个 |
+| 失败必须**读回复文本**才算数 | 命令以「给建议」而不是抛错来回答，所以工具结果不能假定成功。`MODEL_FAILURE_PATTERN` 扩到 `/^(找不到模型|找不到等级|当前|切换模型失败|切换推理等级失败)/`，与命令里的失败开头**同名常量**（`NOT_FOUND_LEVEL` 等）保持一处定义 |
+
+### 验证
+
+新增 21 条测试（core 12 + plugin 9），全套 **315 项全绿**（基线 294）：
+
+| 测试 | 断言的是什么 |
+|---|---|
+| core「/model shows each model's reasoning levels…」 | 标题带当前模型**和**当前等级；当前模型标 `（当前）`、别的模型标 `（默认）`；提示里的例子取自目录数据 |
+| core「/model asks the host about the session…」 | `listModels` 拿到的是**绑定的那个会话 id**（标错模型就是从这条漏出去的） |
+| core「/model 等级 names the levels…」 | 只列等级、**什么都不改** |
+| core「/model 等级 low changes only the level…」 | `selectModel` 收到的是同一个 provider/model + 新等级，回复说的是「推理等级切到」 |
+| core「/model <模型> 等级 <等级>…」 | 一步同时换模型和等级；等级按**名字**匹配（`MAX` → `max`）；id 照旧印出来 |
+| core「…lists the ones it does」 | 未知等级 → `找不到等级「…」` + 该模型**全部**合法等级，且没有发生选择 |
+| core「…on a model with no levels says so…」 | `/model 等级 high` 与 `/model 1 等级 high` 两条路都答 `当前模型不支持推理等级` |
+| core「a level switch the host refuses is reported…」 | 宿主抛错 → `切换推理等级失败：<原话>`，且没有记录成成功 |
+| core「a gateway with no catalog, and one that cannot select…」 | 没有目录 / 没有 `selectModel` 各自的降级话术 |
+| core「a level is named explicitly…」/「matched by id or by name…」 | 解析规则（关键字、多词模型名、`等级`后缀、英文关键字）与等级匹配（不partial） |
+| plugin「/model marks the session's own model and level…」 | **端到端**：会话切到 reasoner 后，`/model` 标的是 reasoner · 中，而不是部署默认的 V3.2 |
+| plugin「a host that cannot report the session's model…」 | `projections` **不在**和**抛错**两种组合：清单照常发出、标部署默认、等级照样能切 |
+| plugin「a failed session-model read is recorded…」 | 退化的那一行日志真的写了（会话 id + 宿主原话）——§3.7/§4.14 的纪律 |
+| plugin「a level switch the host refuses…」 | 工具返回 `ok:false`、原因里带命令的失败话术，**用户被直接告知** |
+| plugin「the model tool changes the level on its own…」/「switches model and level together…」 | 自然语言那条路：`set_level`/`switch`+`level` 都落到对的 `sessionId`、`provider`、`model`、`reasoningEffort` |
+| plugin「the model tool refuses a level action with no level…」 | `set_level` 不带 `level` 直接失败，不变成「列个等级然后报成功」 |
+
+**反向验证**（两次，都恢复到全绿）：
+
+1. 把 `MODEL_FAILURE_PATTERN` 里的 `切换推理等级失败` 去掉 → plugin「a level switch the host refuses…」与
+   core 的同名用例**同时变红**：工具把一次被拒的切换报成了 `ok:true` —— 正是这个模式存在的原因。
+2. 去掉 `#modelInUse` 里的 `try/catch`（让 `projections` 抛出去）→ plugin「a host that cannot report…」
+   与「a failed session-model read is recorded…」**同时变红**，日志里那行是
+   `处理消息失败: session query unavailable`：用户拿到的是失败，而不是标着部署默认的清单。恢复后全绿。
+
+### 没把握的地方（如实记录）
+
+- **只在 `0.2.0-rc.2` 上核对**：`projections` 这个读法在本机 `app.asar` 与仓库里解包的 `_dsh-src`
+  里都在，但**没有在别的桌面端/内核版本上核对过**。所以它做成了可选：方法不在就只有「标部署默认」
+  这一个损失，不会变成启动失败或命令失败（§4.17 的同一条做法）。
+- **等级的中文名不在我们手里**：内置适配器公布的是 `Off/Low/High/Max`，列表里印的就是这些。用户
+  想打「高」得先看列表里写的是 `High`。**没有做别名表**——那会是我们替适配器决定什么叫「高」。
+- `/model 2 high`（按位置给等级）**没有实现**，理由见上表；如果用户觉得别扭，这是要改的第一处。
+
+---
+
 ## 5. 认证：OIDC，不要用 token
 
 **工作流里没有任何密钥。** 用 GitHub 签发的 OIDC 身份向 npm 证明"我确实是这个仓库的这条工作流"。
@@ -1166,7 +1253,7 @@ npm view dsh-wechat-plugin versions --registry=https://registry.npmjs.org
 pnpm build              # 只编译，保留 @dsh-wechat/core 引用（pack 要靠它改写）
 pnpm run dist           # build + 内嵌 core：Git 安装要的可直接加载形态
 pnpm typecheck          # 含 examples/
-pnpm test               # 294 项
+pnpm test               # 315 项
 pnpm run check:install  # 两条安装路径的约束
 pnpm run pack           # 需要先 build，不能先 dist
 pnpm run verify-pack    # 解包、校验清单、按 DSH 的方式挂载一次

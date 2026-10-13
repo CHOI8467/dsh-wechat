@@ -73,6 +73,24 @@ export interface ModelCatalog {
   readonly failures: readonly ModelCatalogFailure[]
 }
 
+/**
+ * Which model, and which reasoning level, one session runs on.
+ *
+ * `next` is the selection the next request will use — the pending choice when one was just installed,
+ * otherwise the one the last request header logged. `lastUsed` is that logged one on its own. Both are
+ * `{provider, model, reasoningEffort?}`, and `null` until the session has a request of its own, which
+ * is why the caller falls back to the catalog's default.
+ */
+export interface ModelSelectionProjection {
+  readonly lastUsed: ModelSelection | null
+  readonly next: ModelSelection | null
+}
+
+/** What one session's registered projections currently hold, as far as this plugin reads them. */
+export interface SessionProjections {
+  readonly modelSelection?: ModelSelectionProjection
+}
+
 /** The subset of the session controller this plugin drives. */
 export interface SessionControllerService {
   /**
@@ -120,16 +138,32 @@ export interface SessionControllerService {
    *
    * Read-only and host-owned: grouping, labels and the default all come from DSH, so a model the
    * host adds or withdraws appears to the user without a plugin change. It takes no session because
-   * the catalog is deployment-wide; which entry a *session* is on is not reported here.
+   * the catalog is deployment-wide; which entry a *session* is on is read through
+   * {@link SessionControllerService.projections} instead.
    */
   modelCatalog(): Promise<ModelCatalog>
 
   /**
-   * Point one session at a model.
+   * Every registered projection for one session, read without activating its Agent.
+   *
+   * This is the only way to learn which model and reasoning level a *particular* session runs on: the
+   * catalog answers deployment-wide, and the picker's default is not the session's choice. It is
+   * optional on purpose — the per-session projection is a host generation detail, and a composition
+   * that cannot answer must leave `/model` marking the deployment default exactly as it did before,
+   * never failing the command. Answers `null` for a session that does not exist.
+   */
+  projections?(
+    request: { readonly sessionId: SessionId },
+    signal?: AbortSignal,
+  ): Promise<{ readonly values?: SessionProjections } | null>
+
+  /**
+   * Point one session at a model, and optionally at one reasoning level.
    *
    * Takes the session id as an argument instead of resolving the caller, because the person asking
    * is on a phone: the session that must change is the one the conversation is bound to, which is
-   * not necessarily the session the agent runs in. Throws when the provider or model is unknown.
+   * not necessarily the session the agent runs in. Throws when the provider or model is unknown, and
+   * when the model does not publish the requested level.
    */
   selectModel(request: {
     readonly sessionId: SessionId

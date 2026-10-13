@@ -161,24 +161,50 @@ export interface ModelOption {
   model: string
   /** Model label, which is what the user reads and usually types. */
   name: string
-  /** Reasoning effort to select the model with, when the model exposes one. */
-  reasoningEffort?: string
+  /**
+   * Reasoning levels this model accepts, in the host's own order.
+   *
+   * Absent means the model has no such setting at all — not that the host forgot to say. The ids are
+   * adapter-owned and opaque; the names are what the user reads and may type back. Which levels exist
+   * is the provider adapter's decision (the bundled DeepSeek adapter publishes `off`/`low`/`high`/`max`,
+   * and only `off` when the deployment disables thinking), so the plugin never assumes a set.
+   */
+  levels?: readonly ReasoningLevel[]
+  /**
+   * Level the host picks when a selection names none.
+   *
+   * Sent back on a plain model switch, so the level in effect is one the user was shown rather than
+   * one a resolve step chose invisibly. The desktop picker does the same thing.
+   */
+  defaultLevel?: string
 }
 
-/** Which model a session runs on. Opaque to core: two ids from the host. */
+/** One reasoning level a model accepts, as the host names it. */
+export interface ReasoningLevel {
+  /** Adapter-owned id, handed straight back to the host. */
+  id: string
+  /** Label the user reads, usually the id in the host's own capitalisation. */
+  name: string
+}
+
+/** Which model a session runs on, and at which reasoning level. Opaque to core: ids from the host. */
 export interface ModelSelection {
   provider: string
   model: string
+  /** Level in effect, absent when the session's model has no reasoning levels. */
+  reasoningEffort?: string
 }
 
 /** Every model on offer, plus the one the host reported as current. */
 export interface ModelListing {
   /**
-   * The selection the host reports, when it reports one.
+   * The selection the host reports for the session that asked, when it reports one.
    *
-   * The host exposes a deployment default rather than a per-session read, so this is what the list
-   * marks. Because choosing a model also saves it as that default, the mark follows every switch
-   * made through this channel.
+   * The bound session is what `/model` is about, so the host is handed its id and answers with *that*
+   * session's model and level. It may instead answer with the deployment default — a composition
+   * without the per-session read, or a session with no request logged yet — which is what the mark
+   * falls back to: choosing a model also saves it as that default, so only a model chosen in the
+   * desktop for one session can differ.
    */
   current?: ModelSelection
   models: readonly ModelOption[]
@@ -231,14 +257,20 @@ export interface SessionGateway {
    * Optional for the same reason as {@link SessionGateway.listOwnSessions}: only the host knows
    * which models exist. A composition without a catalog answers that it has none, rather than
    * throwing out of a command the user typed.
+   *
+   * The session id is passed rather than resolved, because a model selection is session-local while
+   * the catalog is deployment-wide: the same list is shown everywhere, but "current" means the model
+   * *this* conversation is on. It is absent when there is no conversation yet, in which case the host
+   * answers with its deployment default.
    */
-  listModels?(): Promise<ModelListing>
+  listModels?(sessionId?: string): Promise<ModelListing>
   /**
-   * Point a session at one model. Throws with the host's own reason when it cannot.
+   * Point a session at one model, and optionally at one reasoning level.
    *
    * The reasoning effort travels with the model rather than being left to the host to default,
    * because leaving it out would hand a decision to a resolve step the user cannot see: the same
-   * model at a different effort is a different answer.
+   * model at a different effort is a different answer. A level with the *same* provider and model is
+   * how the level is changed on its own.
    */
   selectModel?(
     sessionId: string,
@@ -554,13 +586,21 @@ export class SessionRouter {
          *
          * The asymmetry is the host's: the catalog is deployment-wide, while a selection is
          * session-local. So the list is the same wherever it is asked for, and a switch only means
-         * something once there is a conversation for it to apply to.
+         * something once there is a conversation for it to apply to. The binding is read first so the
+         * list can mark the model *this* conversation is on rather than the deployment default.
          */
         if (this.#gateway.listModels === undefined) {
           return { kind: 'reply', text: '当前组合没有模型列表，无法查看或切换模型。' }
         }
-        const listing = await this.#gateway.listModels()
+        const binding = bindings[params.conversationId]
+        const listing = await this.#gateway.listModels(binding?.sessionId)
         const value = args.trim()
+        const asked = parseModelCommand(value)
+
+        if (asked.levelForm) {
+          return await this.#selectLevel(binding, listing, asked)
+        }
+
         if (value === '') return { kind: 'reply', text: renderModelList(listing) }
 
         const chosen = resolveModelOption(value, listing.models)
@@ -570,11 +610,10 @@ export class SessionRouter {
           // does not know whether the model does not exist or the name was written differently.
           return {
             kind: 'reply',
-            text: `找不到模型「${value}」。回复 /model 看清单，再回复编号或模型名字。`,
+            text: `${NOT_FOUND_MODEL}「${value}」。回复 /model 看清单，再回复编号或模型名字。`,
           }
         }
 
-        const binding = bindings[params.conversationId]
         if (binding === undefined) {
           return { kind: 'reply', text: '当前没有对话。先发一条消息新建一个，再切模型。' }
         }
@@ -586,13 +625,19 @@ export class SessionRouter {
             binding.sessionId,
             chosen.provider,
             chosen.model,
-            chosen.reasoningEffort,
+            chosen.defaultLevel,
           )
           // The model id is repeated on its own line, exactly as `/switch` repeats the session id:
-          // it is what the user has to type, and a label alone does not identify a model.
+          // it is what the user has to type, and a label alone does not identify a model. The level
+          // follows for the same reason: a model selected at a level the user did not expect is a
+          // different answer, and nothing else in the chat would say which one is in effect.
           return {
             kind: 'reply',
-            text: `已把「${binding.title}」切换到 ${chosen.name}（${chosen.providerName}）。\n${selected.model}`,
+            text: [
+              `已把「${binding.title}」切换到 ${chosen.name}（${chosen.providerName}）。`,
+              ...levelReport(selected.reasoningEffort, chosen),
+              selected.model,
+            ].join('\n'),
           }
         } catch (error) {
           /*
@@ -602,8 +647,7 @@ export class SessionRouter {
            * provider, a key that is missing, a model withdrawn since the list was rendered — and a
            * message that hides that leaves the user with nothing to act on.
            */
-          const reason = error instanceof Error ? error.message : String(error)
-          return { kind: 'reply', text: `切换模型失败：${reason}` }
+          return { kind: 'reply', text: `${FAILED_MODEL}：${reasonOf(error)}` }
         }
       }
 
@@ -625,6 +669,100 @@ export class SessionRouter {
 
       default:
         return { kind: 'reply', text: `未知指令 ${command}。\n\n${HELP_TEXT}` }
+    }
+  }
+
+  /**
+   * Answer the `/model 等级 …` half: name a model's levels, or move the conversation onto one.
+   *
+   * A level is a property of a *model*, so both halves need one resolved: the model the user named
+   * (`/model 2 等级 高`), or the one already in use (`/model 等级 高`), which is the shorter thing to
+   * type when only the level changes. Changing the level of a model the conversation is not on is
+   * therefore a model switch that also names the level, and is reported as one.
+   *
+   * @param binding - Its binding, absent when the conversation has never spoken.
+   * @param listing - The catalog, with the selection the host reported as current.
+   * @param asked - The parsed `/model` argument.
+   */
+  async #selectLevel(
+    binding: SessionBinding | undefined,
+    listing: ModelListing,
+    asked: ModelCommand,
+  ): Promise<RouteResult> {
+    const current = listing.current
+    const option =
+      asked.target === ''
+        ? current === undefined
+          ? undefined
+          : listing.models.find(
+              (entry) => entry.provider === current.provider && entry.model === current.model,
+            )
+        : resolveModelOption(asked.target, listing.models)
+
+    if (option === undefined && asked.target !== '') {
+      return {
+        kind: 'reply',
+        text: `${NOT_FOUND_MODEL}「${asked.target}」。回复 /model 看清单，再回复编号或模型名字。`,
+      }
+    }
+    const levels = option?.levels ?? []
+    if (option === undefined || levels.length === 0) {
+      /*
+       * Three ways to get here — no model selected yet, a current model the catalog no longer offers,
+       * and a model that genuinely has no levels — and one answer for all three. They are the same
+       * thing to the user: there is no level to switch, and the next step is to look at the list.
+       */
+      return { kind: 'reply', text: `${NO_LEVELS}。回复 /model 看清单。` }
+    }
+
+    if (asked.level === undefined) {
+      // A question about one model's levels needs no binding: nothing is being changed.
+      return { kind: 'reply', text: renderLevels(option, current, levels) }
+    }
+
+    const level = resolveLevel(asked.level, levels)
+    if (level === undefined) {
+      // The valid set is printed, because a level id the adapter does not publish is not something
+      // the user can guess their way to — and the set is small enough to show in full.
+      return {
+        kind: 'reply',
+        text:
+          `${NOT_FOUND_LEVEL}「${asked.level}」。${option.name} 可以用的推理等级：` +
+          `${levels.map((entry) => entry.name).join('、')}。`,
+      }
+    }
+
+    if (binding === undefined) {
+      return { kind: 'reply', text: '当前没有对话。先发一条消息新建一个，再切推理等级。' }
+    }
+    if (this.#gateway.selectModel === undefined) {
+      return { kind: 'reply', text: '当前组合不支持切换推理等级。' }
+    }
+    const sameModel =
+      current !== undefined && current.provider === option.provider && current.model === option.model
+    try {
+      const selected = await this.#gateway.selectModel(
+        binding.sessionId,
+        option.provider,
+        option.model,
+        level.id,
+      )
+      // The host normalises the level it installed, so the label is looked up from what came back
+      // rather than from what was asked for: those differ exactly when the host decided otherwise.
+      const label = levelName(selected.reasoningEffort, levels) ?? level.name
+      return {
+        kind: 'reply',
+        text: sameModel
+          ? `已把「${binding.title}」的推理等级切到 ${label}（${option.name}）。`
+          : [
+              `已把「${binding.title}」切换到 ${option.name}（${option.providerName}）。`,
+              `推理等级：${label}`,
+              selected.model,
+            ].join('\n'),
+      }
+    } catch (error) {
+      const what = sameModel ? FAILED_LEVEL : FAILED_MODEL
+      return { kind: 'reply', text: `${what}：${reasonOf(error)}` }
     }
   }
 
@@ -1313,6 +1451,143 @@ export function resolveModelOption(
   return undefined
 }
 
+/** What a `/model` argument turned out to be about. */
+export interface ModelCommand {
+  /** Model the user named, or an empty string when they mean the one in use. */
+  target: string
+  /** Level the user named, when the argument named one. */
+  level?: string
+  /** Whether the argument is about a reasoning level at all. */
+  levelForm: boolean
+}
+
+/**
+ * Words that mean "what follows is a reasoning level, not a model".
+ *
+ * `/model 等级 高`, `/model 2 等级 高` and `/model level high` all name the level explicitly instead of
+ * leaving the plugin to guess which half of the argument it is. Nothing else is accepted: a level id
+ * is a single word the adapter published, so a positional rule would have to guess where a
+ * multi-word model name ends — and a guess here picks either the wrong model or the wrong level,
+ * both of which the user would only discover from the next answer.
+ *
+ * `等级` is matched as a *suffix* so the full name of the setting (`推理等级`, `思考等级`) works
+ * without a second spelling table. No model is called that.
+ *
+ * @param args - What the user typed after `/model`.
+ * @returns The parts the command needs, with `levelForm` false for the plain model forms.
+ */
+export function parseModelCommand(args: string): ModelCommand {
+  const trimmed = args.trim()
+  if (trimmed === '') return { target: '', levelForm: false }
+
+  const tokens = trimmed.split(/\s+/)
+  const at = tokens.findIndex(isLevelWord)
+  // No keyword: the whole argument is a model, exactly as it was before levels existed.
+  if (at < 0) return { target: trimmed, levelForm: false }
+
+  const level = tokens.slice(at + 1).join(' ').trim()
+  return {
+    target: tokens.slice(0, at).join(' '),
+    ...(level === '' ? {} : { level }),
+    levelForm: true,
+  }
+}
+
+/** Whether one token is the word that introduces a level. */
+function isLevelWord(token: string): boolean {
+  const lower = token.toLowerCase()
+  return (
+    lower === 'level' || lower === 'effort' || lower === 'reasoning' || token.endsWith('等级')
+  )
+}
+
+/**
+ * Resolve a level the user named against the ones a model publishes.
+ *
+ * Ids and names are both accepted, case-insensitively, because the two are near-identical for the
+ * adapters that ship with DSH (`high` / `High`) and a phone keyboard makes the capitalisation the
+ * user's problem otherwise. No partial matching: a level guessed wrong silently changes how much the
+ * model thinks, which is not a mistake the user can see in the answer.
+ *
+ * @param value - What the user typed.
+ * @param levels - Levels the model publishes.
+ */
+export function resolveLevel(
+  value: string,
+  levels: readonly ReasoningLevel[],
+): ReasoningLevel | undefined {
+  const lower = value.trim().toLowerCase()
+  if (lower === '') return undefined
+  return (
+    levels.find((level) => level.id.toLowerCase() === lower) ??
+    levels.find((level) => level.name.toLowerCase() === lower)
+  )
+}
+
+/** The label to print for one effort id, or undefined when the model does not publish it. */
+function levelName(
+  effort: string | undefined,
+  levels: readonly ReasoningLevel[],
+): string | undefined {
+  if (effort === undefined) return undefined
+  return resolveLevel(effort, levels)?.name ?? effort
+}
+
+/** The `推理等级：…` line for a selection that landed on a level, or nothing when it did not. */
+function levelReport(effort: string | undefined, option: ModelOption): readonly string[] {
+  const label = levelName(effort, option.levels ?? [])
+  return label === undefined ? [] : [`推理等级：${label}`]
+}
+
+/** The host's own words for a refusal, whatever it threw. */
+function reasonOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/** The sentence every shape of "there is no level to switch" is answered with. */
+const NO_LEVELS = '当前模型不支持推理等级'
+/** Openings of the failures `/model` answers with, kept together so the wording cannot drift apart. */
+const NOT_FOUND_MODEL = '找不到模型'
+const NOT_FOUND_LEVEL = '找不到等级'
+const FAILED_MODEL = '切换模型失败'
+const FAILED_LEVEL = '切换推理等级失败'
+
+/**
+ * Render one model's reasoning levels, with the one in effect marked.
+ *
+ * The level the conversation is *on* is what is marked; for any other model the host's own default
+ * is, because that is the level a switch to it would land on. Only one of the two can apply to a
+ * given model — the mark means "you would get this if you stopped typing here".
+ *
+ * @param option - Model whose levels are being shown.
+ * @param current - Selection the host reported, which may be for another model.
+ * @param levels - Levels the model publishes.
+ * @returns The message body.
+ */
+export function renderLevels(
+  option: ModelOption,
+  current: ModelSelection | undefined,
+  levels: readonly ReasoningLevel[],
+): string {
+  const onThisModel =
+    current !== undefined && current.provider === option.provider && current.model === option.model
+  const inEffect = onThisModel ? current.reasoningEffort : option.defaultLevel
+  // `（当前）` only when this *is* the conversation's model: on any other one the marked level is the
+  // host's default, and calling that "current" would be a claim about a model nobody is using.
+  const mark = onThisModel ? '（当前）' : '（默认）'
+  const rows = levels
+    .map((level) => `${level.name}${level.id === inEffect ? mark : ''}`)
+    .join(' · ')
+  const example = levels[0]?.id ?? ''
+  return [
+    `${option.name} 的推理等级：`,
+    '',
+    rows,
+    '',
+    `回复 /model 等级 ${example} 切换。`,
+  ].join('\n')
+}
+
 /**
  * How many rows one screen of the browser shows, at both levels.
  *
@@ -1695,6 +1970,10 @@ function heldHintSuffix(held: readonly ListedSession[]): string {
  * needs a cut-off; a model catalog is a closed set the host itself offers in full, and every model
  * has to be reachable by the number printed next to it.
  *
+ * Each model also carries its reasoning levels when it has any, because "which model" and "how hard
+ * it thinks" are the two halves of the same choice: a list that showed only the first would send the
+ * user back for a second question, and the level is not discoverable anywhere else on a phone.
+ *
  * @param listing - Models on offer, and the selection the host reports.
  * @returns The message body.
  */
@@ -1704,7 +1983,18 @@ export function renderModelList(listing: ModelListing): string {
 
   const current = listing.current
   const currentName = current === undefined ? undefined : labelOfModel(current, models)
-  const header = `可用模型（共 ${String(models.length)} 个${currentName === undefined ? '' : `，当前：${currentName}`}）：`
+  const currentLevel =
+    current === undefined
+      ? undefined
+      : levelName(
+          current.reasoningEffort,
+          models.find(
+            (option) => option.provider === current.provider && option.model === current.model,
+          )?.levels ?? [],
+        )
+  const on = currentName === undefined ? '' : `，当前：${currentName}`
+  const at = currentLevel === undefined ? '' : ` · ${currentLevel}`
+  const header = `可用模型（共 ${String(models.length)} 个${on}${at}）：`
   const rows = models.map((option, index) => renderModelRow(option, index, current))
   // Providers that failed are named rather than silently missing: a model that is simply absent
   // reads as a model the deployment does not have, which is a different thing to act on.
@@ -1715,6 +2005,12 @@ export function renderModelList(listing: ModelListing): string {
       : `\n\n另有 ${String(failures.length)} 个提供方的模型这次没取到：${failures
           .map((failure) => `${failure.name}（${failure.message}）`)
           .join('、')}`
+  // Said only when some model actually has levels; an offer to change a setting nothing supports is
+  // a promise the next reply has to break.
+  const anyLevels = models.some((option) => (option.levels?.length ?? 0) > 0)
+  const levelHint = anyLevels
+    ? [`回复 /model 等级 <等级> 切换推理等级，例如 /model 等级 ${exampleLevelId(models)}。`]
+    : []
 
   return [
     header,
@@ -1723,14 +2019,32 @@ export function renderModelList(listing: ModelListing): string {
     unavailable,
     '',
     '回复 /model 编号即可切换，也可以直接发模型名字。',
+    ...levelHint,
   ].join('\n')
+}
+
+/**
+ * A level id to print as the example.
+ *
+ * A model's *own default* rather than the first level it publishes: the first one is often `off`, and
+ * an example that suggests turning thinking off is a poor thing to put in front of someone who just
+ * asked to see more. Taken from the data either way, so it can never name a level that does not exist.
+ */
+function exampleLevelId(models: readonly ModelOption[]): string {
+  for (const option of models) {
+    const level = option.defaultLevel ?? option.levels?.[0]?.id
+    if (level !== undefined && level !== '') return level
+  }
+  return ''
 }
 
 /**
  * Render one row of the model list.
  *
  * The label leads because it is what a person recognises; the provider and the id follow, because
- * two providers can offer the same id and the id is what the user may end up typing.
+ * two providers can offer the same id and the id is what the user may end up typing. The levels come
+ * last, marked the same way the title is: the level in effect for the conversation's own model, and
+ * the host's default for any other — which is the level a switch to it would land on.
  *
  * @param option - Model to render.
  * @param index - 0-based position, rendered as the 1-based number to reply with.
@@ -1742,12 +2056,24 @@ function renderModelRow(
   index: number,
   current: ModelSelection | undefined,
 ): string {
-  const mark =
+  const isCurrent =
     current !== undefined && current.provider === option.provider && current.model === option.model
-      ? '  ← 当前'
-      : ''
+  const mark = isCurrent ? '  ← 当前' : ''
   const provider = option.providerName.trim() === '' ? option.provider : option.providerName
-  return `${String(index + 1)}. ${option.name}${mark}\n   ${provider} · ${option.model}`
+  const levels = option.levels ?? []
+  const inEffect = isCurrent ? current.reasoningEffort : option.defaultLevel
+  const levelMark = isCurrent ? '（当前）' : '（默认）'
+  const levelLine =
+    levels.length === 0
+      ? []
+      : [
+          `   推理等级：${levels
+            .map((level) => `${level.name}${level.id === inEffect ? levelMark : ''}`)
+            .join(' · ')}`,
+        ]
+  return [`${String(index + 1)}. ${option.name}${mark}`, `   ${provider} · ${option.model}`, ...levelLine].join(
+    '\n',
+  )
 }
 
 /** What to call a selection in a heading: its label when it is on offer, else its id. */
@@ -1792,6 +2118,7 @@ export const HELP_TEXT = [
   '/switch <编号>   切换（引用列表消息再回编号，编号不会过期）',
   '/switch <id>     按列表行尾那个 6 位 id 切换，例如 /switch e716f0',
   '/model <编号>    查看或切换模型',
+  '/model 等级 <等级>  切换当前模型的推理等级',
   '/current         显示当前对话',
   '/cancel          中断当前任务',
   '/help            显示本帮助',
@@ -1801,6 +2128,6 @@ export const HELP_TEXT = [
   '',
   '直接发消息即与当前对话对话。',
   '',
-  '也可以直接用大白话说，例如「查看对话列表」「换个对话」「换个模型」「停下」，',
+  '也可以直接用大白话说，例如「查看对话列表」「换个对话」「换个模型」「把推理等级调到高」「停下」，',
   '我会先问你一次确认，确认后才执行。',
 ].join('\n')

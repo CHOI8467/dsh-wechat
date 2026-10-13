@@ -26,17 +26,21 @@ import {
   browsePage,
   isShowRest,
   mintSessionId,
+  parseModelCommand,
   relativeTime,
   renderFolderScreen,
+  renderLevels,
+  renderModelList,
   renderSessionScreen,
   resolveFolder,
+  resolveLevel,
   resolveTarget,
   sessionFolders,
   shortId,
   splitCommand,
   HELP_TEXT,
 } from '../src/router.ts'
-import type { BrowsePosition, ListedSession, NumberedRows, NumberedSession, SessionBinding, SessionFolder, SessionGateway, SessionState, TargetResolution } from '../src/router.ts'
+import type { BrowsePosition, ListedSession, ModelListing, ModelOption, ModelSelection, NumberedRows, NumberedSession, SessionBinding, SessionFolder, SessionGateway, SessionState, TargetResolution } from '../src/router.ts'
 import type { ChannelState } from '../src/state.ts'
 import { chargeQuota, quotaLedgerFor, type QuotaEntry } from '../src/quota.ts'
 import type { WeixinAccount, WeixinMessage } from '../src/types.ts'
@@ -1721,6 +1725,350 @@ test('shortId stays readable, stays within six characters, and round-trips', () 
   // A foreign id still yields something printable rather than throwing — and still within the bound.
   assert.ok(shortId('not-a-session-id').length <= SHORT_ID_LENGTH)
   assert.ok(shortId('session-').length <= SHORT_ID_LENGTH)
+})
+
+/*
+ * ---------------------------------------------------------------------------
+ * Model and reasoning level
+ * ---------------------------------------------------------------------------
+ *
+ * A level is a property of a model, not of the session: the same provider/model pair at `high` and at
+ * `low` are two different answers, and which levels exist is the provider adapter's decision (the
+ * adapter that ships with DSH publishes `off`/`low`/`high`/`max`). So these tests are about the two
+ * halves of one choice — which model, and how hard it thinks — and about the three ways a level
+ * change can be refused, none of which may be reported as a success.
+ */
+
+/** The catalog `/model` is answered from. Two providers, two of the models with levels. */
+const MODEL_OPTIONS: readonly ModelOption[] = [
+  {
+    provider: 'deepseek-account',
+    providerName: 'DeepSeek 官方',
+    model: 'deepseek-chat',
+    name: 'DeepSeek V3.2',
+  },
+  {
+    provider: 'deepseek-account',
+    providerName: 'DeepSeek 官方',
+    model: 'deepseek-reasoner',
+    name: 'DeepSeek Reasoner',
+    levels: [
+      { id: 'off', name: 'Off' },
+      { id: 'low', name: 'Low' },
+      { id: 'high', name: 'High' },
+      { id: 'max', name: 'Max' },
+    ],
+    defaultLevel: 'high',
+  },
+  {
+    provider: 'openrouter',
+    providerName: 'OpenRouter',
+    model: 'qwen3-coder',
+    name: 'Qwen3 Coder',
+    levels: [
+      { id: 'low', name: 'Low' },
+      { id: 'high', name: 'High' },
+    ],
+    defaultLevel: 'low',
+  },
+]
+
+/**
+ * A gateway that also offers models, which is what `/model` needs.
+ *
+ * Kept apart from {@link FakeGateway} for the same reason the probe gateway is: a composition without
+ * a catalog has to keep behaving exactly as it did, and that is only testable while a gateway without
+ * one still exists.
+ */
+class ModelGateway extends FakeGateway implements SessionGateway {
+  /** Selections the router asked the host to install, in order. */
+  readonly selections: {
+    sessionId: string
+    provider: string
+    model: string
+    reasoningEffort?: string
+  }[] = []
+  /** Session ids `listModels` was asked about, in order. */
+  readonly listings: (string | undefined)[] = []
+  /** The selection the host reports as current, as the per-session projection would. */
+  current: ModelSelection = { provider: 'deepseek-account', model: 'deepseek-chat' }
+  /** When true every selection throws, as a missing key or a withdrawn model does. */
+  failSelection = false
+
+  async listModels(sessionId?: string): Promise<ModelListing> {
+    this.listings.push(sessionId)
+    return { current: this.current, models: MODEL_OPTIONS }
+  }
+
+  async selectModel(
+    sessionId: string,
+    provider: string,
+    model: string,
+    reasoningEffort?: string,
+  ): Promise<ModelSelection> {
+    if (this.failSelection) throw new Error('session/model-unavailable: no key for this provider')
+    if (!MODEL_OPTIONS.some((option) => option.provider === provider && option.model === model)) {
+      throw new Error(`unknown model ${provider}/${model}`)
+    }
+    const selected: ModelSelection = {
+      provider,
+      model,
+      ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+    }
+    this.selections.push({ sessionId, ...selected })
+    this.current = selected
+    return selected
+  }
+}
+
+/** A gateway that lists models but cannot select one. */
+class ListingOnlyGateway extends FakeGateway implements SessionGateway {
+  current: ModelSelection = { provider: 'deepseek-account', model: 'deepseek-reasoner', reasoningEffort: 'high' }
+
+  async listModels(): Promise<ModelListing> {
+    return { current: this.current, models: MODEL_OPTIONS }
+  }
+}
+
+test('/model shows each model’s reasoning levels and marks the one in effect', async () => {
+  const gateway = new ModelGateway()
+  gateway.current = {
+    provider: 'deepseek-account',
+    model: 'deepseek-reasoner',
+    reasoningEffort: 'high',
+  }
+  const router = new SessionRouter({ gateway, store: memoryStore() })
+
+  const result = await router.route({ ...conversation, text: '/model' })
+  assert.equal(result.kind, 'reply')
+  if (result.kind !== 'reply') return
+
+  // The heading answers "which model, and how hard is it thinking" without scanning the rows.
+  assert.match(result.text, /可用模型（共 3 个，当前：DeepSeek Reasoner · High）：/)
+  // The levels sit under their model, with the one in effect marked.
+  assert.match(result.text, /推理等级：Off · Low · High（当前） · Max/)
+  /*
+   * A model that is *not* the conversation's marks the host's default instead, because that is what a
+   * switch to it would land on. Marking it "当前" would be a claim about a model nobody is using.
+   */
+  assert.match(result.text, /推理等级：Low（默认） · High/)
+  // The example is taken from the catalog — and is a level worth landing on, not the first one it
+  // happens to publish (`off` would suggest switching thinking off).
+  assert.match(result.text, /回复 \/model 等级 <等级> 切换推理等级，例如 \/model 等级 high。/)
+  assert.deepEqual(gateway.selections, [], 'listing changes nothing')
+})
+
+test('/model asks the host about the session this conversation is bound to', async () => {
+  const gateway = new ModelGateway()
+  const router = new SessionRouter({ gateway, store: memoryStore() })
+  const first = await router.route({ ...conversation, text: '第一条' })
+  assert.equal(first.kind, 'prompt')
+  if (first.kind !== 'prompt') return
+
+  await router.route({ ...conversation, text: '/model' })
+
+  /*
+   * Without the session id the host can only answer with the deployment default, which is wrong for
+   * anyone who picked a model in the desktop for this one session — the mark would name a model the
+   * next turn is not using, and the user would read the level off the wrong row.
+   */
+  assert.deepEqual(gateway.listings, [first.decision.sessionId])
+})
+
+test('/model with no level hint when nothing offers levels', () => {
+  const onlyChat = MODEL_OPTIONS.filter((option) => option.levels === undefined)
+  const text = renderModelList({ models: onlyChat })
+  assert.match(text, /可用模型（共 1 个）：/)
+  assert.doesNotMatch(text, /推理等级/)
+})
+
+test('/model 等级 names the levels of the model in use and changes nothing', async () => {
+  const gateway = new ModelGateway()
+  gateway.current = {
+    provider: 'deepseek-account',
+    model: 'deepseek-reasoner',
+    reasoningEffort: 'high',
+  }
+  const router = new SessionRouter({ gateway, store: memoryStore() })
+
+  const result = await router.route({ ...conversation, text: '/model 等级' })
+  assert.equal(result.kind, 'reply')
+  if (result.kind !== 'reply') return
+  assert.match(result.text, /DeepSeek Reasoner 的推理等级：/)
+  assert.match(result.text, /High（当前）/)
+  assert.match(result.text, /回复 \/model 等级 off 切换。/)
+  assert.deepEqual(gateway.selections, [])
+})
+
+test('/model 等级 low changes only the level, on the model already in use', async () => {
+  const gateway = new ModelGateway()
+  const router = new SessionRouter({ gateway, store: memoryStore() })
+  const first = await router.route({ ...conversation, text: '第一条' })
+  assert.equal(first.kind, 'prompt')
+  if (first.kind !== 'prompt') return
+  gateway.current = {
+    provider: 'deepseek-account',
+    model: 'deepseek-reasoner',
+    reasoningEffort: 'high',
+  }
+
+  const result = await router.route({ ...conversation, text: '/model 等级 low' })
+  assert.equal(result.kind, 'reply')
+  if (result.kind !== 'reply') return
+
+  // The same provider and model, at the new level: that is what "change the level" means to the host.
+  assert.deepEqual(gateway.selections, [
+    {
+      sessionId: first.decision.sessionId,
+      provider: 'deepseek-account',
+      model: 'deepseek-reasoner',
+      reasoningEffort: 'low',
+    },
+  ])
+  assert.match(result.text, /已把「.+」的推理等级切到 Low（DeepSeek Reasoner）。/)
+})
+
+test('/model <模型> 等级 <等级> switches the model and the level in one step', async () => {
+  const gateway = new ModelGateway()
+  const router = new SessionRouter({ gateway, store: memoryStore() })
+  const first = await router.route({ ...conversation, text: '第一条' })
+  assert.equal(first.kind, 'prompt')
+  if (first.kind !== 'prompt') return
+
+  // The name is accepted, not just the id, and the capitalisation is the phone keyboard's problem.
+  const result = await router.route({ ...conversation, text: '/model 2 等级 MAX' })
+  assert.equal(result.kind, 'reply')
+  if (result.kind !== 'reply') return
+  assert.deepEqual(gateway.selections, [
+    {
+      sessionId: first.decision.sessionId,
+      provider: 'deepseek-account',
+      model: 'deepseek-reasoner',
+      reasoningEffort: 'max',
+    },
+  ])
+  assert.match(result.text, /已把「.+」切换到 DeepSeek Reasoner（DeepSeek 官方）。/)
+  assert.match(result.text, /推理等级：Max/)
+  // The id still follows, because the id is what the user can type back.
+  assert.match(result.text, /deepseek-reasoner/)
+})
+
+test('/model 等级 with a level the model does not publish lists the ones it does', async () => {
+  const gateway = new ModelGateway()
+  gateway.current = {
+    provider: 'deepseek-account',
+    model: 'deepseek-reasoner',
+    reasoningEffort: 'high',
+  }
+  const router = new SessionRouter({ gateway, store: memoryStore() })
+  await router.route({ ...conversation, text: '第一条' })
+
+  const result = await router.route({ ...conversation, text: '/model 等级 超高' })
+  assert.equal(result.kind, 'reply')
+  if (result.kind !== 'reply') return
+  assert.match(result.text, /^找不到等级「超高」。/)
+  // The whole set is printed: a level the adapter does not publish is not something to guess at.
+  assert.match(result.text, /Off、Low、High、Max/)
+  assert.deepEqual(gateway.selections, [], 'nothing was selected')
+})
+
+test('/model 等级 on a model with no levels says so instead of selecting one', async () => {
+  const gateway = new ModelGateway()
+  // The conversation's model is the non-reasoning one, which is the common case.
+  const router = new SessionRouter({ gateway, store: memoryStore() })
+  await router.route({ ...conversation, text: '第一条' })
+
+  for (const text of ['/model 等级 high', '/model 1 等级 high']) {
+    const result = await router.route({ ...conversation, text })
+    assert.equal(result.kind, 'reply')
+    if (result.kind !== 'reply') return
+    assert.match(result.text, /^当前模型不支持推理等级/, `answered for ${text}`)
+    assert.match(result.text, /回复 \/model 看清单/)
+  }
+  assert.deepEqual(gateway.selections, [])
+})
+
+test('a level switch the host refuses is reported, never counted as done', async () => {
+  const gateway = new ModelGateway()
+  gateway.current = {
+    provider: 'deepseek-account',
+    model: 'deepseek-reasoner',
+    reasoningEffort: 'high',
+  }
+  const router = new SessionRouter({ gateway, store: memoryStore() })
+  await router.route({ ...conversation, text: '第一条' })
+  gateway.failSelection = true
+
+  const result = await router.route({ ...conversation, text: '/model 等级 low' })
+  assert.equal(result.kind, 'reply')
+  if (result.kind !== 'reply') return
+  // The host's own words, so the user has something to act on, and an opening that reads as a failure.
+  assert.match(result.text, /^切换推理等级失败：session\/model-unavailable/)
+  assert.deepEqual(gateway.selections, [])
+})
+
+test('a gateway with no catalog, and one that cannot select, each say so', async () => {
+  const bare = new SessionRouter({ gateway: new FakeGateway(), store: memoryStore() })
+  for (const text of ['/model', '/model 等级 high', '/model 2']) {
+    const result = await bare.route({ ...conversation, text })
+    assert.equal(result.kind, 'reply')
+    if (result.kind !== 'reply') return
+    assert.match(result.text, /当前组合没有模型列表/)
+  }
+
+  const listingOnly = new SessionRouter({ gateway: new ListingOnlyGateway(), store: memoryStore() })
+  await listingOnly.route({ ...conversation, text: '第一条' })
+  const switchModel = await listingOnly.route({ ...conversation, text: '/model 2' })
+  assert.equal(switchModel.kind, 'reply')
+  if (switchModel.kind !== 'reply') return
+  assert.match(switchModel.text, /当前组合不支持切换模型/)
+
+  const switchLevel = await listingOnly.route({ ...conversation, text: '/model 等级 low' })
+  assert.equal(switchLevel.kind, 'reply')
+  if (switchLevel.kind !== 'reply') return
+  assert.match(switchLevel.text, /当前组合不支持切换推理等级/)
+})
+
+test('a level is named explicitly, so no model argument is ever split by guesswork', () => {
+  // The plain forms are exactly what they were before levels existed.
+  assert.deepEqual(parseModelCommand(''), { target: '', levelForm: false })
+  assert.deepEqual(parseModelCommand('2'), { target: '2', levelForm: false })
+  assert.deepEqual(parseModelCommand('DeepSeek Reasoner'), {
+    target: 'DeepSeek Reasoner',
+    levelForm: false,
+  })
+  // A keyword introduces the level, and everything before it is the model (or nothing).
+  assert.deepEqual(parseModelCommand('等级'), { target: '', levelForm: true })
+  assert.deepEqual(parseModelCommand('等级 high'), { target: '', level: 'high', levelForm: true })
+  assert.deepEqual(parseModelCommand('2 等级 high'), { target: '2', level: 'high', levelForm: true })
+  assert.deepEqual(parseModelCommand('DeepSeek Reasoner 等级 High'), {
+    target: 'DeepSeek Reasoner',
+    level: 'High',
+    levelForm: true,
+  })
+  // The full name of the setting works, and so does the English one.
+  assert.deepEqual(parseModelCommand('推理等级 高'), { target: '', level: '高', levelForm: true })
+  assert.deepEqual(parseModelCommand('level high'), { target: '', level: 'high', levelForm: true })
+})
+
+test('a level is matched by id or by name, and never partially', () => {
+  const levels = MODEL_OPTIONS[1]?.levels ?? []
+  assert.equal(resolveLevel('high', levels)?.id, 'high')
+  assert.equal(resolveLevel('High', levels)?.id, 'high')
+  assert.equal(resolveLevel('HIGH', levels)?.id, 'high')
+  assert.equal(resolveLevel('', levels), undefined)
+  // A prefix is not a level: `h` guessing at `high` would change how hard the model thinks without
+  // the user saying so.
+  assert.equal(resolveLevel('h', levels), undefined)
+  assert.equal(resolveLevel('高', levels), undefined)
+  // The rendered body of one model's levels, for the model the conversation is not on.
+  const text = renderLevels(
+    MODEL_OPTIONS[1] as ModelOption,
+    { provider: 'deepseek-account', model: 'deepseek-chat' },
+    levels,
+  )
+  assert.match(text, /DeepSeek Reasoner 的推理等级：/)
+  assert.match(text, /High（默认）/)
 })
 
 /*

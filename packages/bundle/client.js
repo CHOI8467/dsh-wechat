@@ -162,7 +162,7 @@ window.__ModuleLoader__.load({
         commandNew: '新建对话，可带标题',
         commandList: '列出本工作区的对话；加 all 先列会话夹（工作区），回复编号或名字进入',
         commandSwitch: '切换到第 N 个对话，或按行尾那个 6 位 id 切换；回复「查看其余」看下十个',
-        commandModel: '看有哪些模型；带编号或名字则切换',
+        commandModel: '看有哪些模型和推理等级；带编号或名字则切换，加「等级 X」可同时指定等级',
         commandCurrent: '显示当前对话',
         commandCancel: '中断当前任务',
         commandsSeparator: '分隔符可用「：」或直接省略，例如 /switch1。',
@@ -274,7 +274,7 @@ window.__ModuleLoader__.load({
           'List this workspace\'s conversations; with all, list the workspaces first and reply with a number or a name to enter one',
         commandSwitch:
           'Move to conversation number N, or switch by the 6-character id at the end of a row; reply 「查看其余」 for the next ten',
-        commandModel: 'List the models; with a number or name, switch to it',
+        commandModel: 'List the models and their reasoning levels; with a number or name, switch to it — add «等级 X» to set the level at the same time',
         commandCurrent: 'Show the conversation in use',
         commandCancel: 'Interrupt the running task',
         commandsSeparator: 'The separator may be «：» or omitted entirely, as in /switch1.',

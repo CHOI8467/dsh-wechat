@@ -169,8 +169,10 @@ Type these to control which DSH conversation you are talking to:
 | `查看其余` | The next ten rows, at either level, all the way to the end. Numbers run on across screens (1–10, then 11–20) |
 | reply `3`, a name, or a row's short id | Works with the listing on screen — no `/switch` needed |
 | quote the list, then `/switch 3` | Move to number 3 **of that screen**, frozen in the message you quoted |
-| `/model` | List the models, marking the one in use |
+| `/model` | List the models and each one's **reasoning levels**, marking the model and level in use |
 | `/model 2` | Switch to number 2, or send a model name instead |
+| `/model 等级 高` | Change the reasoning level of the model in use (`等级` is the word; the level names are the ones the list printed) |
+| `/model 2 等级 高` | Switch the model and set the level in one step |
 | `/current` | Which conversation you are in |
 | `/cancel` | Stop the task that is running |
 | `/help` | This list |
@@ -239,7 +241,7 @@ pnpm install
 pnpm build              # compiles only, leaving @dsh-wechat/core imports for pack to rewrite
 pnpm run dist           # build + inline core: the loadable form a Git install needs
 pnpm typecheck
-pnpm test               # 294 tests
+pnpm test               # 315 tests
 pnpm check              # build + typecheck + test
 pnpm run pack           # run dist first
 pnpm run verify-pack    # unpack, check the manifest's files, mount it as DSH would

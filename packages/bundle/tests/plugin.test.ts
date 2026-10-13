@@ -63,7 +63,14 @@ const MODEL_CATALOG = {
         {
           id: 'deepseek-reasoner',
           name: 'DeepSeek Reasoner',
-          reasoning: { efforts: [{ id: 'medium', name: '中' }], defaultEffort: 'medium' },
+          reasoning: {
+            efforts: [
+              { id: 'low', name: 'Low' },
+              { id: 'medium', name: '中' },
+              { id: 'high', name: 'High' },
+            ],
+            defaultEffort: 'medium',
+          },
         },
       ],
     },
@@ -189,6 +196,9 @@ async function mount(options: {
   seedAccount?: boolean
   refuseSteer?: boolean
   failAllPrompts?: boolean
+  hostReportsNoSessions?: boolean
+  modelProjection?: 'live' | 'absent' | 'throws'
+  failModelSelectionFrom?: number
 }): Promise<Harness> {
   return await mountWith(options)
 }
@@ -207,6 +217,22 @@ async function mountWith(options: {
   failAllPrompts?: boolean
   /** Make the host's session list empty, which is what a real machine returned. */
   hostReportsNoSessions?: boolean
+  /**
+   * How the host answers a per-session model/level read.
+   *
+   * `absent` is a composition that does not expose the projection at all, and `throws` is one whose
+   * read fails; both are normal in the field and neither may cost the user `/model`. The default
+   * tracks what a real session would report.
+   */
+  modelProjection?: 'live' | 'absent' | 'throws'
+  /**
+   * Make model selections fail from this call on (1-based), as a provider that lost its key does.
+   *
+   * From a numbered call rather than from the first, because the setup of such a test is itself a
+   * selection: failing every one would leave the conversation on the model that has no levels, and the
+   * refusal under test would never be reached.
+   */
+  failModelSelectionFrom?: number
 }): Promise<Harness> {
   const created: Created[] = []
   const prompted: { sessionId: string; mode: 'queue' | 'steer'; text: string }[] = []
@@ -285,6 +311,12 @@ async function mountWith(options: {
   const presetApplications: { sessionId: string; preset: string }[] = []
   /** Model selections the channel installed, in order. */
   const modelSelections: ModelRequest[] = []
+  /**
+   * The selection installed for each session, which is what the host's `modelSelection` projection
+   * would report. Kept per session because that is the whole point of the read: a model chosen for one
+   * conversation is not the deployment default.
+   */
+  const installedSelections = new Map<string, { provider: string; model: string; reasoningEffort?: string }>()
   /**
    * The archive set the stub registry reports.
    *
@@ -467,17 +499,53 @@ async function mountWith(options: {
             group.models.some((model) => model.id === request.model),
         )
         if (!known) throw new Error(`unknown model ${request.provider}/${request.model}`)
-        modelSelections.push(request)
-        return {
-          selected: {
-            provider: request.provider,
-            model: request.model,
-            ...(request.reasoningEffort === undefined
-              ? {}
-              : { reasoningEffort: request.reasoningEffort }),
-          },
+        if (
+          options.failModelSelectionFrom !== undefined &&
+          modelSelections.length + 1 >= options.failModelSelectionFrom
+        ) {
+          throw new Error('session/model-unavailable: the provider key is missing')
         }
+        modelSelections.push(request)
+        /*
+         * The real controller resolves the level through the adapter and answers with the normalized
+         * selection, so a request that named none comes back with the model's default effort. Mirrored
+         * here because that value is what the reply tells the user is now in effect.
+         */
+        const effort =
+          request.reasoningEffort ??
+          MODEL_CATALOG.groups
+            .find((group) => group.id === request.provider)
+            ?.models.find((model) => model.id === request.model)?.reasoning?.defaultEffort
+        const selected = {
+          provider: request.provider,
+          model: request.model,
+          ...(effort === undefined ? {} : { reasoningEffort: effort }),
+        }
+        installedSelections.set(request.sessionId, selected)
+        return { selected }
       },
+      /*
+       * The per-session read `/model` marks the current model and level from. The two ways it can be
+       * missing are both real — a host generation without the projection, and a read that fails — and
+       * each has to leave `/model` working, so both are reproducible here.
+       */
+      ...(options.modelProjection === 'absent'
+        ? {}
+        : {
+            projections: async (request: { sessionId: string }) => {
+              if (options.modelProjection === 'throws') {
+                throw new Error('session query unavailable')
+              }
+              return {
+                values: {
+                  modelSelection: {
+                    lastUsed: null,
+                    next: installedSelections.get(request.sessionId) ?? null,
+                  },
+                },
+              }
+            },
+          }),
     },
     sessions: { get: sessionsGet },
     permissionPresets: { set: permissionPresetsSet },
@@ -1388,6 +1456,34 @@ async function withSettings<T>(
 }
 
 /**
+ * Mount with the default settings and a host that answers the model read in a particular way.
+ *
+ * The model tests need both halves: a seeded state file (so there is a bound account to reply to) and
+ * a host whose `modelSelection` read is missing or broken, because those are the compositions in the
+ * field where `/model` still has to work.
+ *
+ * @param run - Test body.
+ * @param options - How the stub host should answer the per-session model read.
+ */
+async function withMount<T>(
+  run: (harness: Harness) => Promise<T>,
+  options: {
+    modelProjection?: 'live' | 'absent' | 'throws'
+    failModelSelectionFrom?: number
+  } = {},
+): Promise<T> {
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
+  await seedState(home, DEFAULT_SETTINGS)
+  const harness = await mount({ home, seedAccount: false, ...options })
+  try {
+    return await run(harness)
+  } finally {
+    harness.dispose()
+    await removeHome(home)
+  }
+}
+
+/**
  * The registered `session_control` tool, driven the way the agent would drive it.
  *
  * Calls go through the definition the registry actually received, so the schema, the argument
@@ -1476,11 +1572,13 @@ function modelTool(harness: Harness): ModelTool {
  * @param harness - Mounted harness.
  * @param action - Action to invoke.
  * @param target - Optional model argument.
+ * @param level - Optional reasoning-level argument.
  */
 async function controlModel(
   harness: Harness,
   action: string,
   target?: string,
+  level?: string,
 ): Promise<{ detail: string; ok: boolean }> {
   const bound = await harness.runtime.bindings()
   const sessionId =
@@ -1488,6 +1586,7 @@ async function controlModel(
   assert.ok(sessionId, 'a session must exist before the tool can be called')
   const args: Record<string, unknown> = { action }
   if (target !== undefined) args.target = target
+  if (level !== undefined) args.level = level
   return await modelTool(harness).execute(args, { agent: { session: { id: sessionId } } })
 }
 
@@ -2554,17 +2653,219 @@ test('/model with a name that does not exist changes nothing and says so', async
   })
 })
 
-test('the model tool offers the two actions a user can ask for', async () => {
+test('the model tool offers the actions a user can ask for, levels included', async () => {
   await withSettings(async (harness) => {
     const tool = modelTool(harness)
-    const action = (tool.parameters.properties as Record<string, { enum?: string[] }>).action
+    const properties = tool.parameters.properties as Record<
+      { enum?: string[] } & Record<string, unknown>
+    >
+    const action = (properties as Record<string, { enum?: string[] }>).action
     // The enum is what the model chooses from, so an action missing here is unreachable.
-    assert.deepEqual(action?.enum, ['list', 'switch'])
+    assert.deepEqual(action?.enum, ['list', 'switch', 'set_level'])
     assert.deepEqual(tool.parameters.required, ['action'])
     // The description is the only thing that decides whether a spoken request reaches this tool.
     assert.match(tool.description, /Call this whenever the user asks/)
     assert.match(tool.description, /换个模型/)
-    assert.match(tool.description, /Never tell the user a model switch succeeded/)
+    // A level asked for in words has to reach this tool too, or "调高一点" is answered with prose.
+    assert.match(tool.description, /推理等级/)
+    assert.match(tool.description, /thinking level/)
+    assert.match(tool.description, /Never tell the user a model or level switch succeeded/)
+    // The level is its own parameter, documented for both actions that take one.
+    const level = (properties as Record<string, { description?: string }>).level
+    assert.match(level?.description ?? '', /Required for set_level/)
+    assert.match(level?.description ?? '', /switch it is optional/)
+  })
+})
+
+test('/model marks the session’s own model and level, not the deployment default', async () => {
+  await withSettings(async (harness) => {
+    await harness.runtime.ingest(inbound('第一条'))
+
+    // The conversation moves itself onto the reasoning model, which is a session-local selection.
+    await harness.runtime.ingest(inbound('/model DeepSeek Reasoner'))
+
+    await harness.runtime.ingest(inbound('/model'))
+    const body = harness.sent.at(-1)?.text ?? ''
+    /*
+     * The mark comes from the session's own projection.
+     *
+     * The deployment default is still `deepseek-chat`, so a list that marked the default would name
+     * DeepSeek V3.2 — and the user would read the level off a model their next turn is not using.
+     */
+    assert.match(body, /可用模型（共 3 个，当前：DeepSeek Reasoner · 中）：/)
+    assert.match(body, /2\. DeepSeek Reasoner {2}← 当前/)
+    assert.match(body, /推理等级：Low · 中（当前） · High/)
+    // The levels are offered, with an example taken from the catalog (the model's own default).
+    assert.match(body, /回复 \/model 等级 <等级> 切换推理等级，例如 \/model 等级 medium。/)
+  })
+})
+
+test('a host that cannot report the session’s model still lists it, marked with the default', async () => {
+  for (const modelProjection of ['absent', 'throws'] as const) {
+    await withMount(
+      async (harness) => {
+        await harness.runtime.ingest(inbound('第一条'))
+        const before = harness.sent.length
+
+        await harness.runtime.ingest(inbound('/model'))
+
+        // The whole point: the read is optional, so losing it costs the precision of one mark and
+        // never the command itself. A throw escaping here would replace the list with a failure.
+        assert.equal(harness.sent.length, before + 1, `one list for ${modelProjection}`)
+        const body = harness.sent.at(-1)?.text ?? ''
+        assert.match(body, /可用模型（共 3 个，当前：DeepSeek V3\.2）：/, `listing for ${modelProjection}`)
+        // And a level switch is still reachable, with the level named by hand: nothing about the
+        // session read is needed to *set* one.
+        const switched = await controlModel(harness, 'switch', 'DeepSeek Reasoner', 'high')
+        assert.equal(switched.ok, true, `level switch after ${modelProjection}: ${switched.detail}`)
+        assert.deepEqual(
+          harness.modelSelections.map((entry) => entry.reasoningEffort),
+          ['high'],
+        )
+      },
+      { modelProjection },
+    )
+  }
+})
+
+test('a failed session-model read is recorded, so the weaker mark is answerable', async () => {
+  await withMount(
+    async (harness) => {
+      await harness.runtime.ingest(inbound('第一条'))
+      await harness.runtime.ingest(inbound('/model'))
+
+      const log = (await bootLogLines(harness)).join('\n')
+      // §3.7/§4.14: a path that silently falls back is one nobody can diagnose. The session id and
+      // the host's own error are what make "why is my list wrong" answerable.
+      assert.match(log, /model: reading the selection of session-/)
+      assert.match(log, /session query unavailable/)
+    },
+    { modelProjection: 'throws' },
+  )
+})
+
+test('/model 等级 switches the level of the model in use, by command', async () => {
+  await withSettings(async (harness) => {
+    await harness.runtime.ingest(inbound('第一条'))
+    await harness.runtime.ingest(inbound('/model DeepSeek Reasoner'))
+    const sessionId = harness.prompted[0]?.sessionId
+
+    await harness.runtime.ingest(inbound('/model 等级 high'))
+
+    // Same provider and model, new level: that is what "change the level" means to the host.
+    assert.deepEqual(harness.modelSelections, [
+      {
+        sessionId,
+        provider: 'deepseek-account',
+        model: 'deepseek-reasoner',
+        reasoningEffort: 'medium',
+      },
+      {
+        sessionId,
+        provider: 'deepseek-account',
+        model: 'deepseek-reasoner',
+        reasoningEffort: 'high',
+      },
+    ])
+    const body = harness.sent.at(-1)?.text ?? ''
+    assert.match(body, /^已把「.+」的推理等级切到 High（DeepSeek Reasoner）。/)
+  })
+})
+
+test('/model 等级 with a level the model does not have says so and changes nothing', async () => {
+  await withSettings(async (harness) => {
+    await harness.runtime.ingest(inbound('第一条'))
+    const selectionsBefore = harness.modelSelections.length
+
+    await harness.runtime.ingest(inbound('/model 等级 超高'))
+
+    const body = harness.sent.at(-1)?.text ?? ''
+    // The model in use has no levels at all, which is the more common refusal.
+    assert.match(body, /^当前模型不支持推理等级/)
+    assert.equal(harness.modelSelections.length, selectionsBefore, 'nothing was selected')
+  })
+})
+
+test('a level switch the host refuses is told to the user, and never reported as done', async () => {
+  await withMount(
+    async (harness) => {
+      await harness.runtime.ingest(inbound('第一条'))
+      await harness.runtime.ingest(inbound('/model DeepSeek Reasoner'))
+      const before = harness.sent.length
+
+      const result = await controlModel(harness, 'set_level', undefined, 'high')
+
+      /*
+       * The failure the whole shape exists for: the command answers with guidance instead of throwing,
+       * so the tool result has to *read* the answer. A false success here leaves the agent telling the
+       * user a level the next turn is not thinking at, and nothing about the chat would look wrong.
+       */
+      assert.equal(result.ok, false)
+      assert.match(result.detail, /操作失败，已直接告诉用户/)
+      assert.match(result.detail, /切换推理等级失败/)
+      // And the user is told directly, which is what makes the agent's silence safe.
+      assert.equal(harness.sent.length, before + 1)
+      assert.match(harness.sent.at(-1)?.text ?? '', /^切换推理等级失败：session\/model-unavailable/)
+    },
+    // The first call moves the conversation onto the reasoning model; the second one is the refusal.
+    { failModelSelectionFrom: 2 },
+  )
+})
+
+test('the model tool changes the level on its own, and the channel tells the user', async () => {
+  await withSettings(async (harness) => {
+    await harness.runtime.ingest(inbound('第一条'))
+    await harness.runtime.ingest(inbound('/model DeepSeek Reasoner'))
+    const sessionId = harness.prompted[0]?.sessionId
+    const before = harness.sent.length
+
+    const result = await controlModel(harness, 'set_level', undefined, 'Low')
+
+    assert.equal(result.ok, true, `level switch failed: ${result.detail}`)
+    assert.deepEqual(harness.modelSelections.at(-1), {
+      sessionId,
+      provider: 'deepseek-account',
+      model: 'deepseek-reasoner',
+      // Matched by name, case-insensitively: `Low` is what the list printed.
+      reasoningEffort: 'low',
+    })
+    assert.equal(harness.sent.length, before + 1, 'exactly one message was sent')
+    assert.match(harness.sent.at(-1)?.text ?? '', /推理等级切到 Low/)
+    assert.match(result.detail, /推理等级已切换/)
+  })
+})
+
+test('the model tool switches model and level together, in one action', async () => {
+  await withSettings(async (harness) => {
+    await harness.runtime.ingest(inbound('第一条'))
+
+    const result = await controlModel(harness, 'switch', 'DeepSeek Reasoner', 'high')
+
+    assert.equal(result.ok, true, `switch failed: ${result.detail}`)
+    assert.deepEqual(harness.modelSelections.at(-1), {
+      sessionId: harness.prompted[0]?.sessionId,
+      provider: 'deepseek-account',
+      model: 'deepseek-reasoner',
+      reasoningEffort: 'high',
+    })
+    const body = harness.sent.at(-1)?.text ?? ''
+    assert.match(body, /切换到 DeepSeek Reasoner/)
+    assert.match(body, /推理等级：High/)
+  })
+})
+
+test('the model tool refuses a level action with no level, and an unknown action', async () => {
+  await withSettings(async (harness) => {
+    await harness.runtime.ingest(inbound('第一条'))
+    const selectionsBefore = harness.modelSelections.length
+
+    // A targetless level switch would otherwise list the levels and report success, which reads as a
+    // change that happened.
+    const targetless = await controlModel(harness, 'set_level')
+    assert.equal(targetless.ok, false)
+    assert.match(targetless.detail, /需要指定等级/)
+
+    assert.equal(harness.modelSelections.length, selectionsBefore)
   })
 })
 

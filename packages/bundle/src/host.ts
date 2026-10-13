@@ -100,6 +100,8 @@ import {
   readStreamFrame,
   type AssistantStreamPayload,
   type Disposer,
+  type ModelCatalog,
+  type ModelSelection,
   type ToolDefinition,
   type SessionSummary,
   type WechatContext,
@@ -261,16 +263,20 @@ export function sessionToolDescription(requireConfirmation: boolean): string {
  */
 export function modelToolDescription(): string {
   return (
-    'Choose which model this WeChat conversation runs on, and show which models are available. Call ' +
+    'Choose which model this WeChat conversation runs on, and at which reasoning level, and show ' +
+    'which models and levels are available. Call ' +
     'this whenever the user asks to see the models, or to change the one in use — in any wording, ' +
-    'such as "换个模型" or "切到 X". Do not merely describe these actions in a reply; call the tool. ' +
+    'such as "换个模型" or "切到 X" — and whenever they ask about how hard it thinks, in any wording ' +
+    'such as "推理等级"、"思考等级"、"thinking level"、"调高一点" or "换成 high". Do not merely ' +
+    'describe these actions in a reply; call the tool. ' +
     'The user is on a phone and cannot see the desktop model picker. ' +
     // Switching does not move the conversation, so unlike the session tool the caller is not at
     // risk of answering from somewhere else — but the announcement rule is the same, because the
     // channel has already told the user what happened and a second, looser telling can only
     // contradict it.
     'Both listing and switching are announced to the user by the channel, including when they fail, ' +
-    'so do not repeat that outcome either way. Never tell the user a model switch succeeded; read ' +
+    'so do not repeat that outcome either way. Never tell the user a model or level switch succeeded; ' +
+    'read ' +
     'the result\'s `ok` field and, if it is false, say nothing about it because the channel has ' +
     'already told them what went wrong. ' +
     'A switch applies to the conversation the caller is bound to, and takes effect from the next turn.'
@@ -282,11 +288,13 @@ export function modelToolDescription(): string {
  *
  * The command answers with guidance rather than throwing, so its text has to be read to know whether
  * a switch happened — the same technique the session tool uses, and needed more here: a false success
- * leaves the agent telling the user about a model the next turn is not using. Anchored to the start,
- * where the router puts its own words, so a conversation title or a model name further down a
- * successful reply cannot be read as a failure.
+ * leaves the agent telling the user about a model the next turn is not using, and about a reasoning
+ * level it is not thinking at. Anchored to the start, where the router puts its own words, so a
+ * conversation title or a model name further down a successful reply cannot be read as a failure.
+ * `当前` covers the whole family of "there is nothing to act on" answers.
  */
-const MODEL_FAILURE_PATTERN = /^(找不到模型|当前|切换模型失败)/
+const MODEL_FAILURE_PATTERN =
+  /^(找不到模型|找不到等级|当前|切换模型失败|切换推理等级失败)/
 
 /**
  * The message that tells the user a session operation actually happened.
@@ -972,27 +980,37 @@ class WechatRuntime {
    * The natural-language half of `/model`, exactly as {@link controlSession} is the natural-language
    * half of `/switch`: the request is recognised by the agent, and the channel only carries it out.
    * Every action runs through the router's own command path, so a spoken request and a typed one can
-   * never diverge — one list, one numbering, one failure message.
+   * never diverge — one list, one numbering, one failure message, and one place that decides what a
+   * reasoning level is called.
    *
    * @param callerSessionId - Session the calling agent is in, which identifies the conversation.
-   * @param action - `list` or `switch`.
+   * @param action - `list`, `switch`, or `set_level`.
    * @param target - Model to switch to, by number, name or id.
+   * @param level - Reasoning level: the one to switch to for `set_level`, and optionally the one to
+   *   switch to *with* the model for `switch`.
    * @returns A result the agent can act on, or a reason it could not be done.
    */
   async controlModel(
     callerSessionId: string | undefined,
     action: string,
     target?: string,
+    level?: string,
   ): Promise<{ ok: boolean; detail: string }> {
     // Validated here rather than by building `/<action>`: an action this plugin does not know must
     // fail, not turn into a different command that happens to start with a slash.
-    if (action !== 'list' && action !== 'switch') {
+    if (action !== 'list' && action !== 'switch' && action !== 'set_level') {
       return { ok: false, detail: `不支持的操作：${action}` }
     }
     if (action === 'switch' && (target === undefined || target.trim() === '')) {
       return {
         ok: false,
         detail: '切换模型需要指定目标：清单里的编号、模型名字或模型 id。',
+      }
+    }
+    if (action === 'set_level' && (level === undefined || level.trim() === '')) {
+      return {
+        ok: false,
+        detail: '切换推理等级需要指定等级：回复 /model 看清单，等级名字就在模型下面。',
       }
     }
 
@@ -1005,11 +1023,23 @@ class WechatRuntime {
       return { ok: false, detail: '这个会话没有绑定任何微信对话，无法操作。' }
     }
 
+    /*
+     * One command text per action, built here rather than by the router, so the router keeps owning
+     * the syntax: `等级` is the word it parses, and a second spelling invented here would be a second
+     * answer to the same request.
+     */
+    const named = level === undefined || level.trim() === '' ? '' : ` 等级 ${level.trim()}`
+    const text =
+      action === 'list'
+        ? '/model'
+        : action === 'set_level'
+          ? `/model 等级 ${String(level).trim()}`
+          : `/model ${String(target).trim()}${named}`
     const result = await this.#router.route({
       conversationId,
       accountId: binding.accountId,
       peerId: binding.peerId,
-      text: action === 'switch' ? `/model ${target ?? ''}` : '/model',
+      text,
     })
     if (result.kind !== 'reply') {
       return { ok: false, detail: `不支持的操作：${action}` }
@@ -1019,9 +1049,9 @@ class WechatRuntime {
      * The reply decides the outcome, because the command answers with guidance instead of throwing.
      *
      * A false success is the failure that matters here: the agent would tell the user a model the
-     * next turn is not using, and nothing about the chat would look wrong. The pattern is anchored to
-     * the opening of each failure message, so a conversation title or a model name appearing later in
-     * a successful reply cannot be mistaken for one.
+     * next turn is not using — or a level it is not thinking at — and nothing about the chat would
+     * look wrong. The pattern is anchored to the opening of each failure message, so a conversation
+     * title or a model name appearing later in a successful reply cannot be mistaken for one.
      */
     const failed = MODEL_FAILURE_PATTERN.test(result.text)
     // Sent by the channel in both cases, for the same reason the session tool does it: a tool result
@@ -1041,7 +1071,9 @@ class WechatRuntime {
       detail:
         action === 'list'
           ? '模型清单已直接发给用户。不要重复这份清单。'
-          : '模型已切换，已直接告诉用户。不要重复。',
+          : action === 'set_level'
+            ? '推理等级已切换，已直接告诉用户。不要重复。'
+            : '模型已切换，已直接告诉用户。不要重复。',
     }
   }
 
@@ -2742,10 +2774,12 @@ class WechatRuntime {
    * The model tool as the registry needs it.
    *
    * Built like the session tool, and registered for the same reason: a request phrased as a sentence
-   * ("换个模型""切到 X") cannot be recognised by rules, so the judgement is the agent's and the
-   * channel only executes it. The action set is deliberately smaller than the session tool's — a
-   * model has no equivalent of "new" or "cancel", and inventing one would give the agent a way to
-   * ask for something that does not exist.
+   * ("换个模型""切到 X""把推理等级调高") cannot be recognised by rules, so the judgement is the
+   * agent's and the channel only executes it. The action set stays small — a model has no equivalent
+   * of "new" or "cancel", and inventing one would give the agent a way to ask for something that
+   * does not exist. Changing the level is its own action rather than a parameter of `switch`, because
+   * the two are different requests: one changes which model answers, the other only how hard it
+   * thinks, and a single action that sometimes did both would have to guess which was meant.
    *
    * @returns The definition to register.
    */
@@ -2758,14 +2792,19 @@ class WechatRuntime {
         properties: {
           action: {
             type: 'string',
-            enum: ['list', 'switch'],
+            enum: ['list', 'switch', 'set_level'],
             description:
-              'list: show every available model with its number, and mark the one in use. switch: move this WeChat conversation to another model.',
+              'list: show every available model with its number and its reasoning levels, and mark the model and level in use. switch: move this WeChat conversation to another model. set_level: change the reasoning level of the model in use, keeping the model.',
           },
           target: {
             type: 'string',
             description:
-              'For switch, the model to move to: its number from list, its name, or its model id. Required for switch.',
+              'For switch, the model to move to: its number from list, its name, or its model id. Required for switch. Ignored by the other actions.',
+          },
+          level: {
+            type: 'string',
+            description:
+              'A reasoning level, by the name or id the list showed (for example high or 高). Required for set_level; for switch it is optional and switches the model and the level together.',
           },
         },
         required: ['action'],
@@ -2782,7 +2821,13 @@ class WechatRuntime {
           required: ['detail', 'ok'],
         },
         render: (args) => [
-          { type: 'text', text: `model_control ${String(args.action ?? '')}` },
+          {
+            type: 'text',
+            text:
+              `model_control ${String(args.action ?? '')}` +
+              `${args.target === undefined ? '' : ` ${String(args.target)}`}` +
+              `${args.level === undefined ? '' : ` 等级 ${String(args.level)}`}`,
+          },
         ],
       },
       execute: async (args, exec) => {
@@ -2790,9 +2835,11 @@ class WechatRuntime {
           sessionIdOf(exec.agent),
           String(args.action ?? ''),
           args.target === undefined ? undefined : String(args.target),
+          args.level === undefined ? undefined : String(args.level),
         )
         this.#recordBoot(
-          `model_control: action=${String(args.action)} target=${String(args.target ?? '')} ok=${String(result.ok)}`,
+          `model_control: action=${String(args.action)} target=${String(args.target ?? '')} ` +
+            `level=${String(args.level ?? '')} ok=${String(result.ok)}`,
         )
         return { detail: result.detail, ok: result.ok }
       },
@@ -3842,27 +3889,39 @@ class WechatRuntime {
        * message does not, and the number the user replies with has to be a number they were shown,
        * so the grouping is dropped here and the router only ever sees one numbered list.
        *
-       * `current` is the catalog's default rather than the session's own selection: the host does not
-       * report a per-session model through this interface. It is the right thing to mark anyway,
-       * because choosing a model also saves it as that default — so the mark follows every switch
-       * made through this channel, and only a model chosen in the desktop for one session can differ.
+       * `current` is the *bound session's* own selection, read from its `modelSelection` projection,
+       * and the deployment default when the host cannot answer that — see `#modelInUse`. It matters
+       * because a model chosen on the desktop for one session is not the default, and a list that
+       * marked the default would tell that user they are on a model they are not.
        */
-      listModels: async () => {
+      listModels: async (sessionId?: string) => {
         const catalog = await ctx.sessionController.modelCatalog()
+        const current = await this.#modelInUse(catalog, sessionId)
         return {
-          current: catalog.default,
+          current,
           models: catalog.groups.flatMap((group) =>
             group.models.map((model) => ({
               provider: group.id,
               providerName: group.name,
               model: model.id,
               name: model.name,
-              // The model's own default effort, because a reasoning model has to be selected at a
-              // level and leaving it out would hand that decision to a resolve step the user cannot
-              // see. This mirrors what the host does when it picks a model for itself.
-              ...(model.reasoning?.defaultEffort === undefined
+              /*
+               * The levels the model publishes, and the one the host would pick when a switch names
+               * none. A reasoning model has to be selected at a level, and leaving that out would
+               * hand the decision to a resolve step the user cannot see; this mirrors what the host
+               * does when it picks a model for itself.
+               */
+              ...(model.reasoning === undefined
                 ? {}
-                : { reasoningEffort: model.reasoning.defaultEffort }),
+                : {
+                    levels: model.reasoning.efforts.map((effort) => ({
+                      id: effort.id,
+                      name: effort.name,
+                    })),
+                    ...(model.reasoning.defaultEffort === undefined
+                      ? {}
+                      : { defaultLevel: model.reasoning.defaultEffort }),
+                  }),
             })),
           ),
           failures: catalog.failures.map((failure) => ({
@@ -3883,8 +3942,70 @@ class WechatRuntime {
           model,
           ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
         })
-        return { provider: selected.provider, model: selected.model }
+        // The level travels back with the model, because the host normalises it: a selection that
+        // named no level comes back with the model's own default, and the reply has to say which
+        // level is actually in effect rather than which one was asked for.
+        return {
+          provider: selected.provider,
+          model: selected.model,
+          ...(selected.reasoningEffort === undefined
+            ? {}
+            : { reasoningEffort: selected.reasoningEffort }),
+        }
       },
+    }
+  }
+
+  /**
+   * Which model and reasoning level one session runs on.
+   *
+   * Read from the session's own `modelSelection` projection, which is the only per-session answer the
+   * host gives — the catalog answers deployment-wide — and falling back to the deployment default,
+   * which is what `/model` marked before this read existed. The fallback covers three normal cases:
+   * a conversation with no session yet, a session with no request of its own (the projection is
+   * `{lastUsed: null, next: null}` until its first turn), and a host generation that does not expose
+   * `projections` at all.
+   *
+   * The level is filled in here rather than left to the caller, so the one shown is the one that will
+   * be used: the projection omits it when the adapter owns the default, and the model's
+   * `defaultEffort` is what the host applies in that case. The desktop picker substitutes exactly the
+   * same value.
+   *
+   * @param catalog - Catalog just read, for the default and the models' levels.
+   * @param sessionId - Session the conversation is bound to, absent when there is none.
+   */
+  async #modelInUse(catalog: ModelCatalog, sessionId: string | undefined): Promise<ModelSelection> {
+    let reported: ModelSelection | undefined
+    if (sessionId !== undefined) {
+      try {
+        const read = await this.#ctx.sessionController.projections?.(
+          { sessionId },
+          new AbortController().signal,
+        )
+        const next = read?.values?.modelSelection?.next
+        if (next !== undefined && next !== null && next.provider !== '' && next.model !== '') {
+          reported = next
+        }
+      } catch (error) {
+        /*
+         * Recorded, not thrown. A read that fails costs only the precision of the mark — the listing
+         * falls back to the deployment default, which is what it showed before this read existed —
+         * and losing `/model` over it would take away the user's only way to see or change the model.
+         */
+        this.#recordBoot(
+          `model: reading the selection of ${sessionId} failed, marking the deployment default: ${describeError(error)}`,
+        )
+      }
+    }
+    const selection = reported ?? catalog.default
+    const model = catalog.groups
+      .find((group) => group.id === selection.provider)
+      ?.models.find((entry) => entry.id === selection.model)
+    const effort = selection.reasoningEffort ?? model?.reasoning?.defaultEffort
+    return {
+      provider: selection.provider,
+      model: selection.model,
+      ...(effort === undefined ? {} : { reasoningEffort: effort }),
     }
   }
 }
