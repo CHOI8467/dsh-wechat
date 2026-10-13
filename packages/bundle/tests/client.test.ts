@@ -34,6 +34,15 @@ const clientPath = join(here, '..', 'client.js')
 const PREFIX = '/.dsh-wechat-plugin'
 
 /**
+ * Any timer this long is the section watchdog; nothing else in the bundle waits seconds for the shell.
+ *
+ * Matched as "at least" rather than by the exact window on purpose: a test that compared against
+ * 20 000 would quietly stop capturing the timer the day the window changed, and would then assert
+ * against a timer that never arrives.
+ */
+const WATCHDOG_MIN_MS = 10_000
+
+/**
  * A React stand-in with working `useState` and a runnable `useEffect`.
  *
  * Effects are collected during render and executed by {@link Mounted.flushEffects},
@@ -162,6 +171,8 @@ async function loadClientBundle(options = {}) {
     fetch: globalThis.fetch,
     setInterval: globalThis.setInterval,
     clearInterval: globalThis.clearInterval,
+    setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout,
   }
   // `navigator` is deliberately not saved: it is a read-only global in Node and the
   // bundle only reads `navigator.language`, which Node already provides.
@@ -201,6 +212,24 @@ async function loadClientBundle(options = {}) {
   // Timers are neutralised: the poll loop is not what these tests exercise.
   globalThis.setInterval = () => 0
   globalThis.clearInterval = () => {}
+  /*
+   * The watchdog's own timer is captured rather than scheduled.
+   *
+   * It waits twenty seconds, so a test that had to wait for it would either be slow or assert
+   * nothing, and a test that asserted on a *different* clock would not be testing this bundle. The
+   * real timer is also what held this file's process open for twenty seconds — every test that
+   * loaded the bundle armed one. Anything shorter still runs on the real clock, so the waits the
+   * tests themselves perform and the page's own transient "已保存" timer behave as before.
+   */
+  const watchdogTimers = []
+  const realSetTimeout = saved.setTimeout
+  globalThis.setTimeout = (callback, delay, ...rest) => {
+    if (typeof delay === 'number' && delay >= WATCHDOG_MIN_MS) {
+      watchdogTimers.push(callback)
+      return 0
+    }
+    return realSetTimeout(callback, delay, ...rest)
+  }
   if (options.fetchImpl) globalThis.fetch = options.fetchImpl
 
   try {
@@ -225,6 +254,20 @@ async function loadClientBundle(options = {}) {
     exports: exported,
     react,
     documentStub,
+    /**
+     * Let the twenty seconds pass.
+     *
+     * Asserting on the watchdog means asserting on what it does when its window closes, and this is
+     * the only way to do that without waiting for it. Exactly one timer is expected: the bundle arms
+     * it once, while its factory runs. An assertion here rather than a silent no-op, because a
+     * harness that stopped capturing the timer would make every "no error" test below pass by
+     * having fired nothing.
+     */
+    fireWatchdog() {
+      assert.equal(watchdogTimers.length, 1, 'the watchdog must be armed exactly once, at load time')
+      const [timer] = watchdogTimers.splice(0)
+      timer()
+    },
     restore() {
       for (const [key, value] of Object.entries(saved)) {
         if (value === undefined) delete globalThis[key]
@@ -388,6 +431,76 @@ function withDirectoryPicker(pick) {
   }
 }
 
+/**
+ * Every client failure the page sent to the host, parsed.
+ *
+ * `reportFailure` reaches the host as a POST to `/client-error` carrying `{ scope, message, stack }`,
+ * and the scope is what says *which* phase failed. That is the whole question when a boot log has to
+ * tell "this bundle never registered a page" apart from "the page registered and then could not
+ * load" — two different failures with two different fixes.
+ *
+ * @param calls - The request log {@link mountPage} returns.
+ */
+function clientErrors(calls) {
+  return calls
+    .filter((call) => call.path === PREFIX + '/client-error')
+    .map((call) => JSON.parse(call.body))
+}
+
+/**
+ * A `fetch` stand-in that records what the page reported and answers 200.
+ *
+ * The page's only way out of the browser is that route, so what lands here is exactly what the host
+ * would have written to the boot log.
+ *
+ * @param reports - Array the reported calls are appended to.
+ */
+function reportingFetch(reports) {
+  return async (url, options) => {
+    reports.push({ path: String(url).replace(/^https?:\/\/[^/]+/, ''), body: options?.body })
+    return { ok: true, status: 200, text: async () => '{}' }
+  }
+}
+
+/**
+ * Apply the bundle to a slot-registry stand-in and report what it did.
+ *
+ * It mirrors the two registry semantics the watchdog now rests on: `inject` runs its contributor as
+ * soon as the slot is declared — `ui-renderer` calls it synchronously when the declaration already
+ * exists — and it calls nothing at all when the shell never declares the slot.
+ *
+ * @param bundle - Handle from {@link loadClientBundle}.
+ * @param options - `declared: false` for a shell that never declares the section slot;
+ *   `crashChannel: false` for a shell that does not offer `slots.onEntryError`.
+ */
+function applyToRegistry(bundle, options = {}) {
+  const sections = []
+  const crashListeners = []
+  const declared = options.declared ?? true
+  const ctx = {
+    effect(execute) {
+      execute()
+    },
+    slots: {
+      inject: (_slot, contributor) => (declared ? contributor() : () => {}),
+      register(definition, component) {
+        sections.push({ definition, component })
+        return () => {}
+      },
+      ...(options.crashChannel === false
+        ? {}
+        : {
+            onEntryError(listener) {
+              crashListeners.push(listener)
+              return () => {}
+            },
+          }),
+    },
+  }
+  bundle.exports.apply(ctx)
+  return { ctx, sections, crashListeners }
+}
+
 const STATUS = {
   enabled: true,
   accounts: [{ accountId: 'fd17bd2d40c3@im.bot', userId: 'peer@im.wechat', polling: true }],
@@ -487,6 +600,94 @@ test('apply registers its resources through effect and cleans them up', async ()
     disposers[0]()
     assert.equal(sections.length, 0, 'the section is unregistered')
     assert.equal(styles().length, 0, 'the stylesheet is removed')
+  } finally {
+    bundle.restore()
+  }
+})
+
+test('a launch that never opens the settings page reports no error', async () => {
+  /*
+   * The bug this pins down. The bundle is loaded at application start (`dsh.client.immediately`),
+   * while the component only mounts when the user opens 设置 → 微信 — so "nothing rendered within 20
+   * seconds" is the ordinary state of every launch that stays in the conversation view. The old
+   * signal was set in the component body, so it turned that ordinary state into one false error per
+   * boot: `客户端错误[mount]: 插件已加载，但设置页在 20 秒内没有渲染`.
+   *
+   * The health signal now comes from registering the section, and registration happens whether or
+   * not anybody ever opens the page.
+   */
+  const reports = []
+  const bundle = await loadClientBundle({ fetchImpl: reportingFetch(reports) })
+  try {
+    const { sections } = applyToRegistry(bundle)
+    assert.equal(sections.length, 1, 'the section registered with the shell')
+
+    bundle.fireWatchdog() // twenty seconds later, with the user still in the conversation view
+
+    assert.deepEqual(reports, [], 'a settings page nobody opened is not a failure')
+  } finally {
+    bundle.restore()
+  }
+})
+
+test('a bundle that loads but never registers its section is still reported', async () => {
+  /*
+   * The watchdog's value, and the half the fix must not throw away. If the shell never declares
+   * `settings.section`, the registry never runs the contributor, no section is ever registered, and
+   * 设置 → 微信 will never appear — with nothing else anywhere to say so. Silence here would be the
+   * exact failure mode this log exists to prevent.
+   *
+   * The registry stand-in has no `onEntryError` either, which is the other thing this test holds:
+   * the crash channel is an optional extra, and a shell without it must still activate the plugin.
+   */
+  const reports = []
+  const bundle = await loadClientBundle({ fetchImpl: reportingFetch(reports) })
+  try {
+    const { sections } = applyToRegistry(bundle, { declared: false, crashChannel: false })
+    assert.equal(sections.length, 0, 'nothing registered: this is the failure the watchdog watches for')
+
+    bundle.fireWatchdog()
+
+    assert.equal(reports.length, 1, 'the watchdog still speaks when nothing registered')
+    assert.equal(reports[0].path, PREFIX + '/client-error')
+    const payload = JSON.parse(reports[0].body)
+    assert.equal(payload.scope, 'register', 'the scope names the step that failed')
+    assert.match(payload.message, /看门狗/, 'the log line names the watchdog, so it can be traced here')
+  } finally {
+    bundle.restore()
+  }
+})
+
+test("a section that throws while rendering is reported, and another plugin's crash is not", async () => {
+  /*
+   * Registering a section proves the shell accepted it; it says nothing about the render. The shell
+   * renders every slot entry inside an error boundary that reports crashes through
+   * `ctx.slots.onEntryError` — the one seam visible from here, and the same one the shell's own
+   * cordis client runner subscribes to.
+   *
+   * The filter matters as much as the report: every settings section in the shell shares this slot,
+   * so a crash reported without checking whose entry it was would blame this plugin for another
+   * plugin's bug.
+   */
+  const reports = []
+  const bundle = await loadClientBundle({ fetchImpl: reportingFetch(reports) })
+  try {
+    const { sections, crashListeners } = applyToRegistry(bundle)
+    assert.equal(crashListeners.length, 1, "the plugin listens on the shell's crash channel")
+
+    const [crash] = crashListeners
+    crash('settings.section', { component: () => null }, new Error('某个别的插件崩了'), {
+      abdicated: true,
+    })
+    assert.deepEqual(reports, [], 'a crash that is not ours must not be attributed to this plugin')
+
+    crash('settings.section', { component: sections[0].component }, new Error('render exploded'), {
+      abdicated: true,
+    })
+    assert.equal(reports.length, 1, 'our own render crash reaches the boot log')
+    const payload = JSON.parse(reports[0].body)
+    assert.equal(payload.scope, 'render')
+    assert.match(payload.message, /render exploded/, 'and carries what was thrown')
   } finally {
     bundle.restore()
   }
@@ -705,7 +906,7 @@ test('the page asks for a verification code only when the host says so', async (
 })
 
 test('a failing status route renders an error instead of throwing', async () => {
-  const { tree, bundle } = await mountPage({
+  const { tree, calls, bundle } = await mountPage({
     // Status is the one the page cannot render without, so its absence is fatal.
     [PREFIX + '/login']: LOGIN_RUNNING,
   })
@@ -714,6 +915,19 @@ test('a failing status route renders an error instead of throwing', async () => 
     assert.match(text, /not found|读取设置失败|Could not read/)
     const buttons = collectByType(tree, 'button')
     assert.ok(buttons.length >= 1, 'an error state offers a retry')
+    /*
+     * And the failure reaches the host, under its own scope.
+     *
+     * This is the path the watchdog is *not* responsible for, and the two must stay apart: a page
+     * that opens and cannot read its routes is a different event from a bundle that never managed
+     * to register a page at all, and only the scope in the boot log tells them apart.
+     */
+    const reported = clientErrors(calls)
+    assert.deepEqual(
+      reported.map((report) => report.scope),
+      ['load'],
+      'a settings page that fails to load is reported under the load scope',
+    )
   } finally {
     bundle.restore()
   }

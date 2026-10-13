@@ -71,19 +71,37 @@ window.__ModuleLoader__.load({
   id: 'dsh-wechat-plugin',
   factory: (require) => {
     /**
-     * Whether this plugin's settings section has rendered at least once.
+     * Whether the settings section has been registered with the shell's slot registry.
      *
-     * A bundle can load and register correctly yet still never produce a usable
-     * page. That failure leaves no evidence anywhere, so the watchdog reports it.
+     * This is the watchdog's health signal, and it is deliberately *not* "the page rendered".
+     * The bundle loads at application start (`dsh.client.immediately`), while the component
+     * only mounts when the user opens 设置 → 微信 — so on every launch that stays in the
+     * conversation view, "nothing rendered within 20 seconds" was the *normal* state, and
+     * the old signal reported it as a failure once per boot.
+     *
+     * Registration is a fact worth watching, and it is one this side can prove: it says the
+     * factory ran, `apply` ran, `ctx.slots` existed, and the shell accepted the section — so
+     * the shell renders it whenever that section is opened. It says nothing about *how* that
+     * render goes; the two comments on the registration and on `watchSectionRenderErrors`
+     * name what is covered and what is not.
      */
-    let mountedOnce = false
+    let sectionRegistered = false
 
-    // Scheduled here rather than at module scope so the timer cannot interfere with
-    // registration, which happens before any factory runs.
+    /*
+     * Armed here, at bundle load, so the countdown starts from the earliest moment this plugin
+     * can be judged. It does not end there any more: the signal is set later, in `apply`, which
+     * is exactly the step a bundle that loads but never registers fails to complete.
+     */
     try {
       setTimeout(() => {
-        if (!mountedOnce) {
-          reportFailure('mount', new Error('插件已加载，但设置页在 20 秒内没有渲染（看门狗触发）'))
+        if (!sectionRegistered) {
+          // Scoped `register`, not `mount`: this line reports the step that failed, and the old
+          // name described a step this watchdog never watched. A stale label misleads exactly the
+          // way a stale success condition does.
+          reportFailure(
+            'register',
+            new Error('插件已加载，但没能把「微信」设置页注册到 DSH（20 秒看门狗触发）'),
+          )
         }
       }, 20_000)
     } catch {
@@ -582,10 +600,6 @@ a.dsh-wechat-button { text-decoration: none; }
         busy: false,
         verifyCode: '',
       })
-
-      // Tell the watchdog that this page really renders. Setting it here is what
-      // distinguishes "loaded but blank" from a working settings section.
-      mountedOnce = true
 
       // Re-render when the shell changes the page language.
       const [, bump] = React.useState(0)
@@ -1602,8 +1616,8 @@ a.dsh-wechat-button { text-decoration: none; }
       clientContext = ctx
       ctx.effect(() => {
         const removeStyles = installStyles()
-        const disposeSection = ctx.slots.inject('settings.section', () =>
-          ctx.slots.register(
+        const disposeSection = ctx.slots.inject('settings.section', () => {
+          const dispose = ctx.slots.register(
             {
               name: 'settings.section',
               id: 'wechat',
@@ -1613,13 +1627,64 @@ a.dsh-wechat-button { text-decoration: none; }
               inject: () => ({}),
             },
             WechatSettings,
-          ),
-        )
+          )
+          /*
+           * The health signal, set where it can actually be proved: `slots.inject` runs this
+           * contributor as soon as the shell declares the slot (synchronously, when the
+           * declaration already exists), so reaching this line means the registry took the
+           * section and the shell will render it whenever it is opened.
+           *
+           * A shell that never declares the slot never runs this, and the watchdog reports
+           * that — which is the failure the watchdog exists for.
+           */
+          sectionRegistered = true
+          return dispose
+        })
+        const disposeRenderWatch = watchSectionRenderErrors(ctx)
         return () => {
+          if (typeof disposeRenderWatch === 'function') disposeRenderWatch()
           if (typeof disposeSection === 'function') disposeSection()
           removeStyles()
         }
       })
+    }
+
+    /**
+     * Report a crash of this plugin's own settings section, because the watchdog cannot see
+     * rendering.
+     *
+     * Registering a section proves only that the shell accepted it. Rendering is the other half,
+     * and this is the one seam the shell exposes for it: every entry it renders sits inside an
+     * error boundary that reports the crash through `ctx.slots.onEntryError`, filtered here by
+     * component identity so another plugin's section in the same slot is not attributed to us.
+     * The shell's own cordis client runner subscribes to that channel with the same
+     * `entry.component` test, so this is a supported seam rather than a guess.
+     *
+     * What is covered: a component that *throws* while rendering, at the moment the user opens
+     * the section. What is not, and no signal here claims otherwise: a component that renders
+     * without throwing and still shows nothing usable — a blank or wrong page. That failure has
+     * no observable form from inside this plugin at all.
+     *
+     * Optional on purpose. A shell without the method leaves the watchdog exactly as strong as
+     * it was, and nothing on this path may fail activation: an entry the runtime records as
+     * `failed` makes the shell refuse to start the whole application.
+     *
+     * @param ctx - The client context `apply` received.
+     * @returns The unsubscribe, when the shell offers the channel.
+     */
+    function watchSectionRenderErrors(ctx) {
+      const slots = ctx.slots
+      if (typeof slots?.onEntryError !== 'function') return undefined
+      try {
+        return slots.onEntryError((slotKey, entry, error) => {
+          if (slotKey !== 'settings.section' || entry?.component !== WechatSettings) return
+          reportFailure('render', error instanceof Error ? error : new Error(String(error)))
+        })
+      } catch (error) {
+        // Losing the extra coverage must not cost the section, but it is worth a line in the log.
+        reportFailure('watchdog', error instanceof Error ? error : new Error(String(error)))
+        return undefined
+      }
     }
 
     // Returning the exports object directly is the documented factory shape.
