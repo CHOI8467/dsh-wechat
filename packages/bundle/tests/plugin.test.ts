@@ -20,6 +20,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 
 import { apply, recordClientFailure, type SendFunction } from '../src/host.ts'
+import { ROUTE_SETTINGS } from '../src/routes.ts'
 import type { WechatContext } from '../src/services.ts'
 import { DEFAULT_SETTINGS, SendRefusedError, aesKeyToBase64, encodeWorkspaceDir, isSameWorkspace, shortId } from '@dsh-wechat/core'
 
@@ -99,7 +100,17 @@ interface Sent {
 
 /** The slice of the runtime these tests drive. */
 interface RuntimeShape {
-  status(): Promise<{ enabled: boolean; accounts: unknown[]; needsLogin: boolean; errors: string[] }>
+  status(): Promise<{
+    enabled: boolean
+    accounts: unknown[]
+    needsLogin: boolean
+    errors: string[]
+    diagnostics?: {
+      workspace: string
+      settingsWorkspace: string
+      logTail: string[]
+    }
+  }>
   loginState(): { phase: string; step?: string }
   bindings(): Promise<{ conversationId: string; sessionId: string; title: string }[]>
   /**
@@ -154,6 +165,14 @@ interface Harness {
   allPrompts: { sessionId: string; mode: 'queue' | 'steer'; text: string }[]
   sent: Sent[]
   events: string[]
+  /**
+   * Routes the plugin registered on the DSH web server.
+   *
+   * Captured rather than discarded so a test can call the real handler the settings page calls.
+   * Calling `runtime.saveSettings` directly would skip the request parsing and the type check that
+   * decide what a page's save actually means — which is where a save can be dropped without a word.
+   */
+  routes: { path: string; handler: (req: unknown, res: unknown) => Promise<void> }[]
   dispose(): void
 }
 
@@ -205,6 +224,8 @@ async function mountWith(options: {
   const events: string[] = []
   let runtime: RuntimeShape | undefined
   let disposer: (() => void) | undefined
+  /** Routes registered on the stub web server, in order. */
+  const routes: { path: string; handler: (req: unknown, res: unknown) => Promise<void> }[] = []
 
   const stateFile = join(options.home, 'wechat', 'state.json')
 
@@ -500,7 +521,15 @@ async function mountWith(options: {
     },
     get(name: string) {
       if (name === 'homePaths') return { home: options.home }
-      if (name === 'webServer') return { port: 0, register: () => () => {} }
+      if (name === 'webServer') {
+        return {
+          port: 0,
+          register: (route: { path: string; handler: (req: unknown, res: unknown) => Promise<void> }) => {
+            routes.push(route)
+            return () => {}
+          },
+        }
+      }
       /*
        * The permission-preset service, reached the way the plugin reaches it.
        *
@@ -545,6 +574,7 @@ async function mountWith(options: {
     allPrompts,
     sent,
     events,
+    routes,
     dispose: () => disposer?.(),
   }
 }
@@ -791,6 +821,51 @@ async function ageBindings(harness: Harness, ageMs: number): Promise<void> {
 async function bootLogLines(harness: Harness): Promise<string[]> {
   const text = await readFile(join(harness.bundleHome, 'wechat', 'boot.log'), 'utf8')
   return text.split(/\r?\n/).filter((line) => line !== '')
+}
+
+/**
+ * Call one of the plugin's own routes the way the web server calls it.
+ *
+ * The handler reads the request as an async iterable of chunks and answers through `writeHead` /
+ * `end`, so the fakes implement exactly that and nothing more. What this buys over calling the
+ * runtime directly: the request body goes through JSON parsing and the host's type check, which is
+ * where a page's save can be accepted, trimmed, or dropped.
+ *
+ * @param harness - Mounted plugin.
+ * @param url - Request path, as `routes.ts` composes it.
+ * @param options.method - HTTP method; defaults to GET.
+ * @param options.body - JSON body to send, omitted for GET.
+ * @returns The status code and the parsed response body.
+ */
+async function callRoute(
+  harness: Harness,
+  url: string,
+  options: { method?: string; body?: unknown } = {},
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const route = harness.routes.find((entry) => url.startsWith(entry.path))
+  assert.ok(route, `the plugin registered a route covering ${url}`)
+  const chunks =
+    options.body === undefined ? [] : [Buffer.from(JSON.stringify(options.body), 'utf8')]
+  const req = {
+    url,
+    method: options.method ?? 'GET',
+    async *[Symbol.asyncIterator]() {
+      for (const chunk of chunks) yield chunk
+    },
+  }
+  let status = 0
+  let payload = ''
+  const res = {
+    writeHead(code: number) {
+      status = code
+      return this
+    },
+    end(text?: string) {
+      payload = text ?? ''
+    },
+  }
+  await route.handler(req, res)
+  return { status, body: payload === '' ? {} : (JSON.parse(payload) as Record<string, unknown>) }
 }
 
 test('a message for an archived session starts a new one, rebinds, and says so', async () => {
@@ -3344,6 +3419,112 @@ test('settings changes apply without a restart', async () => {
     // The defaults stay reported, so the page can offer "reset to default".
     assert.equal(after.defaults.mergeWindowMs, 10_000)
   })
+})
+
+test('a directory saved from the settings page reaches state.json and is used after a restart', async () => {
+  /*
+   * The end-to-end shape of the report this covers: `settings.workspacePath` is written by nothing
+   * but the page's own save, and no test drove a save through the request, the host's type check,
+   * the store write, and the next start. Every half was green while the user's choice never reached
+   * the file — and the evidence that settled it was the *absence of the key* in `state.json`, which
+   * is exactly what a save that never left the browser looks like.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
+  const chosen = join(home, 'picked-ws')
+  try {
+    const harness = await mount({ home, seedAccount: false })
+    try {
+      const loaded = await callRoute(harness, ROUTE_SETTINGS)
+      assert.equal(loaded.status, 200)
+      const draft = (loaded.body.settings ?? {}) as Record<string, unknown>
+      assert.equal(draft.workspacePath, '', 'an untouched install stores no directory')
+
+      // The page posts its whole draft with one field replaced, which is what the client bundle does.
+      const saved = await callRoute(harness, ROUTE_SETTINGS, {
+        method: 'POST',
+        body: { ...draft, workspacePath: chosen },
+      })
+      assert.equal(saved.status, 200)
+      assert.equal(
+        (saved.body.settings as Record<string, unknown>).workspacePath,
+        chosen,
+        'the answer carries the value the host stored, which is what the page shows',
+      )
+
+      // The value really is on disk. This is the assertion whose absence let the bug through.
+      const stored = JSON.parse(await readFile(harness.stateFile, 'utf8')) as {
+        settings?: Record<string, unknown>
+      }
+      assert.equal(stored.settings?.workspacePath, chosen, 'the value lands in state.json')
+
+      // And the status tells the two facts apart until a restart: stored is not in effect.
+      const before = await harness.runtime.status()
+      assert.equal(before.diagnostics?.settingsWorkspace, chosen, 'the stored value is reported')
+      assert.notEqual(
+        before.diagnostics?.workspace,
+        chosen,
+        'the directory in use is still the one resolved at startup',
+      )
+
+      // The save is diagnosable from the log alone: which key, and both values.
+      const line = (await bootLogLines(harness)).find(
+        (entry) => entry.includes('settings: saved') && entry.includes('workspacePath'),
+      )
+      assert.ok(line, 'a settings save writes one line naming the key')
+      assert.ok(
+        line.includes('workspacePath "" -> ') && line.includes(JSON.stringify(chosen)),
+        `the line carries the old and the new value, got: ${String(line)}`,
+      )
+    } finally {
+      harness.dispose()
+    }
+
+    // A restart: `apply` reads the stored directory before any message can arrive.
+    const second = await mount({ home, seedAccount: false })
+    try {
+      assert.ok(existsSync(chosen), 'the chosen directory is created at startup')
+      const after = await second.runtime.status()
+      assert.equal(after.diagnostics?.workspace, chosen, 'the stored directory is the one in use')
+      assert.equal(after.diagnostics?.settingsWorkspace, chosen, 'and the two now agree')
+    } finally {
+      second.dispose()
+    }
+  } finally {
+    await removeHome(home)
+  }
+})
+
+test('a settings save that cannot be written is logged and reported as a failure', async () => {
+  /*
+   * The other half of the same line: a save that fails has to leave a mark, because the page's own
+   * error dialog is gone the moment the tab is closed and the state file then looks exactly like a
+   * save that was never attempted.
+   *
+   * The failure is produced without touching permissions: an empty directory stands where the state
+   * file belongs, so the store's write cannot complete. The reason differs by platform (a rename
+   * over a directory is EPERM on Windows, EISDIR or ENOTDIR elsewhere), which is why only the
+   * marker and the patch are asserted rather than the errno.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
+  try {
+    await mkdir(join(home, 'wechat', 'state.json'), { recursive: true })
+    const harness = await mount({ home, seedAccount: false })
+    try {
+      const answer = await callRoute(harness, ROUTE_SETTINGS, {
+        method: 'POST',
+        body: { workspacePath: join(home, 'picked-ws') },
+      })
+      assert.equal(answer.status, 500, 'the page is told the save failed')
+
+      const line = (await bootLogLines(harness)).find((entry) => entry.includes('settings: save FAILED'))
+      assert.ok(line, 'the failure reaches the boot log')
+      assert.match(line, /workspacePath/, 'and names the field that could not be stored')
+    } finally {
+      harness.dispose()
+    }
+  } finally {
+    await removeHome(home)
+  }
 })
 
 test('a session that is not the bound one can push to WeChat', async () => {

@@ -734,6 +734,122 @@ sessionState?(sessionId: string): Promise<SessionState>
 > 接受之后在 `pre-step` 里静默 reject。那样调用方至少能拿到一个可判断的失败，插件也就不需要
 > 自己去读 registry 猜。
 
+## 4.15 设置页的按钮死了：`ctx` 在组件里根本不存在
+
+> 这是**用户报告的 bug**，也是本仓库第四次遇到"失败不带声音"这个形状。前三次分别在
+> **宿主与服务之间**（§3.6 谎报成功、§3.7 best effort 静默失败、§4.14 连日志都没有），
+> 这一次在**浏览器里**：一个按钮按下去，页面不动、宿主不知道、日志没有一行。
+
+**现象**（设置 → 微信 → 「会话工作目录」）：
+
+1. 点「选择文件夹」选完路径（或手输），**界面没有任何反馈**
+2. **重启 DSH 后输入框又变回空白**
+3. 微信会话始终落在默认目录 `~/.dsh/dsh_wechat`
+
+### 用户的实测证据把范围锁死了（这一条最值得学）
+
+他的原话是：从启动到检查，`state.json` 的 `settings` 里**从未出现过 `workspacePath` 键，连空串都没有**。
+而 `curl` 直接 POST 同一个路由能立刻写进去。
+
+**"连空串都没有"就是结论。** 推理链只有三步，每一步都在代码里：
+
+| 步骤 | 依据 |
+|---|---|
+| 保存时 POST 的是**整个 draft** | `client.js` 的 `saveSettings()`：`body: JSON.stringify(sent)`，而 draft 来自 `GET /settings`，即 `resolveSettings()` 的结果，**每个设置键都在里面**（含 `workspacePath: ''`） |
+| 宿主接受空串 | `readSettingsPatch()`：`if (typeof body.workspacePath === 'string') patch.workspacePath = body.workspacePath.trim()` |
+| 于是任何一次保存都会让这个键**至少以 `''` 的形式**出现在状态文件里 | `saveSettings()` 里 `state.settings = { ...(state.settings ?? {}), ...patch }` |
+
+键**从未出现** ⇒ **那次保存从来没有发出去**。归一化（§4.9）与持久化都无辜。
+
+### 根因（三条，全是"没有声音"）
+
+| # | 问题 | 位置 |
+|---|---|---|
+| 1 | **按钮引用了一个不存在的变量。** 处理函数写的是 `pickDirectory(ctx)`，而 `ctx` 是 `apply(ctx)` 的参数；`WechatSettings` 组件由 slot 注册表实例化，**拿不到那个参数**。于是求值实参时就抛 `ReferenceError: ctx is not defined`——**在选择器被调用之前**，也在那个 `try` 之外（`try` 只包住函数体，包不住实参） | `client.js` 旧 `onClick` |
+| 2 | **"选文件夹"和"保存"是两件事，页面一句没说。** 选完只写进了 `state.draft`（`edit()`），真正落盘要按「保存设置」。而输入框下面只有一行静态说明，页面顶部那句 `settingsHint` 还写着「改完生效，**不用重启**」——与工作目录自己的说明**正好相反** | `client.js` |
+| 3 | **`/status` 只报"正在使用的目录"**，不报"设置里存的目录"。于是"没存上"和"存了没生效"在页面上**长得一模一样**，谁都分不出来 | `host.ts` `status().diagnostics` |
+
+外加一条把 1 变成"完全不可诊断"的：`pickDirectory()` 自己 **`catch {}` 空吞**，调用方又只看返回值
+（`if (picked !== undefined)`），所以连一行 `console.error` 都没有。
+
+### 修法
+
+| 位置 | 做法 |
+|---|---|
+| `client.js` | **把 ctx 留住**：`apply` 里 `clientContext = ctx`，组件用 `pickDirectory(clientContext)`。声明放在组件**外面**——放在组件里会被遮蔽、每次渲染重置（第一版就踩了这个，测试当场报红） |
+| `client.js` | `pickDirectory()` **不再吞异常**：错误交给调用方显示 + `console.error` + `reportFailure` 送进 `boot.log`；**`null` 归一成 `undefined`** 表示"用户取消"，两条路都不报错 |
+| `client.js` | 选完给一句「**已填进输入框。点「保存设置」才会真正保存——选文件夹本身不保存。**」 |
+| `client.js` | 表单和已存值不一致时，按钮旁写「**有改动还没保存。**」——手输、选文件夹、点「恢复默认」都算改动，而这三件事长得都像"已经生效了" |
+| `client.js` | 保存反馈挪到**按钮旁边**：失败显示错误；**主机拒收的字段**逐项点名；"存的目录≠生效的目录"时**一直**提示要重启（不是 2.5 秒的过场） |
+| `client.js` | 顶部那句自相矛盾的提示改成「改完点「保存设置」。多数设置立即生效；「会话工作目录」要重启 DSH 才生效。」 |
+| `host.ts` | 每次保存写**一行 `boot.log`**：`settings: saved workspacePath "" -> "C:\…"; mergeWindowMs 10000 -> 0`；失败写 `settings: save FAILED patch={…} error="…"`。**旧值和新值都要有**，因为状态文件只有"现在是什么"，分不出"没发出来"和"发了没收下" |
+| `host.ts` + `routes.ts` | `diagnostics.settingsWorkspace` 单独回报**设置里存的值**，与 `diagnostics.workspace`（**启动时解析、真正在用**的目录）并列显示 |
+
+**"主机拒收"是顺带堵上的同一类洞**：`readSettingsPatch()` 对类型不对或超上限的字段是**静默丢弃**，
+返回值又是"实际存下来的值"。页面于是会一边显示「已保存」，一边把字段悄悄恢复原样。
+现在页面把**发出去的值**和**主机答回来的值**逐项比对（数字按 `Math.round`、字符串按 `trim`，
+因为主机就是这么处理的），不一致就点名。这样"以后再加设置忘了同步"也会当场看得见——
+**这是 §4.9 那条"白名单一定会漏"在浏览器这一侧的对应物**。
+
+### 一处**有意不做**的事
+
+DSH 自己的目录选择器插件（`dsh-client-ui-directory-picker-native`）声明的是
+`inject = ["slots", "uiWorkspace"]`，并用 `ctx.uiWorkspace.pickDirectory()` 作为
+`__DSH_DIRECTORY_PICKER__` 缺失时的兜底。**我们没有把 `uiWorkspace` 加进 `inject`**：
+按 §3.2，一个永远等不到注入服务的条目**不会激活**，而启动审计会因此**拒绝启动整个应用**——
+为了一个兜底路径去赌服务一定存在，代价是"用户开不了 DSH"。
+改成**在点击那一刻从留住的 ctx 上读**：服务在就可用，不在就报一句清楚的错（而不是静默）。
+
+### 验证
+
+新增/改写的测试（core 0 条 + plugin 2 条 + client 10 条，全套 **290 项全绿**，基线 278）：
+
+| 测试 | 断言的是什么 |
+|---|---|
+| client「the folder dialog is reached through the workspace service when the desktop has no global」 | **就是这条能抓住原 bug**：桌面全局不存在时，走 ctx 的兜底路径必须真的把目录填进输入框 |
+| client「a folder the dialog returns fills the box and says it is not saved yet」 | 字段拿到路径、页面说明"还没保存"、**且没有发出任何 POST** |
+| client「saving posts the chosen directory, so it can reach the state file」 | 点保存后 POST 的 body 里**带着用户选的那个目录** |
+| client「a save that fails says so beside the button instead of looking saved」 | 出现"保存失败"+ 主机的原话，**且不出现"已保存"** |
+| client「a value the host would not accept is reported, not counted as saved」 | 主机把字段改回旧值时，页面点名那个设置 |
+| client「a picker that refuses to open is reported instead of swallowing the failure」 | 错误上页面 + `console.error` + 送到 `/client-error` |
+| client「cancelling the dialog is not an error and changes nothing」 | `null`＝取消：不报错、不改字段、不加提示 |
+| client「a change that is not stored yet is pointed out while it is not」 | 手输也算"还没保存"（`有改动还没保存`），**输入不发请求**，保存后这句消失 |
+| client「a directory that is stored but not in effect says a restart is needed」 | 存了没生效时，重启提示**持续存在** |
+| client「the effective directory and the stored one are shown apart」 | 诊断区两行分开：在用哪个、设置里存的哪个 |
+| plugin「a directory saved from the settings page reaches state.json and is used after a restart」 | **端到端**：走**真路由 handler** → 类型检查 → 落盘 → 状态回报分开 → **重启后真的用新目录**；`boot.log` 那行含旧值与新值 |
+| plugin「a settings save that cannot be written is logged and reported as a failure」 | 写不进去时路由回 500，且日志留下 `settings: save FAILED`（用"状态文件位置上放一个目录"制造失败，**不碰权限**，错误码跨平台不同所以只断言标记与字段名） |
+
+测试的接缝要说清楚：**页面那一半用真 `client.js` 跑，宿主那一半用真路由 + 真状态文件跑，
+但两者不在同一条进程里对接**（`client.js` 是 classic script，只能通过 `new Function` 加载，
+而它的 `fetch` 桩不会真的转到宿主）。两份断言合起来覆盖了请求的**形状**与宿主对它的**处理**，
+剩下的风险是两侧各自改形状而不改另一侧——`ROUTE_PREFIX` 已经有一致性测试，body 形状目前靠这两条。
+
+**反向验证**（四次，都恢复到全绿）：
+
+1. 让 `readSettingsPatch` 丢掉 `workspacePath`（重演 §4.9）→ plugin 的端到端测试立刻红，报的是"主机答回来的值里没有这个目录"
+2. 把 `pickDirectory` 的 `catch {}` 空吞改回去 →「a picker that refuses to open…」红
+3. 把组件里的 `clientContext` 改回 `ctx`（**原始 bug**）→ 5 条 client 测试同时红（选择器两条路都失效）
+4. 去掉保存失败那行 `#recordBoot` →「a settings save that cannot be written…」红
+
+### 教训
+
+1. **"按钮没反应"优先怀疑作用域，而不是怀疑 IPC。** 用户很自然地推断是桌面壳的守卫拒绝了请求
+   （守卫确实存在，`assertDesktopSender` 确实会抛），但真正的第一现场更便宜：**处理函数里有一个
+   装配期没传进来的名字**。这类 bug 的写法有个共同点——**求值实参就会抛**，所以
+   `try { await pick(ctx) } catch {}` 这种"我已经包住了"的防御**根本没生效**。
+2. **`catch {}` 之后必须有人说话。** §3.7 的结论在这里第二次成立：设计成永不抛错的路径，
+   坏了不会有声音。**UI 侧尤其致命**，因为用户的结论不是"坏了"，而是"这个功能不存在"。
+3. **同一个页面上的两句话会互相抵消。** 顶部写"不用重启"，字段下面写"要重启"——用户读到的是
+   前者。凡是"改完要不要重启"这种事实，**一个页面只能有一个说法**。
+4. **状态文件里"没有这个键"是证据，不是缺失。** 报告里那句话（"连空串都没有"）直接排除了
+   归一化与持久化两条路。**能让这种推理成立的代码是好代码**：POST 整个 draft、接受空串、
+   合并写回——三条都恰好把"有没有发生过"编码进了文件。
+   反过来，**日志要记"变化"，不能只记"结果"**：`settings: saved workspacePath "" -> "C:\…"`
+   这一行才是"设了没反应"能一眼定位的东西。
+5. **"存了"和"生效了"必须能分开看。** 这两个事实以前共用一个显示、一个字段名，
+   于是"重启才生效"这种**正常**行为在用户眼里与"保存失败"完全一样。诊断区现在并列两行，
+   这不是冗余信息，是把两种故障分开的最小代价。
+
 ## 5. 认证：OIDC，不要用 token
 
 **工作流里没有任何密钥。** 用 GitHub 签发的 OIDC 身份向 npm 证明"我确实是这个仓库的这条工作流"。
@@ -811,7 +927,7 @@ npm view dsh-wechat-plugin versions --registry=https://registry.npmjs.org
 pnpm build              # 只编译，保留 @dsh-wechat/core 引用（pack 要靠它改写）
 pnpm run dist           # build + 内嵌 core：Git 安装要的可直接加载形态
 pnpm typecheck          # 含 examples/
-pnpm test               # 278 项
+pnpm test               # 290 项
 pnpm run check:install  # 两条安装路径的约束
 pnpm run pack           # 需要先 build，不能先 dist
 pnpm run verify-pack    # 解包、校验清单、按 DSH 的方式挂载一次
@@ -954,6 +1070,8 @@ README 中英两版、用户手册、以及 Hub 的提交，都写了这句话�
 | 插件让 DSH 起不来 | `~/.dsh/wechat/boot.log` 里的 `apply: FAILED:`（**含完整堆栈**） |
 | 桌面端崩溃 | `%APPDATA%\@deepseek-ai\dsh-desktop\logs\crash-*-web-boot.log`（**只采集 error 级 console**） |
 | 设置页空白 / 报错 | 那个路由的 HTTP 状态 + `boot.log` |
+| **设置改了没反应** | `boot.log` 里的 `settings:` 行：有 `saved … 旧值 -> 新值` 说明保存到了（再看**新旧值是否相同**，相同就是主机没收下）；**一行都没有**说明那次保存没发出来，问题在页面（见 §4.15） |
+| **设置存了但没生效** | 「会话工作目录」是启动时解析的：`/status` 的 `diagnostics.settingsWorkspace`（设置里存的）与 `diagnostics.workspace`（正在用的）不一致，就是**缺一次重启** |
 | 收不到回复 | `boot.log` 的 `outbound` 行；没有就是流解析问题 |
 | **发消息完全没有回复，而且日志里一行错都没有** | **绑定会话是不是被归档了**（`workspaceRegistry.archivedSessionIds`，持久副本在 `storages/workspace.json`）或磁盘上已经不存在；`boot.log` 里的 `session-state:` 行说的就是这件事（见 §4.14） |
 | 装完不生效 | profile 的 `bundles` 里有没有它；`dsh.profile.bundles` |

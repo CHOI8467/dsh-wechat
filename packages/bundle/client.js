@@ -111,8 +111,10 @@ window.__ModuleLoader__.load({
         loadFailed: '读取设置失败',
         retry: '重试',
         saveFailed: '保存失败',
+        saveIgnored: '这些值没有被主机接受，已改回实际生效的值：',
         settingsTitle: '行为设置',
-        settingsHint: '改完生效，不用重启。',
+        settingsHint: '改完点「保存设置」。多数设置立即生效；「会话工作目录」要重启 DSH 才生效。',
+        saveRestart: '「会话工作目录」已保存，但新目录要重启 DSH 后才生效——已经建好的对话不会搬家。',
         groupConnection: '连接',
         groupConnectionHint: '开关通道、绑定微信账号。',
         groupBehaviour: '行为',
@@ -149,6 +151,9 @@ window.__ModuleLoader__.load({
           'DSH 在这个目录里读写文件。留空则用默认位置。改完要重启 DSH 才生效，因为已经建好的对话不会搬家。',
         workspacePathPlaceholder: '留空 = 默认位置',
         workspacePathBrowse: '选择文件夹',
+        workspacePathPicked: '已填进输入框。点「保存设置」才会真正保存——选文件夹本身不保存。',
+        workspacePathPickFailed: '打开文件夹选择器失败',
+        workspacePathNotInEffect: '尚未生效，重启 DSH 后启用。',
         allowCrossSessionNotify: '允许其他会话推送到微信',
         allowCrossSessionNotifyHint:
           '开启后，任何会话都能主动发消息或文件到你微信——包括你正在电脑上干活、它做完后通知你的情况。关掉则只有微信对话自己那个会话能发。',
@@ -166,6 +171,7 @@ window.__ModuleLoader__.load({
         presenceNoteHint: '每条消息前都会附上，告诉 agent 你在手机上。不建议清空。',
         settingsSave: '保存设置',
         settingsSaved: '已保存',
+        settingsDirty: '有改动还没保存。',
         settingsReset: '恢复默认',
         disconnect: '断开连接',
         disconnectHint: '断开后要重新扫码才能连上。DSH 里的会话都保留。',
@@ -175,6 +181,10 @@ window.__ModuleLoader__.load({
         logPath: '日志文件',
         statePath: '状态文件',
         workspacePath: '会话工作目录',
+        workspaceEffectiveHint: '（正在使用）',
+        settingsWorkspace: '设置里存的值',
+        settingsWorkspaceEmpty: '（未设置，用默认位置）',
+        settingsWorkspaceHint: '和你刚保存的应该一致；不一致就是「存了没生效」。',
         logTail: '日志末尾',
         noLog: '（暂无日志）',
       },
@@ -208,8 +218,12 @@ window.__ModuleLoader__.load({
         loadFailed: 'Could not read the settings',
         retry: 'Retry',
         saveFailed: 'Could not save',
+        saveIgnored: 'The host did not accept these values, so they were put back to what is in effect:',
         settingsTitle: 'Behaviour',
-        settingsHint: 'Applies at once; no restart.',
+        settingsHint:
+          'Press Save when you are done. Most settings apply at once; the session workspace needs a DSH restart.',
+        saveRestart:
+          'The session workspace was saved, but the new directory takes effect after a DSH restart — conversations that already exist do not move.',
         groupConnection: 'Connection',
         groupConnectionHint: 'Switch the channel and bind a WeChat account.',
         groupBehaviour: 'Behaviour',
@@ -250,6 +264,10 @@ window.__ModuleLoader__.load({
           'Where DSH reads and writes files. Leave empty for the default location. Needs a DSH restart, because conversations that already exist do not move.',
         workspacePathPlaceholder: 'Empty = default location',
         workspacePathBrowse: 'Choose folder',
+        workspacePathPicked:
+          'Put in the box. It is stored when you press Save — choosing a folder does not save anything by itself.',
+        workspacePathPickFailed: 'Could not open the folder dialog',
+        workspacePathNotInEffect: 'Not in effect yet; it is used after a DSH restart.',
         allowCrossSessionNotify: 'Let other sessions push to WeChat',
         allowCrossSessionNotifyHint:
           'On, any session may send you a message or a file — which is how a task that finishes while you are away can still reach you. Off, only the session the WeChat conversation is bound to may send.',
@@ -270,6 +288,7 @@ window.__ModuleLoader__.load({
         presenceNoteHint: 'Prepended to every message, telling the agent you are on a phone.',
         settingsSave: 'Save',
         settingsSaved: 'Saved',
+        settingsDirty: 'Changes are not saved yet.',
         settingsReset: 'Reset to defaults',
         disconnect: 'Disconnect',
         disconnectHint: 'Reconnecting needs a new scan. Sessions and their contents stay.',
@@ -279,6 +298,10 @@ window.__ModuleLoader__.load({
         logPath: 'Log file',
         statePath: 'State file',
         workspacePath: 'Session workspace',
+        workspaceEffectiveHint: '(in use)',
+        settingsWorkspace: 'Stored in Settings',
+        settingsWorkspaceEmpty: '(not set; the default is used)',
+        settingsWorkspaceHint: 'Should match what you just saved; when it does not, it was stored but not applied.',
         logTail: 'End of the log',
         noLog: '(no log yet)',
       },
@@ -351,6 +374,10 @@ window.__ModuleLoader__.load({
 /* Rows and fields are the settings-form pattern: padded, with a hairline between them. */
 .dsh-wechat-row { display: flex; justify-content: space-between; gap: 16px; align-items: center; padding: 12px 0; }
 .dsh-wechat-row-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+/* A field whose control is a row of its own plus a line of feedback under it. Kept apart from the
+   row class above, whose padding and separator rules belong to rows sitting directly in a card. */
+.dsh-wechat-column { display: flex; flex-direction: column; gap: 6px; }
+.dsh-wechat-pick { display: flex; gap: 8px; align-items: center; }
 .dsh-wechat-field { display: flex; flex-direction: column; gap: 6px; padding: 12px 0; }
 .dsh-wechat-field > label { font-size: 13px; font-weight: 500; line-height: 1.5; color: var(--dsw-alias-label-primary); }
 .dsh-wechat-row + .dsh-wechat-row,
@@ -393,6 +420,7 @@ a.dsh-wechat-button { text-decoration: none; }
 .dsh-wechat-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 12px 0; }
 .dsh-wechat-hint { margin: 0; font-size: 12px; line-height: 1.5; color: var(--dsw-alias-label-tertiary); }
 .dsh-wechat-ok { font-size: 12px; line-height: 1.5; color: var(--dsw-alias-state-success-primary); }
+.dsh-wechat-warn { font-size: 12px; line-height: 1.6; color: var(--dsw-alias-state-warn-primary); }
 .dsh-wechat-error { font-size: 12px; line-height: 1.5; color: var(--dsw-alias-state-error-primary); }
 .dsh-wechat-errors { margin: 0; padding: 0 0 0 18px; font-size: 12px; line-height: 1.6; color: var(--dsw-alias-label-secondary); }
 
@@ -490,6 +518,25 @@ a.dsh-wechat-button { text-decoration: none; }
       )
     }
 
+    /**
+     * The client plugin context, kept where the settings section can reach it.
+     *
+     * `apply` is the only place that receives it, and the section component is created by the slot
+     * registry, which calls it with no arguments of its own. The button used to name `ctx` directly
+     * from inside the component, where no such binding existed: pressing 「选择文件夹」 threw
+     * `ReferenceError: ctx is not defined` *while evaluating the argument*, before the picker was
+     * called and outside the `try` that was supposed to cover it. Nothing appeared on the page,
+     * nothing reached the host, and the only trace was a console entry nobody was reading — which is
+     * exactly how "选择文件夹 does nothing" was reported.
+     *
+     * Declared here, outside the component, so both sides share one binding: a declaration inside
+     * the component would shadow it and be reset on every render. Held rather than passed down
+     * because `uiWorkspace` may appear after this plugin activates — the service is read at the
+     * moment of the click, not at registration, so the fallback route works whenever the client
+     * offers it.
+     */
+    let clientContext
+
     function WechatSettings() {
       const [state, setState] = React.useState({
         phase: 'loading',
@@ -507,6 +554,18 @@ a.dsh-wechat-button { text-decoration: none; }
          */
         draft: undefined,
         saved: false,
+        /**
+         * Fields the last save sent but the host did not keep.
+         *
+         * The host drops a value it cannot accept and answers with what is stored, so the page
+         * would otherwise say "saved" while the field quietly went back to its old value — the
+         * same shape as the bug that made a saved setting vanish on the next write.
+         */
+        ignored: [],
+        /** Failure text from the folder dialog, which is a different failure from a failed save. */
+        pickError: '',
+        /** True once a folder has been put in the box and not yet saved. */
+        picked: false,
         busy: false,
         verifyCode: '',
       })
@@ -549,8 +608,10 @@ a.dsh-wechat-button { text-decoration: none; }
             settings: settings?.settings,
             defaults: settings?.defaults,
             // A reload discards an in-progress edit, which is the honest behaviour: what is shown
-            // is what is stored.
+            // is what is stored. The notes about that edit go with it, for the same reason.
             draft: settings?.settings ?? prev.draft,
+            picked: false,
+            pickError: '',
           }))
         } catch (error) {
           reportFailure('load', error)
@@ -663,21 +724,72 @@ a.dsh-wechat-button { text-decoration: none; }
 
       async function saveSettings() {
         if (state.draft === undefined) return
-        setState((prev) => ({ ...prev, busy: true, saved: false }))
+        const sent = state.draft
+        setState((prev) => ({ ...prev, busy: true, saved: false, error: '', ignored: [] }))
         try {
           const result = await request(`${PREFIX}/settings`, {
             method: 'POST',
-            body: JSON.stringify(state.draft),
+            body: JSON.stringify(sent),
           })
-          const saved = result?.settings ?? state.draft
-          setState((prev) => ({ ...prev, busy: false, saved: true, settings: saved, draft: saved }))
+          const saved = result?.settings ?? sent
+          setState((prev) => ({
+            ...prev,
+            busy: false,
+            saved: true,
+            // The "not saved yet" note described the state before this request, so it goes now: a
+            // note that outlives what it describes is the same lie in the other direction.
+            picked: false,
+            // A save is only reported as a success if every value sent is the value stored. The
+            // host silently drops a field it cannot accept, and "已保存" over a dropped field is
+            // how a user comes to believe a setting is in effect when it never was.
+            ignored: ignoredSettings(sent, saved, t),
+            settings: saved,
+            draft: saved,
+          }))
           // The confirmation is transient: it describes one save, not a state of the form.
+          // Whatever was ignored, or is waiting for a restart, stays on screen — those are states.
           setTimeout(() => setState((prev) => ({ ...prev, saved: false })), 2500)
         } catch (error) {
+          // Reported to the host as well as shown: a failing save is exactly the case where a
+          // static page and a stale state file look the same from the outside.
+          reportFailure('save', error)
           setState((prev) => ({
             ...prev,
             busy: false,
             error: error instanceof Error ? error.message : String(error),
+          }))
+        }
+      }
+
+      /**
+       * Put a directory the dialog returned into the field.
+       *
+       * Cancel and failure are handled apart, because they mean opposite things: a cancelled dialog
+       * is not an error and must leave the field and the page untouched, while a dialog that refused
+       * to open is precisely the case that used to be invisible. The note matters too — choosing a
+       * folder only fills the box, it does not save, and nothing on the page said so.
+       */
+      async function chooseDirectory() {
+        setState((prev) => ({ ...prev, pickError: '', picked: false }))
+        try {
+          const picked = await pickDirectory(clientContext)
+          if (picked === undefined) {
+            // The user closed the dialog. Nothing to say and nothing to change.
+            setState((prev) => ({ ...prev, pickError: '', picked: false }))
+            return
+          }
+          setState((prev) => ({
+            ...prev,
+            draft: { ...(prev.draft ?? {}), workspacePath: picked },
+            picked: true,
+          }))
+        } catch (error) {
+          console.error('dsh-wechat: 选择文件夹失败', error)
+          reportFailure('pick-directory', error)
+          setState((prev) => ({
+            ...prev,
+            picked: false,
+            pickError: error instanceof Error ? error.message : String(error),
           }))
         }
       }
@@ -692,43 +804,155 @@ a.dsh-wechat-button { text-decoration: none; }
         await act(`${PREFIX}/disconnect`, { accountId })
       }
 
-      /** One editable field, with its label and explanation. */
-      /**
- * Open DSH's own folder dialog.
- *
- * Two routes, because the desktop app and the web client expose it differently: the Electron
- * preload publishes `__DSH_DIRECTORY_PICKER__`, and everything else goes through the workspace
- * service. Both are tried in that order, and any failure returns undefined so the field keeps
- * whatever it already held rather than being cleared by a dialog that never opened.
- *
- * @param {object} ctx - Client plugin context.
- * @returns {Promise<string | undefined>} The chosen directory, or undefined when cancelled.
- */
-async function pickDirectory(ctx) {
-  try {
-    const desktop = globalThis.__DSH_DIRECTORY_PICKER__
-    if (desktop !== undefined && typeof desktop.pick === 'function') {
-      return (await desktop.pick()) ?? undefined
-    }
-    const workspace = ctx?.uiWorkspace
-    if (workspace !== undefined && typeof workspace.pickDirectory === 'function') {
-      return (await workspace.pickDirectory()) ?? undefined
-    }
-  } catch {
-    // No picker, or the user dismissed it: leave the typed path as it is.
-  }
-  return undefined
-}
-
-function field(label, hint, control) {
-        return h(
-          'div',
-          { className: 'dsh-wechat-field' },
-          h('label', null, label),
-          control,
-          hint ? h('span', { className: 'dsh-wechat-hint' }, hint) : null,
-        )
+    /**
+     * Open DSH's own folder dialog.
+     *
+     * Two routes, because the desktop app and the web client expose it differently: the Electron
+     * preload publishes `__DSH_DIRECTORY_PICKER__`, and everything else goes through the workspace
+     * service. Both are tried in that order, which is the order the shell's own directory-picker
+     * plugin uses.
+     *
+     * Nothing is caught here, deliberately. The desktop side guards this call — it accepts only a
+     * request from the app's own main frame, and a request from anywhere else is *thrown*, not
+     * answered with nothing — and an error that is swallowed here is indistinguishable to the user
+     * from a dialog they cancelled: the button appears to do nothing at all, and with no message
+     * anywhere the failure cannot even be reported. So the failure travels to the caller, which
+     * shows it and reports it. `null` from either route means the user closed the dialog, which the
+     * desktop handler returns on purpose; it is normalised to `undefined` so the two cannot be
+     * confused.
+     *
+     * @param {object} ctx - Client plugin context, read at the moment of the click.
+     * @returns {Promise<string | undefined>} The chosen directory, or undefined when cancelled.
+     */
+    async function pickDirectory(ctx) {
+      const desktop = globalThis.__DSH_DIRECTORY_PICKER__
+      if (desktop !== undefined && typeof desktop.pick === 'function') {
+        return (await desktop.pick()) ?? undefined
       }
+      const workspace = ctx?.uiWorkspace
+      if (workspace !== undefined && typeof workspace.pickDirectory === 'function') {
+        return (await workspace.pickDirectory()) ?? undefined
+      }
+      // No picker on this platform is still a failure of the button the user just pressed, and the
+      // one thing it must not do is look like a cancelled dialog.
+      throw new Error('no directory picker is available in this client')
+    }
+
+    /**
+     * Whether a value that was sent is the value that was stored.
+     *
+     * Loose on purpose: the host trims the workspace path and rounds the numbers, so an exact
+     * comparison would call every ordinary save partly ignored. Strings are compared trimmed because
+     * trimming is exactly what the host does to them; the user is not being lied to when a trailing
+     * space disappears.
+     *
+     * @param {unknown} sent - Value the page sent.
+     * @param {unknown} stored - Value the host answered with.
+     * @returns {boolean} True when the host kept the value.
+     */
+    function sameSetting(sent, stored) {
+      if (typeof sent === 'number' && typeof stored === 'number') {
+        return Math.round(sent) === Math.round(stored)
+      }
+      if (typeof sent === 'string' && typeof stored === 'string') return sent.trim() === stored.trim()
+      return sent === stored
+    }
+
+    /**
+     * The keys whose sent value is not the value the host holds.
+     *
+     * @param {object} sent - The draft that was posted.
+     * @param {object} stored - The settings the host holds.
+     * @returns {string[]} Keys that differ.
+     */
+    function changedKeys(sent, stored) {
+      if (sent === null || stored === null || typeof sent !== 'object' || typeof stored !== 'object') {
+        return []
+      }
+      return Object.keys(sent).filter((key) => !sameSetting(sent[key], stored[key]))
+    }
+
+    /**
+     * The names of the settings the host did not keep.
+     *
+     * The host answers a save with the settings it actually stored, dropping any field it cannot
+     * accept. Comparing the two turns that silent drop into something the user can see, and it
+     * catches every field at once rather than the ones somebody remembered to check.
+     *
+     * @param {object} sent - The draft that was posted.
+     * @param {object} stored - The settings the host answered with.
+     * @param {object} t - Copy table, for the names shown to the user.
+     * @returns {string[]} Labels of the fields that did not stick.
+     */
+    function ignoredSettings(sent, stored, t) {
+      return changedKeys(sent, stored).map((key) => (typeof t[key] === 'string' ? t[key] : key))
+    }
+
+    /**
+     * Whether the form holds changes that are not stored yet.
+     *
+     * Every control on the page writes to the draft and none of them saves, and a filled box looks
+     * exactly like a stored value. Saying so is the difference between "it did not work" and "I did
+     * not save it" — the conclusion a user reached here, correctly, from a page that never said
+     * either thing.
+     *
+     * @param {object} state - Page state.
+     * @returns {boolean} True while the form differs from what is stored.
+     */
+    function draftIsDirty(state) {
+      if (state.draft === undefined || state.settings === undefined) return false
+      return changedKeys(state.draft, state.settings).length > 0
+    }
+
+    /**
+     * Whether two directories are the same place.
+     *
+     * Only used to decide whether the stored workspace is the one in effect, and the browser cannot
+     * know the platform's case rules, so this errs towards "the same": a false "same" costs a
+     * missing reminder, while a false "different" would nag every Windows user about a directory
+     * that is already in use. An empty stored value means the default location, which is not this
+     * comparison's business — callers check for it first.
+     *
+     * @param {string} a - One directory.
+     * @param {string} b - The other.
+     * @returns {boolean} True when they can be treated as the same place.
+     */
+    function sameDirectory(a, b) {
+      if (typeof a !== 'string' || typeof b !== 'string') return false
+      const clean = (value) => value.trim().replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase()
+      return clean(a) !== '' && clean(a) === clean(b)
+    }
+
+    /**
+     * Whether the directory stored in Settings is still waiting for a restart.
+     *
+     * `status.diagnostics.workspace` is the directory resolved when the plugin started; the stored
+     * setting is what the user last saved. When they differ, the directory in use is not the one the
+     * settings page shows, and the answer is to keep saying so — it would be a lie to print a
+     * confirmation once and let the page look settled, and the difference is invisible in every
+     * other place the page displays. An empty stored value means "the default location", which is
+     * the ordinary state rather than a pending change, so it never raises this.
+     *
+     * @param {object} state - Page state.
+     * @param {object} status - Last status from the host.
+     * @returns {boolean} True while a saved directory is not yet the one in use.
+     */
+    function workspacePendingRestart(state, status) {
+      const stored = state.settings?.workspacePath
+      if (typeof stored !== 'string' || stored.trim() === '') return false
+      return !sameDirectory(stored, status?.diagnostics?.workspace)
+    }
+
+    /** One editable field, with its label and explanation. */
+    function field(label, hint, control) {
+      return h(
+        'div',
+        { className: 'dsh-wechat-field' },
+        h('label', null, label),
+        control,
+        hint ? h('span', { className: 'dsh-wechat-hint' }, hint) : null,
+      )
+    }
 
       /** Patch one draft field, leaving the rest of the form alone. */
       function edit(key, value) {
@@ -949,7 +1173,8 @@ function field(label, hint, control) {
         ),
         ),
 
-        // Tuned behaviour. Everything here applies without a restart.
+        // Tuned behaviour. Everything here applies without a restart except the workspace, which
+        // says so on its own line and again beside the save button while it is still waiting.
         state.draft !== undefined
           ? h(
               Group,
@@ -993,33 +1218,53 @@ function field(label, hint, control) {
                * Editable as well as pickable: the dialog is the fast route, but a path copied from
                * somewhere else has to be accepted too, and an empty box is how the default comes back.
                * The button only writes what the dialog returned, so cancelling leaves the field alone.
+               *
+               * Picking fills the box; it does not save. That distinction is invisible in the markup
+               * — an input and a button look the same either way — so it is said in words the moment
+               * the dialog returns, rather than left for the user to discover after a restart.
                */
               field(
                 t.workspacePath,
                 t.workspacePathHint,
                 h(
                   'div',
-                  { className: 'dsh-wechat-row' },
-                  h('input', {
-                    className: 'dsh-wechat-input',
-                    type: 'text',
-                    value: state.draft.workspacePath ?? '',
-                    placeholder: t.workspacePathPlaceholder,
-                    onChange: (event) => edit('workspacePath', event.target.value),
-                  }),
+                  { className: 'dsh-wechat-column' },
                   h(
-                    'button',
-                    {
-                      type: 'button',
-                      className: 'dsh-wechat-button',
-                      onClick: () => {
-                        void pickDirectory(ctx).then((picked) => {
-                          if (picked !== undefined) edit('workspacePath', picked)
-                        })
+                    'div',
+                    { className: 'dsh-wechat-pick' },
+                    h('input', {
+                      className: 'dsh-wechat-input',
+                      type: 'text',
+                      value: state.draft.workspacePath ?? '',
+                      placeholder: t.workspacePathPlaceholder,
+                      onChange: (event) => {
+                        edit('workspacePath', event.target.value)
+                        // Typing is the same promise the dialog makes: it is not stored yet.
+                        setState((prev) => ({ ...prev, picked: false, pickError: '' }))
                       },
-                    },
-                    t.workspacePathBrowse,
+                    }),
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'dsh-wechat-button',
+                        onClick: () => void chooseDirectory(),
+                      },
+                      t.workspacePathBrowse,
+                    ),
                   ),
+                  // Cancelling the dialog reports nothing here on purpose: nothing happened, and an
+                  // error beside a field the user simply changed their mind about is noise.
+                  state.pickError !== ''
+                    ? h(
+                        'span',
+                        { className: 'dsh-wechat-error', role: 'alert' },
+                        `${t.workspacePathPickFailed}：${state.pickError}`,
+                      )
+                    : null,
+                  state.picked
+                    ? h('span', { className: 'dsh-wechat-ok' }, t.workspacePathPicked)
+                    : null,
                 ),
               ),
 
@@ -1151,18 +1396,49 @@ function field(label, hint, control) {
                   },
                   t.settingsSave,
                 ),
-                h(
-                  'button',
-                  {
-                    type: 'button',
-                    className: 'dsh-wechat-button dsh-wechat-outline',
-                    disabled: state.busy || state.defaults === undefined,
-                    onClick: () => setState((prev) => ({ ...prev, draft: prev.defaults })),
-                  },
-                  t.settingsReset,
-                ),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-wechat-button dsh-wechat-outline',
+                      disabled: state.busy || state.defaults === undefined,
+                      // Resetting fills the form from the defaults and saves nothing, so the note
+                      // about an earlier pick is about a draft that no longer exists.
+                      onClick: () => setState((prev) => ({ ...prev, draft: prev.defaults, picked: false })),
+                    },
+                    t.settingsReset,
+                  ),
                 state.saved ? h('span', { className: 'dsh-wechat-ok' }, t.settingsSaved) : null,
+                draftIsDirty(state) ? h('span', { className: 'dsh-wechat-warn' }, t.settingsDirty) : null,
               ),
+
+              /*
+               * What happens to a save, said next to the button that started it.
+               *
+               * The page carried one line about the workspace needing a restart, at the top of a
+               * long form, while the save button sat at the bottom. A user who saved and restarted
+               * with nothing changed had no way to tell "it did not save" from "it saved and is not
+               * in effect", and neither had we: the state file's absence of the key is what settled
+               * it. Both statements are therefore made where the button is — a failure, a field the
+               * host refused, and a directory that is stored but not yet the one in use.
+               */
+              state.error !== ''
+                ? h(
+                    'p',
+                    { className: 'dsh-wechat-error', role: 'alert' },
+                    `${t.saveFailed}：${state.error}`,
+                  )
+                : null,
+              state.ignored.length > 0
+                ? h(
+                    'p',
+                    { className: 'dsh-wechat-error', role: 'alert' },
+                    `${t.saveIgnored}${state.ignored.join('、')}`,
+                  )
+                : null,
+              workspacePendingRestart(state, status)
+                ? h('p', { className: 'dsh-wechat-warn' }, t.saveRestart)
+                : null,
             )
             )
           : null,
@@ -1227,7 +1503,38 @@ function field(label, hint, control) {
                         'div',
                         { className: 'dsh-wechat-fact' },
                         h('dt', null, t.workspacePath),
-                        h('dd', null, status.diagnostics.workspace),
+                        h(
+                          'dd',
+                          null,
+                          status.diagnostics.workspace,
+                          h('span', { className: 'dsh-wechat-hint' }, t.workspaceEffectiveHint),
+                        ),
+                      ),
+                      /*
+                       * The value the settings page stores, shown apart from the one in use.
+                       *
+                       * Two different questions, and the page could only answer the second: a
+                       * directory that was never saved and a directory saved without a restart both
+                       * showed the old path here, so "it did not save" and "it saved and is not in
+                       * effect" were indistinguishable — which is exactly the report that produced
+                       * this row.
+                       */
+                      h(
+                        'div',
+                        { className: 'dsh-wechat-fact' },
+                        h('dt', null, t.settingsWorkspace),
+                        h(
+                          'dd',
+                          null,
+                          typeof status.diagnostics.settingsWorkspace === 'string' &&
+                            status.diagnostics.settingsWorkspace !== ''
+                            ? status.diagnostics.settingsWorkspace
+                            : t.settingsWorkspaceEmpty,
+                          h('span', { className: 'dsh-wechat-hint' }, t.settingsWorkspaceHint),
+                          workspacePendingRestart(state, status)
+                            ? h('span', { className: 'dsh-wechat-warn' }, t.workspacePathNotInEffect)
+                            : null,
+                        ),
                       ),
                     ),
                     h('h3', null, t.logTail),
@@ -1278,6 +1585,8 @@ function field(label, hint, control) {
     // The client-plugin rules call for factories free of side effects and for
     // `apply` to register every resource through `ctx.effect`, returning cleanup.
     function apply(ctx) {
+      // Kept for the section, which the slot registry instantiates without arguments.
+      clientContext = ctx
       ctx.effect(() => {
         const removeStyles = installStyles()
         const disposeSection = ctx.slots.inject('settings.section', () =>

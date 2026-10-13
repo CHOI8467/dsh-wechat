@@ -709,6 +709,16 @@ class WechatRuntime {
         // showed the default even when the config pointed somewhere else, so a user who moved the
         // workspace was told the old path was in use.
         workspace: this.#workspace,
+        /*
+         * What the settings page stores, next to the directory that is actually in use.
+         *
+         * Two different questions, and until now only the second was answerable: a directory that
+         * was never saved and a directory saved without a restart both showed the old path, so the
+         * user could not tell "it never saved" from "it saved and is not in effect" — and neither
+         * could anyone reading a bug report. The value is read from the store, not from
+         * `#settingsCache`, so it is what is on disk rather than what this process last decided.
+         */
+        settingsWorkspace: resolveSettings(state).workspacePath,
         logTail: this.#bootLogTail(),
       },
     }
@@ -1551,16 +1561,34 @@ class WechatRuntime {
    * @returns The settings after the change.
    */
   async saveSettings(patch: ChannelSettings): Promise<Required<ChannelSettings>> {
-    let next: Required<ChannelSettings> = this.#settingsNow()
-    const before = next.requireConfirmation
-    await this.#store.update((state) => {
-      state.settings = { ...(state.settings ?? {}), ...patch }
-      next = resolveSettings(state)
-    })
+    const before: Required<ChannelSettings> = this.#settingsNow()
+    let next: Required<ChannelSettings> = before
+    try {
+      await this.#store.update((state) => {
+        state.settings = { ...(state.settings ?? {}), ...patch }
+        next = resolveSettings(state)
+      })
+    } catch (error) {
+      /*
+       * A failed save leaves the page reporting one thing and the file holding another, and the
+       * user's only evidence is that nothing changed. Logged before the throw, because the route
+       * turns the throw into a 500 whose text never reaches this file.
+       */
+      this.#recordBoot(`settings: save FAILED patch=${describeSettingsPatch(patch)} error="${describeError(error)}"`)
+      throw error
+    }
     this.#settingsCache = next
+    /*
+     * One line per save, with both values.
+     *
+     * The state file records what is stored *now*, which cannot tell "this save never arrived" from
+     * "it arrived and was dropped" — the old and new values can, and this is the only place both
+     * are known. It is what a user means by "I set it and nothing happened".
+     */
+    this.#recordBoot(`settings: ${describeSettingsSave(before, next, patch)}`)
     // The confirmation policy lives in the session tool's description, which the registry copies at
     // registration. Without this the setting would look inert until the next restart.
-    if (next.requireConfirmation !== before) this.refreshSessionTool()
+    if (next.requireConfirmation !== before.requireConfirmation) this.refreshSessionTool()
     return next
   }
 
@@ -4263,6 +4291,61 @@ function readSettingsPatch(body: Record<string, unknown>): ChannelSettings {
     patch.workspacePath = body.workspacePath.trim()
   }
   return patch
+}
+
+/**
+ * One setting's value as it appears in a log line.
+ *
+ * Strings are quoted because the empty string is a meaningful value here — it is how the workspace
+ * goes back to the default — and printed bare it reads as a key nobody set.
+ *
+ * @param value - Value to describe.
+ * @returns A short, unambiguous rendering.
+ */
+function formatSettingValue(value: unknown): string {
+  const text = JSON.stringify(value)
+  return text === undefined ? 'undefined' : text
+}
+
+/**
+ * The keys a patch actually carries, for a log line.
+ *
+ * @param patch - Settings patch the page sent.
+ * @returns A compact rendering of the patch.
+ */
+function describeSettingsPatch(patch: ChannelSettings): string {
+  const keys = Object.keys(patch) as (keyof ChannelSettings)[]
+  if (keys.length === 0) return '(no usable field)'
+  return `{${keys.map((key) => `${key}: ${formatSettingValue(patch[key])}`).join(', ')}}`
+}
+
+/**
+ * What one settings save changed, as `key "old" -> "new"` pairs.
+ *
+ * The pair is the point. A page that reports "saved" while the host dropped the value, and a page
+ * whose request never left the browser, both leave the state file looking the same; only the two
+ * values together say which happened, and only the host has both.
+ *
+ * @param before - Effective settings before the change.
+ * @param after - Effective settings after the change.
+ * @param patch - Fields the request asked to change.
+ * @returns The log text, without the timestamp.
+ */
+function describeSettingsSave(
+  before: Required<ChannelSettings>,
+  after: Required<ChannelSettings>,
+  patch: ChannelSettings,
+): string {
+  const keys = Object.keys(patch) as (keyof ChannelSettings)[]
+  if (keys.length === 0) {
+    // Not an error: an unreadable body and a body of wrong-typed values both arrive as "nothing to
+    // apply", and that is worth being able to tell apart from a save that was never sent.
+    return 'save carried no usable field — nothing changed'
+  }
+  const changes = keys.map(
+    (key) => `${key} ${formatSettingValue(before[key])} -> ${formatSettingValue(after[key])}`,
+  )
+  return `saved ${changes.join('; ')}`
 }
 
 function json(res: import('node:http').ServerResponse, status: number, body: unknown): void {

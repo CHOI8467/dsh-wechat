@@ -105,8 +105,16 @@ export interface ChannelStatus {
     logPath: string
     /** Absolute path of the state file. */
     statePath: string
-    /** Session workspace folder. */
+    /** Session workspace folder, resolved when the plugin started. */
     workspace: string
+    /**
+     * Directory stored in the settings page, empty when none is set.
+     *
+     * Reported apart from {@link workspace} because they answer different questions: the two differ
+     * exactly while a saved directory is waiting for a restart, and a user who cannot see that
+     * difference cannot tell a setting that never saved from one that saved and is not in effect.
+     */
+    settingsWorkspace: string
     /** Last lines of the boot log, oldest first. */
     logTail: string[]
   }
@@ -116,7 +124,10 @@ export interface ChannelStatus {
  * Wire shape of the tuned settings.
  *
  * Every field is both readable and writable, so the page can show the effective value — defaults
- * included — without duplicating them.
+ * included — without duplicating them. This list is documentation only: nothing consumes it, which
+ * is why it drifted once already (the three settings added for `0.37.0` were missing from it while
+ * the same omission in the host's own allow-list was dropping them on every write). The host's
+ * allow-list is derived from `ChannelSettings` and compile-checked; a copy here cannot be.
  */
 export interface SettingsPayload {
   allowedUsers: string[]
@@ -126,4 +137,8 @@ export interface SettingsPayload {
   quoteHistory: number
   autoReplyAttachments: boolean
   presenceNote: string
+  permissionPreset?: 'danger-full-access' | 'auto' | 'default'
+  allowCrossSessionNotify?: boolean
+  /** Directory the sessions run in; empty means the default under the DSH home. */
+  workspacePath?: string
 }

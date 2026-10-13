@@ -234,25 +234,55 @@ async function loadClientBundle(options = {}) {
 }
 
 /** Mount the page against stubbed routes and return the final tree. */
-async function mountPage(routes) {
+async function mountPage(routes, options = {}) {
   const requested = []
+  /**
+   * Every request the page made, with its method and body.
+   *
+   * The path alone cannot show whether a save carried the value the user picked, and that is the
+   * question this page has repeatedly answered wrongly: the field held a directory, the page said
+   * nothing, and the host never heard about it.
+   */
+  const calls = []
   const react = createReactStub()
   const bundle = await loadClientBundle({
     react,
-    fetchImpl: async (url) => {
-      const path = String(url)
-      requested.push(path.replace(/^https?:\/\/[^/]+/, ''))
-      const body = routes[path.replace(/^https?:\/\/[^/]+/, '')]
-      if (body === undefined) {
+    fetchImpl: async (url, options) => {
+      const path = String(url).replace(/^https?:\/\/[^/]+/, '')
+      const method = options?.method ?? 'GET'
+      requested.push(path)
+      calls.push({ path, method, body: options?.body })
+      const entry = routes[path]
+      if (entry === undefined) {
         return { ok: false, status: 404, text: async () => JSON.stringify({ error: 'not found' }) }
       }
-      return { ok: true, status: 200, text: async () => JSON.stringify(body) }
+      /*
+       * A route is a body, or a function of the request for the cases that need one: a stub that
+       * answers a save with the same object it served on load cannot tell a value the host stored
+       * from one it refused, and that difference is the subject of several tests below.
+       */
+      const answer =
+        typeof entry === 'function' ? entry({ path, method, body: options?.body }) : { status: 200, body: entry }
+      const status = answer.status ?? 200
+      if (status !== 200) {
+        const message = answer.body?.error ?? `HTTP ${String(status)}`
+        return { ok: false, status, text: async () => JSON.stringify({ error: message }) }
+      }
+      return { ok: true, status, text: async () => JSON.stringify(answer.body) }
     },
   })
 
   const sections = []
   const disposers = []
   const ctx = {
+    /*
+     * The workspace service, when the test supplies one.
+     *
+     * It is the fallback route to the folder dialog, and reaching it is the only proof that the
+     * page kept the context `apply` was given: a component cannot see that argument on its own, and
+     * naming it anyway is a `ReferenceError` thrown before the picker is called.
+     */
+    ...(options.uiWorkspace === undefined ? {} : { uiWorkspace: options.uiWorkspace }),
     // The client-plugin rules require resources to be registered through `effect`,
     // so the stub runs the body and collects the returned cleaner.
     effect(execute) {
@@ -282,6 +312,7 @@ async function mountPage(routes) {
   return {
     tree,
     requested,
+    calls,
     sections,
     bundle,
     disposers,
@@ -295,6 +326,67 @@ async function mountPage(routes) {
   }
 }
 
+/**
+ * Let the page's promises settle, then render what the click produced.
+ *
+ * The stub has no scheduler: a handler that awaits the host updates state *after* the current pass,
+ * so a test that asserted without waiting would read the tree from before its own click.
+ *
+ * @param page - The mounted page.
+ * @returns The tree after the pending work finished.
+ */
+async function settle(page) {
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  return page.rerender()
+}
+
+/** The first button whose text contains the given label. */
+function findButton(tree, label) {
+  const button = collectByType(tree, 'button').find((node) => collectText(node).join('').includes(label))
+  assert.ok(button, `expected a button labelled ${label}`)
+  return button
+}
+
+/**
+ * A settings route that answers the way the host does in the one respect that matters here.
+ *
+ * A GET serves what is stored; a POST stores what it was sent and answers with that. `transform`
+ * stands in for everything the host may do to a value on the way in — it is where a test makes the
+ * host drop a field, which the page has to notice rather than report as saved.
+ *
+ * @param initial - Stored settings.
+ * @param transform - Applied to `(sent, stored)` on a POST; returns what is stored next.
+ */
+function settingsRoute(initial, transform = (sent) => sent) {
+  let stored = { ...initial }
+  return ({ method, body }) => {
+    if (method === 'POST') stored = { ...stored, ...transform(JSON.parse(body), stored) }
+    return { status: 200, body: { settings: { ...stored }, defaults: { ...initial } } }
+  }
+}
+
+/** The routes a page needs to render, with the settings route the test wants. */
+function pageRoutes(settings, status = STATUS) {
+  return {
+    [PREFIX + '/status']: status,
+    [PREFIX + '/login']: LOGIN_RUNNING,
+    [PREFIX + '/settings']: settings,
+  }
+}
+
+/**
+ * Put a stand-in for the desktop preload's directory picker in place.
+ *
+ * The page reads `globalThis.__DSH_DIRECTORY_PICKER__` when the button is pressed, the way the
+ * desktop shell publishes it. Returns the undo, so a test cannot leave it for the next one.
+ */
+function withDirectoryPicker(pick) {
+  globalThis.__DSH_DIRECTORY_PICKER__ = { pick }
+  return () => {
+    delete globalThis.__DSH_DIRECTORY_PICKER__
+  }
+}
+
 const STATUS = {
   enabled: true,
   accounts: [{ accountId: 'fd17bd2d40c3@im.bot', userId: 'peer@im.wechat', polling: true }],
@@ -304,6 +396,8 @@ const STATUS = {
     logPath: 'C:\\Users\\me\\.dsh\\wechat\\boot.log',
     statePath: 'C:\\Users\\me\\.dsh\\wechat\\state.json',
     workspace: 'C:\\Users\\me\\.dsh\\dsh_wechat',
+    // The ordinary state of a fresh install: nothing chosen, so the default directory is in use.
+    settingsWorkspace: '',
     logTail: ['2026-10-06T00:00:00.000Z apply: mounted'],
   },
 }
@@ -558,7 +652,7 @@ test('the diagnostics paths are a definition list, so their labels line up', asy
     const facts = collectByClass(tree, 'dsh-wechat-facts')
     assert.equal(facts.length, 1, 'one list of paths')
     const terms = collectByType(facts[0], 'dt').map((node) => collectText(node).join(''))
-    assert.deepEqual(terms, ['日志文件', '状态文件', '会话工作目录'])
+    assert.deepEqual(terms, ['日志文件', '状态文件', '会话工作目录', '设置里存的值'])
   } finally {
     bundle.restore()
   }
@@ -698,8 +792,276 @@ test('the package name, the host row id and the client module id agree', async (
   assert.equal(moduleId, name, 'the client module id must equal the package name')
 })
 
-test('the page and the host agree on the route prefix', async () => {
-  // The page calls routes; the host registers them. If the two strings drift, every request 404s and
+/**
+ * Choosing a folder, saving, and what the page says about either.
+ *
+ * These exist because of a report that could not be answered from the outside: a directory was
+ * chosen, the page showed nothing, the field was empty again after a restart, and conversations
+ * kept using the default. The state file's `settings` had never contained the key — not even as an
+ * empty string — which proved the save had never left the browser, while every visible part of the
+ * page looked fine. What was missing was any statement of what had just happened: picking a folder
+ * fills the box and saves nothing, a picker that refuses to open must say so instead of doing
+ * nothing, and a save must be distinguishable from a field the host quietly refused.
+ */
+test('a folder the dialog returns fills the box and says it is not saved yet', async () => {
+  const page = await mountPage(pageRoutes(settingsRoute(SETTINGS)))
+  const undo = withDirectoryPicker(async () => 'C:\\picked-ws')
+  try {
+    findButton(page.tree, '选择文件夹').props.onClick()
+    const tree = await settle(page)
+
+    const field = collectByType(tree, 'input').find((node) => node.props.type === 'text')
+    assert.equal(field.props.value, 'C:\\picked-ws', 'the chosen directory is in the field')
+    assert.match(
+      collectText(tree).join(' | '),
+      /点「保存设置」/,
+      'the page says that choosing a folder does not save it',
+    )
+    // The distinction the whole report turned on: the picker is not a save.
+    assert.equal(
+      page.calls.filter((call) => call.method === 'POST').length,
+      0,
+      'picking a folder must not post anything',
+    )
+  } finally {
+    undo()
+    page.bundle.restore()
+  }
+})
+
+test('the folder dialog is reached through the workspace service when the desktop has no global', async () => {
+  /*
+   * This is the test that would have caught the original report. The button's handler named `ctx`
+   * from inside the section component, where `apply`'s argument does not exist, so pressing it
+   * threw `ReferenceError: ctx is not defined` while building the arguments — the picker was never
+   * called, the `try` around it never saw the throw, and the page showed nothing at all. Both
+   * routes to the dialog therefore have to be exercised, not just the desktop global.
+   */
+  const page = await mountPage(pageRoutes(settingsRoute(SETTINGS)), {
+    uiWorkspace: { pickDirectory: async () => 'C:\\from-workspace' },
+  })
+  try {
+    findButton(page.tree, '选择文件夹').props.onClick()
+    const tree = await settle(page)
+
+    const field = collectByType(tree, 'input').find((node) => node.props.type === 'text')
+    assert.equal(field.props.value, 'C:\\from-workspace', 'the service route fills the field')
+    assert.doesNotMatch(collectText(tree).join(' | '), /打开文件夹选择器失败/, 'and nothing failed')
+  } finally {
+    page.bundle.restore()
+  }
+})
+
+test('saving posts the chosen directory, so it can reach the state file', async () => {
+  const page = await mountPage(pageRoutes(settingsRoute(SETTINGS)))
+  const undo = withDirectoryPicker(async () => 'C:\\picked-ws')
+  try {
+    findButton(page.tree, '选择文件夹').props.onClick()
+    const picked = await settle(page)
+    findButton(picked, '保存设置').props.onClick()
+    await settle(page)
+
+    const post = page.calls.find(
+      (call) => call.method === 'POST' && call.path === PREFIX + '/settings',
+    )
+    assert.ok(post, 'the save has to reach the host: nothing else writes the setting')
+    assert.equal(
+      JSON.parse(post.body).workspacePath,
+      'C:\\picked-ws',
+      'the body carries the directory the user chose',
+    )
+    // And the note about that pick does not outlive the save it was waiting for.
+    const after = await settle(page)
+    assert.doesNotMatch(collectText(after).join(' | '), /选文件夹本身不保存/)
+  } finally {
+    undo()
+    page.bundle.restore()
+  }
+})
+
+test('a save that fails says so beside the button instead of looking saved', async () => {
+  const failing = ({ method }) =>
+    method === 'POST'
+      ? { status: 500, body: { error: 'EACCES: state.json is not writable' } }
+      : { status: 200, body: { settings: { ...SETTINGS }, defaults: { ...SETTINGS } } }
+  const page = await mountPage(pageRoutes(failing))
+  try {
+    findButton(page.tree, '保存设置').props.onClick()
+    const tree = await settle(page)
+
+    const text = collectText(tree).join(' | ')
+    assert.match(text, /保存失败/, 'a failed save is reported')
+    assert.match(text, /not writable/, 'the host\'s own words are shown')
+    assert.doesNotMatch(text, /已保存/, 'and it must not also claim success')
+  } finally {
+    page.bundle.restore()
+  }
+})
+
+test('a value the host would not accept is reported, not counted as saved', async () => {
+  /*
+   * The host drops any field it cannot accept and answers with what is stored, so the page would
+   * otherwise print "已保存" over a value that never took effect — the same lie as a save the user
+   * never made, just in the other direction.
+   */
+  const stored = { ...SETTINGS, maxReplyChars: 4_000 }
+  const page = await mountPage(
+    pageRoutes(settingsRoute(stored, (sent, current) => ({ ...sent, maxReplyChars: current.maxReplyChars }))),
+  )
+  try {
+    const field = collectByType(page.tree, 'input').find((node) => node.props.type === 'number')
+    assert.ok(field, 'the reply-length field is rendered')
+    // Find it by value rather than by order: the page has several number fields.
+    const replyLimit = collectByType(page.tree, 'input').find((node) => node.props.value === 4_000)
+    replyLimit.props.onChange({ target: { value: '500000' } })
+    const edited = await settle(page)
+    findButton(edited, '保存设置').props.onClick()
+    const tree = await settle(page)
+
+    const text = collectText(tree).join(' | ')
+    assert.match(text, /没有被主机接受/, 'the page admits the value did not stick')
+    assert.match(text, /回复长度上限/, 'and names the setting, so it can be fixed')
+  } finally {
+    page.bundle.restore()
+  }
+})
+
+test('a picker that refuses to open is reported instead of swallowing the failure', async () => {
+  /*
+   * The desktop side guards this call and throws for a frame it does not own. Swallowing that throw
+   * made the button indistinguishable from a dialog the user had cancelled, so the failure could
+   * not even be reported afterwards — which is what made the original report undiagnosable.
+   */
+  const page = await mountPage(pageRoutes(settingsRoute(SETTINGS)))
+  const reported = []
+  const originalError = console.error
+  console.error = (...args) => reported.push(args.map(String).join(' '))
+  const undo = withDirectoryPicker(async () => {
+    throw new Error('dsh desktop: rejected directory picker from an unowned renderer')
+  })
+  try {
+    findButton(page.tree, '选择文件夹').props.onClick()
+    const tree = await settle(page)
+
+    const text = collectText(tree).join(' | ')
+    assert.match(text, /打开文件夹选择器失败/, 'the page says the dialog could not be opened')
+    assert.match(text, /unowned renderer/, 'and repeats what the picker said')
+    assert.ok(reported.length > 0, 'the console keeps a record as well')
+    // Sent to the host's log too, which is the only place a failure survives the page.
+    assert.ok(
+      page.calls.some((call) => call.path === PREFIX + '/client-error'),
+      'the failure reaches the boot log',
+    )
+  } finally {
+    undo()
+    console.error = originalError
+    page.bundle.restore()
+  }
+})
+
+test('cancelling the dialog is not an error and changes nothing', async () => {
+  // `null` is the documented shape of "the user closed the dialog". Treating it as a failure would
+  // put an error message beside a field nobody tried to change.
+  const page = await mountPage(pageRoutes(settingsRoute({ ...SETTINGS, workspacePath: 'C:\\kept' })))
+  const undo = withDirectoryPicker(async () => null)
+  try {
+    findButton(page.tree, '选择文件夹').props.onClick()
+    const tree = await settle(page)
+
+    const text = collectText(tree).join(' | ')
+    // Narrow patterns on purpose: the page's own diagnostics hint contains the word 失败, and the
+    // settings hint mentions saving, so a broad match would fail on the page's ordinary copy.
+    assert.doesNotMatch(text, /打开文件夹选择器失败/, 'a cancelled dialog is not a failure')
+    assert.doesNotMatch(text, /选文件夹本身不保存/, 'and nothing was put in the box to save')
+    const field = collectByType(tree, 'input').find((node) => node.props.type === 'text')
+    assert.equal(field.props.value, 'C:\\kept', 'the field keeps what it already held')
+  } finally {
+    undo()
+    page.bundle.restore()
+  }
+})
+
+test('a directory that is stored but not in effect says a restart is needed', async () => {
+  /*
+   * Both states showed the same thing before — the directory in use. "It never saved" and "it saved
+   * and is not in effect" were indistinguishable, on the page and in the report that was filed.
+   */
+  const chosen = 'C:\\Users\\me\\picked-ws'
+  // The host's own diagnostic, as it answers once the directory is saved and still not in effect.
+  const stored = {
+    ...STATUS,
+    diagnostics: { ...STATUS.diagnostics, settingsWorkspace: chosen },
+  }
+  const page = await mountPage(pageRoutes(settingsRoute({ ...SETTINGS, workspacePath: chosen }), stored))
+  try {
+    const text = collectText(page.tree).join(' | ')
+    assert.match(text, /重启 DSH 后才生效/, 'the page says the saved directory is not in use yet')
+    assert.match(text, /C:\\Users\\me\\picked-ws/, 'and shows the value the settings file holds')
+  } finally {
+    page.bundle.restore()
+  }
+})
+
+test('the effective directory and the stored one are shown apart', async () => {
+  // Two rows, because they answer two questions: what conversations are using now, and what the
+  // settings page has saved. With one row, a user who saved without restarting sees no change at
+  // all and concludes the save did nothing.
+  const page = await mountPage(pageRoutes(settingsRoute(SETTINGS)))
+  try {
+    const facts = collectByClass(page.tree, 'dsh-wechat-facts')
+    const rows = collectByType(facts[0], 'div').filter((node) =>
+      collectByType(node, 'dt').length === 1,
+    )
+    const byTerm = (term) => rows.find((row) => collectText(collectByType(row, 'dt')[0]).join('') === term)
+    assert.equal(
+      collectText(collectByType(byTerm('会话工作目录'), 'dd')[0]).join(''),
+      'C:\\Users\\me\\.dsh\\dsh_wechat（正在使用）',
+      'the row says this is the directory in use',
+    )
+    assert.match(
+      collectText(collectByType(byTerm('设置里存的值'), 'dd')[0]).join(''),
+      /^（未设置，用默认位置）/,
+      'and the stored value is reported as unset rather than guessed at',
+    )
+  } finally {
+    page.bundle.restore()
+  }
+})
+
+test('a change that is not stored yet is pointed out while it is not', async () => {
+  /*
+   * Every control writes to the draft and none of them saves, while a filled box looks exactly like
+   * a stored value. The report that produced these tests was, in the end, someone who believed the
+   * page had saved and had no way to find out otherwise.
+   */
+  const page = await mountPage(pageRoutes(settingsRoute(SETTINGS)))
+  try {
+    assert.doesNotMatch(collectText(page.tree).join(' | '), /有改动还没保存/, 'nothing to save yet')
+
+    const field = collectByType(page.tree, 'input').find((node) => node.props.type === 'text')
+    field.props.onChange({ target: { value: 'C:\\typed-by-hand' } })
+    const edited = await settle(page)
+    assert.match(collectText(edited).join(' | '), /有改动还没保存/, 'typing is a change, not a save')
+    assert.equal(
+      page.calls.filter((call) => call.method === 'POST').length,
+      0,
+      'and typing must not save on its own',
+    )
+
+    findButton(edited, '保存设置').props.onClick()
+    const saved = await settle(page)
+    assert.match(collectText(saved).join(' | '), /已保存/, 'the save is confirmed')
+    assert.doesNotMatch(
+      collectText(saved).join(' | '),
+      /有改动还没保存/,
+      'and the form is no longer outstanding',
+    )
+  } finally {
+    page.bundle.restore()
+  }
+})
+
+test('the page and the host agree on the route prefix', async () => {  // The page calls routes; the host registers them. If the two strings drift, every request 404s and
   // the settings page renders empty — with no error anywhere, because a 404 is a valid response.
   const hostSource = await readFile(join(here, '..', 'src', 'host.ts'), 'utf8')
   const registered = /path:\s*'([^']+)'/.exec(hostSource)?.[1]
