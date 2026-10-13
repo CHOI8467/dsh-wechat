@@ -161,6 +161,15 @@ export interface WorkspaceRegistryService {
   create(path: string): Promise<Workspace>
   get(id: string): Workspace | undefined
   list(): readonly Workspace[]
+  /**
+   * Sessions the user has archived, across every workspace.
+   *
+   * The archive set is one registry-global list rather than a per-workspace flag, and it is the only
+   * place the fact is recorded — nothing in the session record on disk says so. Optional because a
+   * composition without the Workspace feature has no archive concept either, in which case nothing
+   * can be archived and there is nothing to report.
+   */
+  readonly archivedSessionIds?: readonly string[]
 }
 
 /** Live session registry, used to read a session's header. */

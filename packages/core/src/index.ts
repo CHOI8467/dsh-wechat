@@ -28,6 +28,7 @@ export * from './render.ts'
 export {
   SessionRouter,
   BROWSE_PAGE_SIZE,
+  MISSING_BINDING_GRACE_MS,
   SHORT_ID_LENGTH,
   SHOW_REST,
   ambiguousFolderMessage,
@@ -66,5 +67,6 @@ export {
   type SessionFolder,
   type SessionGateway,
   type SessionRouterOptions,
+  type SessionState,
   type TargetResolution,
 } from './router.ts'

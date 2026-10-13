@@ -110,6 +110,15 @@ export interface RouteDecision {
   prompt: string
   /** True when this message started a brand new session. */
   created: boolean
+  /**
+   * A sentence to send to the user before the prompt, when the conversation had to be moved.
+   *
+   * Carried back rather than sent here because core has no way to send anything: the caller owns
+   * every outbound message. It is not optional decoration — a rebind without it looks to the user
+   * like their conversation was replaced at random, and the one thing they can do about it is be
+   * told.
+   */
+  notice?: string
 }
 
 /** Result of routing one message. */
@@ -178,6 +187,17 @@ export interface ModelListing {
 }
 
 /**
+ * Whether the session a conversation is bound to can still take a message.
+ *
+ * Three answers, because two different failures look identical from the phone. An **archived**
+ * session is still on disk and still accepts a prompt — DSH records the archive in the workspace
+ * registry and rejects the *step* the prompt proposes, so the turn ends blocked with no error and
+ * nothing said. A **missing** session has no record at all, so the prompt lands nowhere. Either way
+ * the user's message is swallowed in silence, which is the failure this vocabulary exists to name.
+ */
+export type SessionState = 'usable' | 'archived' | 'missing'
+
+/**
  * The session surface this router needs from the host.
  *
  * Keeping it narrow means the routing rules are unit-testable without booting DSH,
@@ -226,7 +246,44 @@ export interface SessionGateway {
     model: string,
     reasoningEffort?: string,
   ): Promise<ModelSelection>
+  /**
+   * Whether a session a conversation is already bound to can still take work.
+   *
+   * **Optional, and the router behaves exactly as it did before without it.** A gateway that cannot
+   * answer must not cost the user a message, so an absent probe is not an error and not a reason to
+   * rebind — the binding is reused as it always was.
+   *
+   * It exists because both of the ways a bound session goes dead are invisible downstream: the
+   * prompt is accepted and nothing is ever answered, and no layer logs a thing. Asking *before*
+   * reuse is the only point at which the channel can tell the difference between a session that
+   * works and one that will swallow the message.
+   *
+   * A throw is not a verdict. The router treats a failed probe as `usable` and writes a diagnostic
+   * line, because a broken probe losing the user's message would be worse than a stale binding.
+   */
+  sessionState?(sessionId: string): Promise<SessionState>
 }
+
+/**
+ * How long a binding must have existed before a `missing` verdict is believed.
+ *
+ * This is not a nicety; it is what a live run cost. The first version of this check replaced a
+ * binding whenever the probe answered `missing`, and the machine immediately produced an endless
+ * run of new sessions: a session has **no record on disk until its first turn writes one**, so every
+ * message that arrived before that write judged the session it had just created to be missing, and
+ * created another one. The user saw a new conversation per message.
+ *
+ * The age of the *binding* is what separates "its record is not written yet" from "it is actually
+ * gone": the binding is created before the session's first prompt, so a young binding is expected to
+ * be recordless, while an old one that still has no record is a session that has been deleted. Two
+ * minutes is far longer than a first write takes and short enough that a deleted session is repaired
+ * during the same exchange the user would otherwise have lost.
+ *
+ * `archived` is deliberately not subject to this. The archive set lives in the workspace registry,
+ * which answers immediately and knows nothing about whether a record has been written yet — there is
+ * no race here to be tolerant of, and an archived session never becomes usable by waiting.
+ */
+export const MISSING_BINDING_GRACE_MS = 2 * 60 * 1000
 
 /** Everything persisted for routing, injected so the store stays pluggable. */
 export interface BindingStore {
@@ -249,6 +306,19 @@ export interface SessionRouterOptions {
   ownWorkspace?: string
   /** Heading for the channel's own workspace. */
   ownWorkspaceLabel?: string
+  /**
+   * Sink for routing facts that have to end up in a log.
+   *
+   * The router cannot write to a log itself — core imports nothing from the host — and the facts that
+   * matter most here are precisely the ones with no other trace: a binding replaced because its
+   * session died, a rebind *skipped* because the binding is too young to judge, and a probe that
+   * threw and was therefore treated as `usable`. Each of those is a decision a person diagnosing a
+   * silence needs to see, and none of them is visible in the message that was routed.
+   *
+   * Lines are English, like the rest of the channel's log, and each names the conversation, the
+   * session, the verdict and what was done with it.
+   */
+  onDiagnostic?: (line: string) => void
 }
 
 /**
@@ -260,6 +330,7 @@ export class SessionRouter {
   readonly #titlePrefix: string
   readonly #ownWorkspace: string | undefined
   readonly #ownWorkspaceLabel: string
+  readonly #onDiagnostic: ((line: string) => void) | undefined
   #bindings: Record<string, SessionBinding> | undefined
 
   constructor(options: SessionRouterOptions) {
@@ -268,6 +339,7 @@ export class SessionRouter {
     this.#titlePrefix = options.titlePrefix ?? '微信'
     this.#ownWorkspace = options.ownWorkspace
     this.#ownWorkspaceLabel = options.ownWorkspaceLabel ?? '微信会话'
+    this.#onDiagnostic = options.onDiagnostic
   }
 
   /**
@@ -283,7 +355,9 @@ export class SessionRouter {
    *   differs between a typed `/list` and a spoken request.
    * @param params.browse - Where this conversation was left in the listing browser, when it is
    *   somewhere. Without it a bare number is an ordinary message, as it always was.
-   * @returns Either text to reply with directly, or a prompt for a session.
+   * @returns Either text to reply with directly, or a prompt for a session. A prompt decision may
+   *   carry a `notice` when the conversation had to be moved to a new session first — see
+   *   {@link SessionGateway.sessionState}.
    */
   async route(params: {
     conversationId: string
@@ -316,13 +390,43 @@ export class SessionRouter {
     const bindings = await this.#load()
     let binding = bindings[params.conversationId]
     let created = false
+    let notice: string | undefined
     if (binding === undefined) {
       binding = await this.#bind(params, undefined)
       created = true
     } else {
-      // DSH may have restarted since this binding was made; make sure the session
-      // is live before handing it a prompt.
-      await this.#gateway.ensureSession(binding.sessionId, binding.title)
+      /*
+       * Ask whether the bound session still works *before* reusing it.
+       *
+       * Both ways it can be dead are silent from here on down: an archived session accepts the
+       * prompt and then has its step rejected, and a session gone from disk receives nothing. The
+       * message is then lost with no reply from the phone's point of view and no line in any log,
+       * and there is nothing the user can do about it — which is what this check is for.
+       */
+      const dead = await this.#deadState(binding)
+      if (dead !== undefined) {
+        /*
+         * A dead binding is replaced rather than repaired or unarchived.
+         *
+         * The conversation has to keep working, and the one thing that is definitely still usable is
+         * a session this channel creates itself; unarchiving would be the plugin reaching into a
+         * decision the user made on the desktop, and a session deleted on disk has nothing left to
+         * repair. `/switch` is still there for anyone who wants the old conversation back.
+         */
+        const previous = binding
+        binding = await this.#bind(params, undefined)
+        created = true
+        notice = replacedBindingNotice(previous.title, dead, binding.title)
+        this.#diagnose(
+          `session-state: binding moved conversation=${params.conversationId} ` +
+            `from=${previous.sessionId} to=${binding.sessionId} state=${dead} ` +
+            `bindingAge=${String(Math.round((Date.now() - previous.createdAt) / 1000))}s`,
+        )
+      } else {
+        // DSH may have restarted since this binding was made; make sure the session
+        // is live before handing it a prompt.
+        await this.#gateway.ensureSession(binding.sessionId, binding.title)
+      }
     }
 
     binding.lastUsedAt = Date.now()
@@ -330,7 +434,12 @@ export class SessionRouter {
 
     return {
       kind: 'prompt',
-      decision: { sessionId: binding.sessionId, prompt: text, created },
+      decision: {
+        sessionId: binding.sessionId,
+        prompt: text,
+        created,
+        ...(notice === undefined ? {} : { notice }),
+      },
     }
   }
 
@@ -546,6 +655,67 @@ export class SessionRouter {
   async #load(): Promise<Record<string, SessionBinding>> {
     this.#bindings ??= await this.#store.load()
     return this.#bindings
+  }
+
+  /**
+   * Whether a bound session can no longer take work, and therefore has to be replaced.
+   *
+   * Three outcomes, and each one is deliberate:
+   *
+   *  - The gateway has no probe → `undefined`, and the binding is reused. This is the behaviour the
+   *    channel had before the probe existed, and a composition that cannot answer must not be
+   *    punished for it.
+   *  - The probe throws → `undefined` plus a diagnostic line. A broken probe is not evidence that
+   *    the session is dead, and rebinding on it would throw away a working conversation; treating it
+   *    as usable keeps the message on its way.
+   *  - `missing` on a binding younger than {@link MISSING_BINDING_GRACE_MS} → `undefined` plus a
+   *    diagnostic line. The session's first turn is what writes its record, so a fresh binding is
+   *    *expected* to look missing; believing it is what produced an endless run of new sessions on a
+   *    live machine.
+   *
+   * @param binding - The binding about to be reused.
+   * @returns `archived` or `missing` when it must be replaced, `undefined` when it may be reused.
+   */
+  async #deadState(binding: SessionBinding): Promise<SessionState | undefined> {
+    const probe = this.#gateway.sessionState
+    if (probe === undefined) return undefined
+
+    let state: SessionState
+    try {
+      state = await probe.call(this.#gateway, binding.sessionId)
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      this.#diagnose(
+        `session-state: probe failed conversation=${binding.conversationId} ` +
+          `session=${binding.sessionId} error=${JSON.stringify(reason)} — treated as usable`,
+      )
+      return undefined
+    }
+
+    if (state === 'usable') return undefined
+
+    if (state === 'missing') {
+      const ageMs = Date.now() - binding.createdAt
+      if (ageMs < MISSING_BINDING_GRACE_MS) {
+        this.#diagnose(
+          `session-state: ${binding.sessionId} reported missing but its binding is only ` +
+            `${String(Math.round(ageMs / 1000))}s old (grace ${String(MISSING_BINDING_GRACE_MS / 1000)}s) ` +
+            `— reusing it, its first turn has probably not written a record yet`,
+        )
+        return undefined
+      }
+    }
+
+    return state
+  }
+
+  /**
+   * Report one routing decision to the host's log, when a sink was given.
+   *
+   * @param line - The line to write.
+   */
+  #diagnose(line: string): void {
+    this.#onDiagnostic?.(line)
   }
 
   /**
@@ -875,6 +1045,31 @@ export function splitCommand(text: string): { command: string; args: string } {
 
 /** What a `/switch` and a reply inside a folder both say when nothing matched. */
 const UNKNOWN_TARGET = '找不到这个对话。回复 /list 看清单，再回复数字或 id。'
+
+/**
+ * What the user is told when their conversation had to be moved to a new session.
+ *
+ * Said out loud because the alternative is a conversation that silently changed identity: the
+ * messages keep going out, the answers come back from a session with no history, and the only
+ * explanation available is a log line the user cannot see. The old title is named so they recognise
+ * which conversation was left behind, and the new one so they can find it in `/list`.
+ *
+ * @param previousTitle - Title of the session that can no longer take messages.
+ * @param state - Why it was replaced.
+ * @param nextTitle - Title of the session that is now bound.
+ * @returns The sentence to send into the chat.
+ */
+function replacedBindingNotice(
+  previousTitle: string,
+  state: SessionState,
+  nextTitle: string,
+): string {
+  const why = state === 'archived' ? '已经被归档' : '在电脑上已经不存在了'
+  return (
+    `原对话「${previousTitle}」${why}，我已新建「${nextTitle}」并接到这里。\n` +
+    '你刚发的这条会发到新对话里，之前那个的上下文不在新对话里。'
+  )
+}
 
 /**
  * What a `/switch` argument resolved to.

@@ -24,6 +24,7 @@ import {
   findSentMessage,
   findSessionList,
   forgetBrowse,
+  hasStoredSession,
   latestSessionList,
   login as loginHandshake,
   isSameWorkspace,
@@ -61,6 +62,7 @@ import {
   type RouteDecision,
   type SessionBinding,
   type SessionGateway,
+  type SessionState,
   type UploadMediaTypeValue,
   type WeixinAccount,
 } from '@dsh-wechat/core'
@@ -665,6 +667,16 @@ class WechatRuntime {
       // path is what decides which rows go under the heading the user knows this workspace by.
       ownWorkspace: this.#workspace,
       ownWorkspaceLabel: WORKSPACE_TITLE,
+      /*
+       * The router's decisions go to the boot log.
+       *
+       * A replaced binding and a *declined* replacement are the two facts a silence is diagnosed
+       * from, and neither is visible in the message that was routed: the one that was moved looks
+       * like an ordinary prompt, and the one that was left alone looks like nothing happened at all.
+       */
+      onDiagnostic: (line) => {
+        this.#recordBoot(line)
+      },
     })
   }
 
@@ -1585,7 +1597,22 @@ class WechatRuntime {
     await this.#flushPending(message.conversationId)
 
     const account = await this.#account(message.accountId)
-    if (account === undefined) return
+    if (account === undefined) {
+      /*
+       * The message is dropped here, and this line is the only trace it leaves.
+       *
+       * The account is gone once its token goes stale (`forgetAccount`), and everything that would
+       * have answered the user needs it. Returning silently — which this did — meant a message could
+       * be received, logged as an inbound line, and then never answered, never stored and never
+       * mentioned again: exactly the silence this channel must not produce. Loud, because unlike a
+       * chat that has moved, this one is not a state the user can recover from by writing again.
+       */
+      this.#recordError(
+        `inbound dropped: account ${message.accountId} is no longer stored ` +
+          `(conversation=${message.conversationId} text=${String(message.text.length)} chars)`,
+      )
+      return
+    }
     this.#startTyping(message.accountId, message.conversationId, message.peerId)
     let handedOff = false
     try {
@@ -1994,7 +2021,16 @@ class WechatRuntime {
         .filter((part) => part !== '')
         .join('\n\n')
       const account = await this.#account(message.accountId)
-      if (account === undefined) return false
+      if (account === undefined) {
+        // Reachable from the parked-attachment timer, which fires long after the inbound handler
+        // checked: an account that went away in the meantime would otherwise lose the batch in
+        // silence, including the user's own words that were waiting with it.
+        this.#recordError(
+          `inbound dropped: account ${message.accountId} is no longer stored ` +
+            `(conversation=${message.conversationId}, attachments=${String(attachments.length)})`,
+        )
+        return false
+      }
 
       // A command answers locally and never reaches the agent, so an attachment riding along
       // would be dropped without trace. With an attachment the text goes to the agent as an
@@ -3013,6 +3049,26 @@ class WechatRuntime {
     const settings = await this.#settings()
     const naming = await this.#isFirstMessage(decision.sessionId)
 
+    /*
+     * Say so before anything else when the conversation had to be moved.
+     *
+     * The router replaces a binding whose session is archived or gone, and without this sentence the
+     * user sees answers from a conversation with none of their history and no explanation at all —
+     * the move is only visible in the log. Sent first, and even when the prompt below fails, because
+     * what it explains is the *identity* of the conversation they are now in.
+     */
+    if (decision.notice !== undefined) {
+      const account = await this.#account(message.accountId)
+      if (account === undefined) {
+        this.#recordError(
+          `notice not sent: account ${message.accountId} is no longer stored ` +
+            `(conversation=${message.conversationId}) — the conversation was moved anyway`,
+        )
+      } else {
+        await this.#reply(account, message.conversationId, message.peerId, decision.notice)
+      }
+    }
+
     const lines = [
       decision.prompt,
       ...(quoted === undefined ? [] : [quoted]),
@@ -3041,7 +3097,7 @@ class WechatRuntime {
     }
     if (delivered) return
 
-    this.#recordError('提交任务失败: 插话与排队都未成功')
+    this.#recordError(`提交任务失败: 插话与排队都未成功（会话 ${decision.sessionId}）`)
     const account = await this.#account(message.accountId)
     if (account === undefined) return
     // Hand the words back rather than losing them. A dropped message is the one failure here
@@ -3389,7 +3445,22 @@ class WechatRuntime {
     void (async () => {
       const bindings = (await this.#store.read()).bindings
       const conversation = Object.values(bindings).find((entry) => entry.sessionId === sessionId)
-      if (conversation === undefined) return
+      if (conversation === undefined) {
+        /*
+         * A session no conversation is bound to produces nothing the phone can receive.
+         *
+         * That is normal for a turn the user started on the desktop — which is why this is a boot-log
+         * observation rather than an error, and why it is written once per session — but it is also
+         * what a binding that went away looks like, and then the answer is genuinely lost. Logged
+         * because "the model finished and no message arrived" has otherwise no line anywhere: the
+         * stream reader saw the text and this early return threw it away without a word.
+         */
+        this.#recordOnce(
+          '#unboundStreams',
+          `stream: no WeChat conversation is bound to ${sessionId} — its answer is not delivered`,
+        )
+        return
+      }
 
       const existing = this.#replies.get(sessionId)
       if (existing !== undefined) clearTimeout(existing.timer)
@@ -3428,9 +3499,29 @@ class WechatRuntime {
 
     const state = await this.#store.read()
     const binding = state.bindings[entry.conversationId]
-    if (binding === undefined) return
+    if (binding === undefined) {
+      /*
+       * The answer is thrown away, and this is the only record of it.
+       *
+       * It reaches here when the conversation lost its binding between the turn starting and the
+       * answer arriving — a disconnect, or the account being forgotten. The reply is already the
+       * finished work of a whole turn, so silence here is the most expensive kind: the user asked,
+       * the model answered, and nothing anywhere says where the answer went.
+       */
+      this.#recordError(
+        `reply dropped: conversation ${entry.conversationId} has no binding ` +
+          `(session=${sessionId} text=${String(text.length)} chars)`,
+      )
+      return
+    }
     const account = state.accounts[binding.accountId]
-    if (account === undefined) return
+    if (account === undefined) {
+      this.#recordError(
+        `reply dropped: account ${binding.accountId} is no longer stored ` +
+          `(conversation=${entry.conversationId} session=${sessionId} text=${String(text.length)} chars)`,
+      )
+      return
+    }
     await this.#reply(account, binding.conversationId, binding.peerId, text)
   }
 
@@ -3681,6 +3772,40 @@ class WechatRuntime {
       },
       cancel: async (sessionId: string): Promise<void> => {
         await ctx.sessionController.cancel({ sessionId })
+      },
+      /*
+       * Whether a bound session can still take a message.
+       *
+       * Both failures this answers for end in the same place — the user's message is accepted and
+       * then vanishes with nothing said and nothing logged — so the answer is asked *before* a
+       * binding is reused, and a session that cannot work is replaced.
+       *
+       * `archived` is read from the workspace registry, which is where DSH records the fact: an
+       * archived session's prompt is accepted and the *step* it proposes is rejected
+       * (`dsh-api-session-controller`'s archived-session gate), so the turn ends blocked and no
+       * answer is ever produced. Nothing on disk marks the session, so the registry is the only
+       * source that can be right.
+       *
+       * `missing` is read from the same on-disk index the listing uses, and means the session has no
+       * record anywhere. That is *also* what a session looks like during the window between its
+       * creation and its first turn — which is why the router will not believe this verdict for a
+       * binding younger than `MISSING_BINDING_GRACE_MS`, and why this function reports the raw fact
+       * rather than deciding.
+       *
+       * A record that is *present but unreadable* answers `usable`, not `missing`: that is a damaged
+       * store rather than a deleted session, and replacing the conversation over it would happen
+       * again every time a binding aged past the grace window.
+       *
+       * Absent a workspace registry there is no archive set, so only the disk test applies. A
+       * failure propagates: the router treats a throwing probe as `usable` and logs it, which keeps
+       * one broken probe from costing a working conversation.
+       */
+      sessionState: async (sessionId: string): Promise<SessionState> => {
+        const archived = ctx.workspaceRegistry?.archivedSessionIds
+        if (archived?.includes(sessionId) === true) return 'archived'
+        const workspace = await storedSessionWorkspace(this.#home, sessionId)
+        if (workspace !== undefined) return 'usable'
+        return (await hasStoredSession(this.#home, sessionId)) ? 'usable' : 'missing'
       },
       /*
        * The model catalog, flattened for a chat stream.

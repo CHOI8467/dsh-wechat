@@ -20,7 +20,7 @@
  * @module @dsh-wechat/core/session-index
  */
 
-import { readdir, readFile } from 'node:fs/promises'
+import { readdir, readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 
 /** One session as the store describes it. */
@@ -357,4 +357,52 @@ export async function storedSessionWorkspace(
 ): Promise<string | undefined> {
   const index = await readIndex(join(home, 'storages', 'session_projcache', 'sessions'), sessionId)
   return index.cwd === '' ? undefined : index.cwd
+}
+
+/**
+ * Whether the store holds a record for this session at all, readable or not.
+ *
+ * The pair with {@link storedSessionWorkspace} matters more than it looks. That function answers
+ * `undefined` both for "there is no such session" and for "there is a record I could not read", and
+ * those two call for opposite responses: the first is a session the user deleted, while the second is
+ * a damaged store. Reading the second as the first would move the conversation to a new session, and
+ * — since the damage does not heal — move it again every time the binding aged past the grace
+ * window, losing the history each time and saying nothing about why.
+ *
+ * Existence is the file's, not the parse's: a record that is present and unparseable still counts.
+ * The session's own directory counts too, because the index beside it is a *projection cache* and a
+ * row can be evicted while the conversation itself survives — the directory is what the listing
+ * actually walks.
+ *
+ * @param home - DSH home directory.
+ * @param sessionId - Session to look for.
+ * @returns True when any index row or session directory for this id exists on disk.
+ */
+export async function hasStoredSession(home: string, sessionId: string): Promise<boolean> {
+  const indexDir = join(home, 'storages', 'session_projcache', 'sessions')
+  for (const name of indexNamesFor(sessionId)) {
+    try {
+      await stat(join(indexDir, name))
+      return true
+    } catch {
+      // Try the next spelling.
+    }
+  }
+
+  let folders: string[]
+  try {
+    const entries = await readdir(join(home, 'sessions'), { withFileTypes: true })
+    folders = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name)
+  } catch {
+    return false
+  }
+  for (const folder of folders) {
+    try {
+      const entries = await readdir(join(home, 'sessions', folder), { withFileTypes: true })
+      if (entries.some((entry) => entry.isDirectory() && entry.name === sessionId)) return true
+    } catch {
+      // An unreadable folder has nothing to say about this session.
+    }
+  }
+  return false
 }

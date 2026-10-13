@@ -18,6 +18,7 @@ import { DEFAULT_SETTINGS, StateStore, SESSION_LIST_HISTORY, SESSION_LIST_TITLE_
 import {
   SessionRouter,
   BROWSE_PAGE_SIZE,
+  MISSING_BINDING_GRACE_MS,
   SHORT_ID_LENGTH,
   SHOW_REST,
   ambiguousFolderMessage,
@@ -35,7 +36,7 @@ import {
   splitCommand,
   HELP_TEXT,
 } from '../src/router.ts'
-import type { BrowsePosition, ListedSession, NumberedRows, NumberedSession, SessionBinding, SessionFolder, SessionGateway, TargetResolution } from '../src/router.ts'
+import type { BrowsePosition, ListedSession, NumberedRows, NumberedSession, SessionBinding, SessionFolder, SessionGateway, SessionState, TargetResolution } from '../src/router.ts'
 import type { ChannelState } from '../src/state.ts'
 import { chargeQuota, quotaLedgerFor, type QuotaEntry } from '../src/quota.ts'
 import type { WeixinAccount, WeixinMessage } from '../src/types.ts'
@@ -252,9 +253,38 @@ class FakeGateway implements SessionGateway {
   }
 }
 
+/**
+ * A gateway that can also say whether a bound session still works.
+ *
+ * Kept separate from {@link FakeGateway} rather than folded into it, because the two answer different
+ * questions: a composition *without* a probe has to keep behaving exactly as it always did, and that
+ * is only testable while a gateway without one still exists.
+ */
+class ProbeGateway extends FakeGateway {
+  /** Verdicts to report, by session id. */
+  readonly states = new Map<string, SessionState>()
+  /** Sessions the probe was asked about, in order. */
+  readonly probes: string[] = []
+  /** When true, every probe throws, as an unreadable store or a broken implementation would. */
+  failProbe = false
+
+  /**
+   * @param fallback - Verdict for a session with no entry in {@link states}.
+   */
+  constructor(readonly fallback: SessionState = 'usable') {
+    super()
+  }
+
+  async sessionState(sessionId: string): Promise<SessionState> {
+    this.probes.push(sessionId)
+    if (this.failProbe) throw new Error('store unreadable')
+    return this.states.get(sessionId) ?? this.fallback
+  }
+}
+
 /** In-memory binding store. */
-function memoryStore() {
-  let data: Record<string, SessionBinding> = {}
+function memoryStore(initial: Record<string, SessionBinding> = {}) {
+  let data: Record<string, SessionBinding> = initial
   return {
     async load() {
       return data
@@ -270,6 +300,29 @@ const conversation = {
   conversationId: 'fd17bd2d40c3@im.bot:user@im.wechat',
   accountId: 'fd17bd2d40c3@im.bot',
   peerId: 'user@im.wechat',
+}
+
+/**
+ * A binding as a previous run would have left it, `ageMs` old.
+ *
+ * The age is the whole point of these tests: `missing` is only believed once a binding has been
+ * around long enough that its session's first turn would have written a record.
+ *
+ * @param sessionId - Session the conversation is bound to.
+ * @param title - Title the binding carries.
+ * @param ageMs - How long ago it was created.
+ */
+function agedBinding(sessionId: string, title: string, ageMs: number): SessionBinding {
+  const now = Date.now()
+  return {
+    conversationId: conversation.conversationId,
+    accountId: conversation.accountId,
+    peerId: conversation.peerId,
+    sessionId,
+    title,
+    createdAt: now - ageMs,
+    lastUsedAt: now - ageMs,
+  }
 }
 
 test('first message auto-binds a new session and returns a prompt decision', async () => {
@@ -301,6 +354,208 @@ test('a second message reuses the same session', async () => {
   assert.equal(second.decision.created, false)
   // The reused session is re-ensured so a host restart cannot strand it.
   assert.ok(gateway.calls.some((call) => call.startsWith(`ensure:${first.decision.sessionId}:`)))
+})
+
+/*
+ * The probe, and the two failures it exists for.
+ *
+ * Both of them are invisible from outside: an archived session is still on disk and still accepts a
+ * prompt — DSH rejects the *step* the prompt proposes, so the turn ends with nothing said — and a
+ * session that is gone receives the prompt into nowhere. Neither raises, neither is logged by anyone
+ * else, and the user simply never hears back. So these tests are as much about the log lines as about
+ * the rebinding: a fix that rebinds silently would leave the next report just as unanswerable.
+ */
+
+test('a binding whose session was archived is replaced, and the user is told', async () => {
+  const gateway = new ProbeGateway()
+  const store = memoryStore()
+  const lines: string[] = []
+  const router = new SessionRouter({ gateway, store, onDiagnostic: (line) => lines.push(line) })
+
+  const first = await router.route({ ...conversation, text: '第一句' })
+  assert.equal(first.kind, 'prompt')
+  if (first.kind !== 'prompt') return
+  const archived = first.decision.sessionId
+  // Nothing to ask about yet: a conversation with no binding is created, never probed.
+  assert.deepEqual(gateway.probes, [])
+  gateway.states.set(archived, 'archived')
+
+  const second = await router.route({ ...conversation, text: '第二句' })
+  assert.equal(second.kind, 'prompt')
+  if (second.kind !== 'prompt') return
+  assert.notEqual(second.decision.sessionId, archived, 'the archived session is left behind')
+  assert.equal(second.decision.created, true)
+  assert.equal(second.decision.prompt, '第二句', 'the user\'s words still reach the agent')
+  assert.ok(
+    (second.decision.notice ?? '').includes('归档'),
+    'the user is told why the conversation changed',
+  )
+  assert.ok(
+    (second.decision.notice ?? '').includes(shortId(archived)),
+    'and which conversation was left behind, by the short id the user can recognise',
+  )
+  assert.ok(gateway.calls.some((call) => call.startsWith(`ensure:${second.decision.sessionId}:`)))
+  // Persisted, or the next message would land in the archived session again.
+  assert.equal(store.peek()[conversation.conversationId]?.sessionId, second.decision.sessionId)
+  const moved = lines.find((line) => line.includes('state=archived'))
+  assert.ok(moved !== undefined, `a replaced binding must be written down; got ${lines.join(' | ')}`)
+  assert.ok(moved.includes(conversation.conversationId), 'the line names the conversation')
+  assert.ok(moved.includes(archived), 'and the session that was left')
+  assert.ok(moved.includes(second.decision.sessionId), 'and the one that took over')
+})
+
+test('an archived session is replaced however young the binding is', async () => {
+  /*
+   * The grace period below exists because a *new* session has no record yet. Archiving is not that:
+   * the registry answers immediately and knows nothing about whether a record has been written, so
+   * waiting the two minutes out would leave the user talking to a session that cannot answer.
+   */
+  const gateway = new ProbeGateway()
+  const old = mintSessionId()
+  gateway.states.set(old, 'archived')
+  const store = memoryStore({
+    [conversation.conversationId]: agedBinding(old, '微信 刚建的', 1_000),
+  })
+  const router = new SessionRouter({ gateway, store })
+
+  const result = await router.route({ ...conversation, text: '这条不能丢' })
+  assert.equal(result.kind, 'prompt')
+  if (result.kind !== 'prompt') return
+  assert.notEqual(result.decision.sessionId, old)
+  assert.equal(result.decision.created, true)
+})
+
+test('a session that is gone from disk is replaced once the binding is old enough to be sure', async () => {
+  const gateway = new ProbeGateway()
+  const old = mintSessionId()
+  gateway.states.set(old, 'missing')
+  const store = memoryStore({
+    [conversation.conversationId]: agedBinding(
+      old,
+      '微信 旧对话',
+      MISSING_BINDING_GRACE_MS + 1_000,
+    ),
+  })
+  const lines: string[] = []
+  const router = new SessionRouter({ gateway, store, onDiagnostic: (line) => lines.push(line) })
+
+  const result = await router.route({ ...conversation, text: '还在吗' })
+  assert.equal(result.kind, 'prompt')
+  if (result.kind !== 'prompt') return
+  assert.notEqual(result.decision.sessionId, old)
+  assert.equal(result.decision.created, true)
+  assert.ok((result.decision.notice ?? '').includes('不存在'), 'the user is told what happened')
+  assert.equal(store.peek()[conversation.conversationId]?.sessionId, result.decision.sessionId)
+  assert.ok(lines.some((line) => line.includes('state=missing') && line.includes(old)))
+})
+
+test('a session with no record yet is kept, not replaced', async () => {
+  /*
+   * This is the bug the grace period was written for. A session's record is written by its first
+   * turn, so a brand-new binding legitimately looks "missing" — believing that verdict replaced the
+   * session it had just created and produced one new conversation per message on a live machine.
+   */
+  const gateway = new ProbeGateway()
+  const fresh = mintSessionId()
+  gateway.states.set(fresh, 'missing')
+  const store = memoryStore({
+    [conversation.conversationId]: agedBinding(fresh, '微信 刚开始', 1_000),
+  })
+  const lines: string[] = []
+  const router = new SessionRouter({ gateway, store, onDiagnostic: (line) => lines.push(line) })
+
+  const result = await router.route({ ...conversation, text: '第一条' })
+  assert.equal(result.kind, 'prompt')
+  if (result.kind !== 'prompt') return
+  assert.equal(result.decision.sessionId, fresh, 'the young binding is reused')
+  assert.equal(result.decision.created, false)
+  assert.equal(result.decision.notice, undefined, 'and nothing is said to the user about it')
+  assert.ok(gateway.calls.some((call) => call.startsWith(`ensure:${fresh}:`)))
+  assert.ok(
+    lines.some((line) => line.includes('grace') && line.includes(fresh)),
+    `the declined replacement must be visible; got ${lines.join(' | ')}`,
+  )
+})
+
+test('a missing verdict inside the grace window cannot multiply sessions', async () => {
+  // Every probe answers missing, which is exactly the state the live machine was in: the record is
+  // written by the first turn, so *whatever* this channel creates looks missing until then.
+  const gateway = new ProbeGateway('missing')
+  const store = memoryStore()
+  const router = new SessionRouter({ gateway, store })
+
+  const ids: string[] = []
+  for (let index = 0; index < 5; index += 1) {
+    const result = await router.route({ ...conversation, text: `第 ${String(index)} 条` })
+    assert.equal(result.kind, 'prompt')
+    if (result.kind !== 'prompt') return
+    ids.push(result.decision.sessionId)
+  }
+  assert.equal(new Set(ids).size, 1, 'five messages, one conversation')
+})
+
+test('a burst of messages after an archived session is replaced creates one new session', async () => {
+  const gateway = new ProbeGateway()
+  const store = memoryStore()
+  const router = new SessionRouter({ gateway, store })
+
+  const first = await router.route({ ...conversation, text: '一' })
+  assert.equal(first.kind, 'prompt')
+  if (first.kind !== 'prompt') return
+  gateway.states.set(first.decision.sessionId, 'archived')
+
+  const created: string[] = []
+  for (const text of ['二', '三', '四']) {
+    const result = await router.route({ ...conversation, text })
+    assert.equal(result.kind, 'prompt')
+    if (result.kind !== 'prompt') return
+    created.push(result.decision.sessionId)
+  }
+  assert.equal(new Set(created).size, 1, 'the replacement is not replaced again')
+  // Once per reuse, and never for the message that created the first binding: there was nothing to ask.
+  assert.equal(gateway.probes.length, 3)
+})
+
+test('a probe that throws is treated as usable, so a broken probe cannot cost a message', async () => {
+  const gateway = new ProbeGateway()
+  gateway.failProbe = true
+  const store = memoryStore()
+  const lines: string[] = []
+  const router = new SessionRouter({ gateway, store, onDiagnostic: (line) => lines.push(line) })
+
+  const first = await router.route({ ...conversation, text: '一' })
+  assert.equal(first.kind, 'prompt')
+  if (first.kind !== 'prompt') return
+
+  const second = await router.route({ ...conversation, text: '二' })
+  assert.equal(second.kind, 'prompt')
+  if (second.kind !== 'prompt') return
+  assert.equal(second.decision.sessionId, first.decision.sessionId, 'the working session is kept')
+  assert.equal(second.decision.notice, undefined)
+  assert.equal(store.peek()[conversation.conversationId]?.sessionId, first.decision.sessionId)
+  assert.ok(
+    lines.some((line) => line.includes('probe failed') && line.includes(first.decision.sessionId)),
+    `a failed probe must be written down; got ${lines.join(' | ')}`,
+  )
+})
+
+test('a gateway with no probe behaves exactly as it did before', async () => {
+  // A gateway that cannot answer must not be punished for it: no rebinding, no notice, and not even a
+  // diagnostic line, because nothing was asked.
+  const gateway = new FakeGateway()
+  const store = memoryStore()
+  const lines: string[] = []
+  const router = new SessionRouter({ gateway, store, onDiagnostic: (line) => lines.push(line) })
+
+  const first = await router.route({ ...conversation, text: '一' })
+  const second = await router.route({ ...conversation, text: '二' })
+  assert.equal(first.kind, 'prompt')
+  assert.equal(second.kind, 'prompt')
+  if (first.kind !== 'prompt' || second.kind !== 'prompt') return
+  assert.equal(second.decision.sessionId, first.decision.sessionId)
+  assert.equal(second.decision.created, false)
+  assert.equal(second.decision.notice, undefined)
+  assert.deepEqual(lines, [])
 })
 
 test('/new creates a distinct session', async () => {

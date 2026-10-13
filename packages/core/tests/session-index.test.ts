@@ -15,11 +15,13 @@ import { test } from 'node:test'
 import {
   compareSessionsNewestFirst,
   encodeWorkspaceDir,
+  hasStoredSession,
   indexKeyFor,
   indexNamesFor,
   isSameWorkspace,
   listAllStoredSessions,
   listStoredSessions,
+  storedSessionWorkspace,
 } from '../src/session-index.ts'
 
 /**
@@ -341,6 +343,43 @@ test('a session whose record contradicts its folder is dropped', async () => {
     )
 
     assert.deepEqual(await listStoredSessions(home, workspace), [])
+  } finally {
+    await removeHome(home)
+  }
+})
+
+test('a record that exists but cannot be read is not the same as no record at all', async () => {
+  /*
+   * What this distinction protects: a bound session that the store cannot *read* must not be reported
+   * as deleted, because the channel's answer to "deleted" is to start a new conversation. A damaged
+   * store does not heal, so that answer would be given again every time the binding aged past the
+   * grace window — losing the history each round while saying nothing about why.
+   *
+   * `storedSessionWorkspace` cannot tell the two apart (it answers undefined for both); this is the
+   * question that can.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-store-'))
+  try {
+    const workspace = join(home, 'dsh_wechat')
+    const indexPath = join(home, 'storages', 'session_projcache', 'sessions')
+
+    // A readable record, a corrupt one, and one whose index row was evicted while the session's own
+    // directory survived — the index is a projection *cache*, so that is a state the store can be in.
+    await seedStore(home, workspace, [['session-aaaa1111-aaaa1111-x', '好的']])
+    const corrupt = 'session-eeee5555-eeee5555-x'
+    await writeFile(join(indexPath, `${corrupt}.json`), '{')
+    const evicted = 'session-ffff6666-ffff6666-x'
+    await mkdir(join(home, 'sessions', encodeWorkspaceDir(workspace), evicted), { recursive: true })
+    await writeFile(join(home, 'sessions', encodeWorkspaceDir(workspace), evicted, 'v.jsonl'), 'x')
+
+    assert.equal(await hasStoredSession(home, 'session-aaaa1111-aaaa1111-x'), true)
+    assert.equal(await storedSessionWorkspace(home, corrupt), undefined, 'a broken record reads empty')
+    assert.equal(await hasStoredSession(home, corrupt), true, 'but the session is still there')
+    assert.equal(await storedSessionWorkspace(home, evicted), undefined)
+    assert.equal(await hasStoredSession(home, evicted), true, 'its own directory is evidence enough')
+    assert.equal(await hasStoredSession(home, 'session-99999999-99999999-x'), false)
+    // A store that is not there at all holds nothing, and must not throw.
+    assert.equal(await hasStoredSession(join(home, 'nope'), 'session-99999999-99999999-x'), false)
   } finally {
     await removeHome(home)
   }

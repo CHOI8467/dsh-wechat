@@ -102,6 +102,14 @@ interface RuntimeShape {
   status(): Promise<{ enabled: boolean; accounts: unknown[]; needsLogin: boolean; errors: string[] }>
   loginState(): { phase: string; step?: string }
   bindings(): Promise<{ conversationId: string; sessionId: string; title: string }[]>
+  /**
+   * The live state, as the channel holds it in memory.
+   *
+   * Reached so a test can age a binding: `missing` is only believed past the grace window, and the
+   * only way to be past it without waiting two minutes is to move the timestamp the verdict is
+   * weighed against.
+   */
+  state(): Promise<{ bindings: Record<string, { sessionId: string; createdAt: number }> }>
   setEnabled(enabled: boolean): Promise<void>
   ingest(message: {
     accountId: string
@@ -132,6 +140,13 @@ interface Harness {
   presetApplications: { sessionId: string; preset: string }[]
   /** Model selections the channel installed, in order. */
   modelSelections: ModelRequest[]
+  /**
+   * Sessions the stub registry reports as archived.
+   *
+   * The archive set is the registry's, not a field on the session, which is what makes it the only
+   * place the channel can learn the fact — and what these tests drive.
+   */
+  archivedSessionIds: string[]
   created: Created[]
   /** Messages carrying the user's own words, which is what most tests are about. */
   prompted: { sessionId: string; mode: 'queue' | 'steer'; text: string }[]
@@ -249,6 +264,13 @@ async function mountWith(options: {
   const presetApplications: { sessionId: string; preset: string }[] = []
   /** Model selections the channel installed, in order. */
   const modelSelections: ModelRequest[] = []
+  /**
+   * The archive set the stub registry reports.
+   *
+   * A stub without it would send the channel down its "no archive concept" path, where nothing can
+   * ever be archived — and the behaviour under test would look correct while never running.
+   */
+  const archivedSessionIds: string[] = []
   /** Recorded so a test can assert the permission behaviour rather than infer it. */
   const permissionPresetsSet = (session: unknown, preset: string): void => {
     presetApplications.push({ sessionId: String((session as { id?: string }).id ?? ''), preset })
@@ -456,6 +478,11 @@ async function mountWith(options: {
           ? workspace
           : [...workspacesByPath.values()].find((entry) => entry.id === id),
       list: () => [workspace, ...workspacesByPath.values()],
+      // A getter, as the real registry has: the channel reads the set at the moment it asks, so a
+      // test that archives a session mid-run is seen by the next probe rather than by a new mount.
+      get archivedSessionIds(): readonly string[] {
+        return archivedSessionIds
+      },
     },
     // Present in every real composition, and the agent's only route to sending a file
     // back to WeChat. Captured so a test can invoke the registered tool.
@@ -512,6 +539,7 @@ async function mountWith(options: {
     resolvedWorkspacePaths,
     presetApplications,
     modelSelections,
+    archivedSessionIds,
     created,
     prompted,
     allPrompts,
@@ -712,6 +740,195 @@ test('a second message reuses the same session with an identical cwd', async () 
     assert.deepEqual(
       harness.prompted.map((entry) => userPart(entry.text)),
       ['one', 'two'],
+    )
+  })
+})
+
+/**
+ * Remove one session from the on-disk store, as deleting it on the desktop does.
+ *
+ * Both halves go: the session's own directory under `sessions/`, which is what the transcript lives
+ * in, and its row in the index the listing and the probe read. Leaving either behind would keep the
+ * session looking alive to one reader and gone to another — and the whole bug being tested is that
+ * "gone" was never noticed.
+ *
+ * @param home - Temporary DSH home.
+ * @param workspace - Directory the session belonged to.
+ * @param sessionId - Session to delete.
+ */
+async function deleteStoredSession(
+  home: string,
+  workspace: string,
+  sessionId: string,
+): Promise<void> {
+  await rm(join(home, 'sessions', encodeWorkspaceDir(workspace), sessionId), {
+    recursive: true,
+    force: true,
+  })
+  await rm(join(home, 'storages', 'session_projcache', 'sessions', `${sessionId}.json`), {
+    force: true,
+  })
+}
+
+/**
+ * Age every binding past the `missing` grace window.
+ *
+ * A session has no record on disk until its first turn writes one, so the probe's `missing` verdict
+ * is only believed for a binding older than two minutes. Moving the timestamp is the only way to
+ * reach that state without waiting, and it is the same field the router weighs.
+ *
+ * @param harness - Mounted channel.
+ * @param ageMs - How old to make the bindings.
+ */
+async function ageBindings(harness: Harness, ageMs: number): Promise<void> {
+  const state = await harness.runtime.state()
+  for (const binding of Object.values(state.bindings)) {
+    binding.createdAt = Date.now() - ageMs
+  }
+}
+
+/** Everything the channel wrote to its boot log, newest last. */
+async function bootLogLines(harness: Harness): Promise<string[]> {
+  const text = await readFile(join(harness.bundleHome, 'wechat', 'boot.log'), 'utf8')
+  return text.split(/\r?\n/).filter((line) => line !== '')
+}
+
+test('a message for an archived session starts a new one, rebinds, and says so', async () => {
+  /*
+   * The failure this is written for: an archived session is still on disk and still accepts a prompt,
+   * and DSH then refuses the *step* that prompt proposes — so the turn ends with nothing said and
+   * nothing logged, and the user's message is simply gone. Asking the registry before reuse is the
+   * only point at which the channel can tell.
+   */
+  await withHarness(async (harness) => {
+    await harness.runtime.ingest(inbound('第一句'))
+    const archived = harness.created[0].sessionId ?? ''
+    assert.notEqual(archived, '')
+    harness.archivedSessionIds.push(archived)
+
+    await harness.runtime.ingest(inbound('第二句'))
+
+    const replacement = harness.created.at(-1)?.sessionId ?? ''
+    assert.notEqual(replacement, archived, 'a different session answers from now on')
+    assert.equal(harness.created.length, 2, 'one replacement, not a session per message')
+    assert.equal(
+      harness.prompted.at(-1)?.sessionId,
+      replacement,
+      'the user\'s own words go to the new session, not the archived one',
+    )
+    assert.deepEqual(
+      (await harness.runtime.bindings()).map((binding) => binding.sessionId),
+      [replacement],
+      'the rebind is persisted, or the next message would land in the archived session again',
+    )
+    // The user has to be told: answers now come from a conversation with none of their history.
+    const notice = harness.sent.at(-1)?.text ?? ''
+    assert.match(notice, /归档/)
+    assert.match(notice, /新建/)
+    // And the move is written down, which is what makes the next report of a silence diagnosable.
+    const lines = await bootLogLines(harness)
+    const moved = lines.find((line) => line.includes('state=archived'))
+    assert.ok(moved !== undefined, `the rebind must be logged; got ${lines.join(' | ')}`)
+    assert.ok(moved.includes(archived) && moved.includes(replacement))
+  })
+})
+
+test('a message for a session deleted from disk starts a new one and says so', async () => {
+  await withHarness(async (harness) => {
+    await harness.runtime.ingest(inbound('第一句'))
+    const deleted = harness.created[0].sessionId ?? ''
+    await deleteStoredSession(harness.bundleHome, harness.workspace, deleted)
+    // Past the grace window: a session with no record is only believed gone once its first turn
+    // would certainly have written one.
+    await ageBindings(harness, 5 * 60 * 1000)
+
+    await harness.runtime.ingest(inbound('第二句'))
+
+    const replacement = harness.created.at(-1)?.sessionId ?? ''
+    assert.notEqual(replacement, deleted)
+    assert.equal(harness.created.length, 2)
+    assert.equal(harness.prompted.at(-1)?.sessionId, replacement)
+    assert.match(harness.sent.at(-1)?.text ?? '', /不存在/)
+    const lines = await bootLogLines(harness)
+    const moved = lines.find((line) => line.includes('state=missing'))
+    assert.ok(moved !== undefined, `the rebind must be logged; got ${lines.join(' | ')}`)
+    assert.ok(moved.includes(deleted) && moved.includes(replacement))
+  })
+})
+
+test('a session the store cannot read is kept, not replaced', async () => {
+  /*
+   * The fail-safe direction, end to end. A record that exists but does not parse is a damaged store,
+   * not a deleted session, and answering "gone" for it would start a new conversation — and start
+   * another one every time the binding aged past the grace window, because damage does not heal. The
+   * user's message must keep going where it was going.
+   */
+  await withHarness(async (harness) => {
+    await harness.runtime.ingest(inbound('第一句'))
+    const sessionId = harness.created[0].sessionId ?? ''
+    await writeFile(
+      join(
+        harness.bundleHome,
+        'storages',
+        'session_projcache',
+        'sessions',
+        `${sessionId}.json`,
+      ),
+      '{',
+    )
+    await ageBindings(harness, 5 * 60 * 1000)
+
+    await harness.runtime.ingest(inbound('第二句'))
+
+    assert.deepEqual(
+      new Set(harness.created.map((entry) => entry.sessionId)),
+      new Set([sessionId]),
+      'the session is reused, however unreadable its record is',
+    )
+    assert.equal(harness.prompted.at(-1)?.sessionId, sessionId)
+    assert.equal(harness.sent.length, 0, 'and nothing is said to the user')
+  })
+})
+
+test('a session with no record yet is kept, so messages cannot multiply sessions', async () => {
+  /*
+   * The live machine's first version of this fix created a new conversation per message: a session
+   * has no record until its first turn writes one, so every freshly created session looked missing.
+   * The binding's age is what separates the two cases, and this is the test that pins it.
+   */
+  await withHarness(async (harness) => {
+    await harness.runtime.ingest(inbound('第一句'))
+    const sessionId = harness.created[0].sessionId ?? ''
+    await deleteStoredSession(harness.bundleHome, harness.workspace, sessionId)
+    // But *young*, which is the whole point: this is what a session looks like before its first
+    // turn has written anything.
+
+    await harness.runtime.ingest(inbound('第二句'))
+    await harness.runtime.ingest(inbound('第三句'))
+
+    assert.equal(harness.created.length, 3, 'the same session is re-ensured, not replaced')
+    assert.deepEqual(new Set(harness.created.map((entry) => entry.sessionId)), new Set([sessionId]))
+    assert.equal(harness.sent.length, 0, 'and the user is told nothing, because nothing changed')
+    // The declined replacement is still written down: "why did it not repair itself" has to be
+    // answerable from the log.
+    const lines = await bootLogLines(harness)
+    assert.ok(
+      lines.some((line) => line.includes('grace') && line.includes(sessionId)),
+      `the skipped replacement must be visible; got ${lines.join(' | ')}`,
+    )
+  })
+})
+
+test('a conversation whose binding is healthy is left alone', async () => {
+  await withHarness(async (harness) => {
+    await harness.runtime.ingest(inbound('one'))
+    await harness.runtime.ingest(inbound('two'))
+
+    assert.equal(harness.sent.length, 0, 'nothing is said when nothing is wrong')
+    assert.equal(
+      (await harness.runtime.bindings())[0]?.sessionId,
+      harness.created[0].sessionId,
+      'and the session that was created is still the one bound',
     )
   })
 })
@@ -3058,6 +3275,14 @@ async function seedBoundConversation(
   pending: unknown[] = [],
   quotaUsed = 0,
 ): Promise<void> {
+  /*
+   * The bound session has to exist on disk, or this fixture would describe a conversation whose
+   * session is *gone* — which the channel now detects and repairs by starting a new one and telling
+   * the user. That repair is right, but it is not what these tests are about: they stand mid-window
+   * to count sends, and a replacement session would spend a slot and arrive as an extra message.
+   * So the fixture models a working conversation, which is what it always meant.
+   */
+  await seedStoredSession(home, join(home, 'dsh_wechat'), 'session-wechat-bound', '微信那边')
   await mkdir(join(home, 'wechat'), { recursive: true })
   await writeFile(
     join(home, 'wechat', 'state.json'),

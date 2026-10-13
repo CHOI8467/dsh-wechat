@@ -625,6 +625,115 @@ token 由**用户那条消息**签发，回信时必须原样带回。它过期�
 
 > **教训（与 §4.9 同一条）**：这次又差点在同一个地方交学费——`normalize()` 是白名单，加字段就必须同时加校验和往返测试。而更要紧的是那条**结构**上的收获：§4.12 的「打印用一份、冻结用另一份」不是靠更小心修好的，是**把第二份删掉**修好的。同一份事实有两个产生者时，先找能不能只留一个。
 
+## 4.14 静默吞消息：会话被归档之后，日志里连一行都没有
+
+> 这一节是**用户报告的 bug**，也是本仓库第三次遇到"失败不带声音"这个形状（§3.6 是**谎报成功**、
+> §3.7 是**best effort 静默失败**）。这次更彻底：**连一行日志都没有**，用户和插件都无从下手。
+
+**现象**：微信绑定的会话**被归档**，或者该会话**在磁盘上已经不存在**，之后微信再发消息 ——
+消息完全消失：手机收不到回复，电脑上也没有动静，**日志里没有任何错误**。
+
+### 根因：两种死法，都不报错
+
+| 状态 | 为什么消息会消失 | 依据 |
+|---|---|---|
+| **已归档** | 归档**不是**磁盘上的标记，会话本体还在，`sessionController.prompt` 照常**接受**；随后 `archived-session-gate` 在 `agent/pre-step` 上把它 **reject** 掉，回合以 `blocked` 结束 —— 没有请求、没有异常、没有日志 | `@deepseek-ai/dsh-api-session-controller/lib/types/archived-session-gate.js`：`an archived Session … must not run a model step until it is restored` |
+| **磁盘上不存在** | 会话记录没了，prompt 提交给一个不存在的会话，谁都不会回话 | 会话索引里查不到它（`storedSessionWorkspace()` 返回 undefined） |
+
+**归档状态存在哪里**：`ctx.workspaceRegistry.archivedSessionIds`（一个 registry 全局的集合，不是会话上的字段；
+实测机器上它的持久副本在 `<home>/storages/workspace.json` 的 `global.archivedSessionIds`）。
+**排查时先看这个集合**，因为磁盘上没有任何东西能告诉你一个会话被归档了。
+
+### 修法：**复用 binding 之前先问一句**
+
+`SessionGateway` 增加一个**可选**探针：
+
+```ts
+export type SessionState = 'usable' | 'archived' | 'missing'
+sessionState?(sessionId: string): Promise<SessionState>
+```
+
+| 要点 | 做法与理由 |
+|---|---|
+| **查询时机** | router **复用既有 binding 之前**。再往后就来不及了：prompt 一旦提交，这一轮是沉默的 |
+| **不可用时** | **新建会话 + 改绑**（不是解归档，也不是修复）。对话必须能继续工作，而唯一确定可用的是本渠道自己建的会话；解归档等于替用户在桌面上做决定，磁盘上删掉的会话也没有东西可修。想找回旧对话仍然可以用 `/switch` |
+| **同时回一句中文提示** | `RouteDecision.notice`，由宿主在**提交 prompt 之前**发出去。**只改绑不说话是另一种困惑**：用户看到新对话里没有任何上下文 |
+| **查询出错按 `usable`** | 探针抛错 → 记一行诊断 → 当可用。**探针坏了不能把用户的消息弄丢**。同理，"记录存在但读不出来"（损坏的 store）也按 `usable`，见 `hasStoredSession()` |
+| **探针是可选的** | 网关没有实现它时，行为与从前**逐字一致**：不查询、不改绑、不打日志 |
+| **日志由宿主写** | core 不认识日志，路由把诊断交给 `SessionRouterOptions.onDiagnostic`，宿主接到 `boot.log` |
+
+### 踩过的坑：无限新建循环（用户实盘踩出来的）
+
+首版只对 `missing` 换新，实盘**立刻出现无限新建循环**：**新会话在首轮写入之前磁盘上没有任何记录**，
+于是每条消息都判 `missing`、每条都新建一个会话。
+
+**修法**：`missing` 需要 **binding 满 2 分钟**（`MISSING_BINDING_GRACE_MS`）才相信；
+**`archived` 不受宽限期影响**——归档状态在 registry 里，立刻可答，不存在"还没写完"的竞争。
+
+**为什么用 binding 的年龄而不是会话的年龄**：binding 建在首轮 prompt **之前**，
+所以"年轻的 binding 没有记录"是预期状态，而"年老的 binding 仍然没有记录"才说明它真的被删了。
+两分钟远长于首轮写入所需，又短到被删的会话能在同一轮对话里被修好。
+
+### 让失败可见（这是本次最要紧的一条）
+
+**静默吞消息且不留日志，才是这个 bug 真正致命的地方。** 所以：
+
+| 位置 | 现在的痕迹 |
+|---|---|
+| 换绑 | `session-state: binding moved conversation=… from=… to=… state=archived|missing bindingAge=Ns` |
+| **拒绝**换绑（宽限期内） | `session-state: <id> reported missing but its binding is only Ns old (grace 120s) — reusing it…`（"它为什么没自愈"必须能从日志里回答） |
+| 探针抛错 | `session-state: probe failed conversation=… session=… error="…" — treated as usable` |
+| 提示发不出去 | `notice not sent: account … is no longer stored (conversation=…) — the conversation was moved anyway` |
+
+**顺带找出的其它"静默吞消息"路径**（都补了日志；它们都不报错，只是"什么都不做"）：
+
+| 路径 | 原来 | 现在 |
+|---|---|---|
+| `#handleInbound` / `#deliver` 找不到 account | `return`，用户的消息消失 | `inbound dropped: account … is no longer stored (conversation=… text=N chars)` |
+| `onAssistantFrame` 找不到该会话的 binding | `return`，模型答完了没人知道 | `stream: no WeChat conversation is bound to <id> — its answer is not delivered`（**按会话去重**，桌面会话的回合是正常情况，不能刷屏，但必须留痕） |
+| `#flushReply` 的 binding / account 没了 | `return`，**整轮答案**丢掉 | `reply dropped: conversation … has no binding (session=… text=N chars)` |
+| `提交任务失败: 插话与排队都未成功` | 没有会话 id，定位不了 | 补上 `（会话 <id>）` |
+
+### 验证
+
+新增测试（core 9 条 + session-index 1 条 + plugin 5 条，全套 **278 项全绿**，基线 264）：
+
+| 测试 | 断言的是什么 |
+|---|---|
+| core「a binding whose session was archived is replaced…」 | 换新会话、**入库的 binding 真的改了**、有中文提示、日志有 `state=archived` 且带上新旧 id；**首条消息不查询** |
+| core「an archived session is replaced however young the binding is」 | 归档**不吃宽限期** |
+| core「a session that is gone from disk is replaced…」 | 超期 `missing` → 换绑 + 提示 + 日志 |
+| core「a session with no record yet is kept, not replaced」 | 宽限期内**不换**，且留下一行 `grace` 诊断 |
+| core「a missing verdict inside the grace window cannot multiply sessions」 | 五条消息一个会话（**防无限新建**） |
+| core「a burst of messages after an archived session is replaced creates one new session」 | 换一次就够；复用**每次只查一次** |
+| core「a probe that throws is treated as usable…」 | 抛错 → 消息照走，且有 `probe failed` 日志 |
+| core「a gateway with no probe behaves exactly as it did before」 | 无探针：不换绑、不提示、**连诊断都不写** |
+| session-index「a record that exists but cannot be read…」 | `storedSessionWorkspace` 分不出"没有"和"读不出来"，`hasStoredSession` 能 |
+| plugin 四条 | 同样的四种情形走**真宿主粘合层**：归档 → 换绑 + 提示 + 日志；磁盘删除（超宽限）→ 同上；记录损坏 / 宽限期内 → **不换**且不打扰用户 |
+
+**反向验证**（两次，都恢复到全绿）：
+
+1. 把宽限期判断改成永不相信（`if (false && …)`）→ core 的「no record yet」与「cannot multiply sessions」
+   两条立刻变红，plugin 的同名用例也变红；报的正是"新建了一个不该新建的会话"
+2. 把探针的 `catch` 从 `return undefined` 改成 `return 'missing'` →「a probe that throws is treated as usable」变红
+
+### 教训
+
+1. **"接受"不等于"会执行"。** 一个接口返回成功、然后在下游被一道门悄悄拒掉，是最难查的形状：
+   调用方拿到的每一步都是"好的"。**凡是"提交给别的东西去做"的路径，都要能回答"它后来做了吗"**——
+   这里就是复用 binding 之前问一句。
+2. **没有记录 ≠ 被删了。** 新会话在首轮写入之前就是"没有记录"，任何"查不到就重建"的逻辑都必须有
+   **年龄闸门**，否则它会把正常的启动窗口当成故障。这条闸门是从实盘的无限循环里换来的。
+3. **fail-safe 的方向要选对**：探针坏了当成"不可用"会换掉一个好好的对话；当成"可用"最坏只是这一条
+   消息仍然沉默。**能丢的是重试机会，不能丢的是用户的消息。**
+4. 又一次印证 §3.6 / §3.7：**一个设计上不报错、不写日志的失败路径，坏了不会有任何声音。**
+   这次的做法可以照抄：**每条"什么都不做就返回"的分支，都要问一句"用户会因此收不到东西吗"**，
+   会的话就必须留下能定位的痕迹（哪个会话、哪个 binding、判定是什么、做了什么）。
+
+> **给内核侧的建议（本仓库不做，转述）**：`prompt` 对**已归档**的会话应当直接**报错**，而不是
+> 接受之后在 `pre-step` 里静默 reject。那样调用方至少能拿到一个可判断的失败，插件也就不需要
+> 自己去读 registry 猜。
+
 ## 5. 认证：OIDC，不要用 token
 
 **工作流里没有任何密钥。** 用 GitHub 签发的 OIDC 身份向 npm 证明"我确实是这个仓库的这条工作流"。
@@ -702,7 +811,7 @@ npm view dsh-wechat-plugin versions --registry=https://registry.npmjs.org
 pnpm build              # 只编译，保留 @dsh-wechat/core 引用（pack 要靠它改写）
 pnpm run dist           # build + 内嵌 core：Git 安装要的可直接加载形态
 pnpm typecheck          # 含 examples/
-pnpm test               # 264 项
+pnpm test               # 278 项
 pnpm run check:install  # 两条安装路径的约束
 pnpm run pack           # 需要先 build，不能先 dist
 pnpm run verify-pack    # 解包、校验清单、按 DSH 的方式挂载一次
@@ -846,6 +955,7 @@ README 中英两版、用户手册、以及 Hub 的提交，都写了这句话�
 | 桌面端崩溃 | `%APPDATA%\@deepseek-ai\dsh-desktop\logs\crash-*-web-boot.log`（**只采集 error 级 console**） |
 | 设置页空白 / 报错 | 那个路由的 HTTP 状态 + `boot.log` |
 | 收不到回复 | `boot.log` 的 `outbound` 行；没有就是流解析问题 |
+| **发消息完全没有回复，而且日志里一行错都没有** | **绑定会话是不是被归档了**（`workspaceRegistry.archivedSessionIds`，持久副本在 `storages/workspace.json`）或磁盘上已经不存在；`boot.log` 里的 `session-state:` 行说的就是这件事（见 §4.14） |
 | 装完不生效 | profile 的 `bundles` 里有没有它；`dsh.profile.bundles` |
 | 用户装到旧版 | profile 里锁的版本；锁文件；pnpm 缓存 |
 
