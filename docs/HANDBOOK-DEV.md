@@ -1176,6 +1176,111 @@ const modelSelectionSchema = z.object({
 
 ---
 
+## 4.19 v0.43.0 发布失败：两条测试挂在 ubuntu 上，而它们跟平台无关
+
+> 这一条记的是**诊断方法**上的坑：CI 红在 ubuntu、绿在 windows，**不等于**平台差异。
+> 两个 ubuntu job 挂的是**两条不同的测试**——这一条事实就足以判定是竞态，而不是"Linux 的
+> errno 和 Windows 不同"。**先看两个 job 挂的是不是同一条，比读任何 errno 都值钱。**
+
+**现象**：`v0.43.0` 打 tag 后 `publish` 的 `pnpm test` 挂了；同一个 commit 的 CI 在
+`ubuntu-latest` 上 Node 22.19 与 24 都失败，`windows-latest` 上两个都通过。
+
+### 先被怀疑的那条是无辜的
+
+`plugin.test.ts` 里「用空目录顶替状态文件」制造保存失败的那条，**自己的注释就写着平台差异**
+（`EPERM` vs `EISDIR`/`ENOTDIR`），所以首先被怀疑。**它不是原因**：它在 Ubuntu 22.04 与
+**Ubuntu 24.04**（chroot，Node 22.19）上各跑多轮全绿。原因是 `rename` 一个文件覆盖一个目录在
+两种平台上虽然 errno 不同，但**路由对任何异常都回 500 并写 `settings: save FAILED`**，
+两种 errno 走的是同一条断言。
+
+**怎么拿到日志**：job 日志接口要认证，但本机 git 凭据管理器里的凭据**就是仓库的**
+（`git credential fill`）——拿它 `GET /actions/jobs/<id>/logs` 就能读自己仓库的日志。
+日志给出两条不同的失败，各自只挂一条、其余全过：
+
+| job | 挂的测试 | 断言 |
+|---|---|---|
+| ubuntu / 22.19 | `the eighth reply asks the user for a new window, once` | `the eighth send carries the ask` → `actual: 0, expected: 1` |
+| ubuntu / 24 | `a switch to something unknown reports failure instead of a phantom move` | `actual: true, expected: false` |
+
+### 两条根因都是"测试在赌"，不是平台
+
+| # | 测试 | 为什么可能在**任何**平台上挂 |
+|---|---|---|
+| 1 | 「第八条回复要带上续期提醒」 | `deliverReply` 发完两帧后**睡固定 80 ms** 再断言提醒已发出。充值与提醒都要落盘，CI runner 上这 80 ms 不够 → 提醒计数 0 |
+| 2 | 「切到不存在的目标要报失败」 | 目标写的是 `99`，而这是**合法的十六进制前缀**：某个会话的短 id 恰好以 `99` 开头时，这次切换**真的成功了**（约 1/256） |
+
+> **`99` 那一条其实已经被修过一次**：§7.3 记着"换成一个含非十六进制字符的目标"，而同文件里
+> **打字**那条路（`/switch zzzzzzz`）改了、**说大白话**那条路（`control(harness,'switch','99')`）
+> 漏了。**同一个行为有两个入口时，修一处不算修完**（与 §4.12 同源）。
+
+### 修法
+
+| 位置 | 做法 |
+|---|---|
+| `deliverReply` | 不再睡时长，改为**等回复自己的记录**——那是发送路径写的**最后**一件东西（先发文本、再充值并在该提醒时发提醒、最后才按服务给的 id 记录消息），等到它等于前面都发生了。慢机器只是多等一会儿；真没发生仍然会红，且报出在等哪条回复 |
+| 配额测试 | 用注入的 `RecordingStore` **报告自己写成功了什么**，而不是去读状态文件 |
+| 「切到不存在的目标」 | 目标改成含非十六进制字符的 `zzzzzzz`：任何 id 都匹配不上，失败路径**每次都走到** |
+| 设置保存那两条 | **注入**一个写入必失败的 store 来钉契约（500 + `settings: save FAILED` + 文件没动）；真实文件系统那条（空目录顶替状态文件）保留，但**只断言"没有被报成成功"**——具体哪个 errno、在哪一步抛出属于操作系统，不属于我们 |
+
+`stateStore` 接缝加在 `apply()` **已有**的 `internals` 参数上（那个参数本来就写着
+"Test seams. The loader never sets this."），生产代码只有一行默认值：
+
+```ts
+this.#store = options.stateStore ?? new StateStore(options.stateFile)
+```
+
+### 自己踩进去的坑（本轮最贵的一条）
+
+第一版的等待是**轮询读 `state.json`**。在 Linux 上没问题，在 Windows 上**把被测的写入搞挂了**：
+`rename` 覆盖一个正被读取的文件会返回 `EPERM`——实测**2000 次里失败 790 次**。于是插件把这次
+发送记成失败、记录永远不落盘、轮询超时：**测试失败在它自己制造的故障上。**
+
+> **教训**：**测试不能扰动被测对象。** 要等一件事做完，就等**代码自己**报出来的完成信号
+> （这里是 store 的 `update()` 返回），不要去戳它正在写的文件。**观察**与**干涉**的区别，
+> 在文件系统这一层就是一次 `open`。
+
+### 验证
+
+**反向验证**（两次，都恢复到全绿）：
+
+1. 人为在发送与充值之间加 250 ms（冒充慢 runner），并把等待换回固定 80 ms →「第八条」立刻报出
+   **与 CI 完全一样的** `the eighth send carries the ask`（`actual: 0, expected: 1`）；
+   **只把等待换回新写法**（延迟保留）→ 相关三条测试全绿，耗时约 570 ms——**说明它在等事，不是睡觉**。
+2. 让 `saveSettings` 把"写入失败"当成成功（去掉 rethrow）→ 两条设置测试同时变红，报的正是
+   `the page is told the save failed` 与 `a save that did not happen must not look saved`。
+
+**目标不可命中的证明**（纯函数，`packages/core/src/router.ts`）：
+
+```
+shortId('session-99ab12cd-…') = '99ab12'
+resolveTarget('99',      …) → { kind: 'found' }   ← 旧目标**可能**命中
+resolveTarget('zzzzzzz', …) → { kind: 'none'  }   ← 新目标**不可能**命中
+```
+
+**平台矩阵**（全套 **316 项**，0 失败）：
+
+| 平台 | 结果 |
+|---|---|
+| Windows（本机） | 全套 exit 0；plugin 文件另跑 4 轮，120/120 |
+| Ubuntu 22.04 / Node 22.19（WSL） | 全套 ×2，exit 0 |
+| **Ubuntu 24.04** / Node 22.19（chroot，= CI 当时的 ubuntu-latest） | 全套 ×2，exit 0；plugin 文件 ×5，120/120 |
+| **Ubuntu 24.04** / Node 24（chroot，= 挂掉的那个矩阵格） | 全套 316 通过 0 失败，exit 0 |
+
+**教训**：
+
+1. **"只在 ubuntu 上挂"是数据，不是结论。** 两个 job 挂的是**不同**的测试 → 竞态；相同 → 才值得
+   去查平台差异。这一条把排查方向整个从 errno 挪开了。
+2. **固定睡眠只在"负向断言"里是安全的。** 断言"某件事**没有**发生"，慢机器只会让它更成立；
+   断言"某件事**发生了**"，睡多久都是赌。§7.5 的纪律要按这个标准逐条过一遍。
+3. **两个入口的行为要一起改**（§4.12 的老账）：概率失败修在打字那条路上，说话那条路留着，
+   于是它以 1/256 的概率挡住一次发布。
+4. **测试替身的失败要"注入"，不要"诱发"。** 让文件系统拒绝写入，等于把操作系统拉进契约；
+   注入一个写入必失败的 store，测的才是我们的代码。
+5. **观察不等于干涉**：轮询读文件会让 Windows 上的 `rename` 失败，而那个 `rename` 正是被测代码
+   的写入。
+
+---
+
 ## 5. 认证：OIDC，不要用 token
 
 **工作流里没有任何密钥。** 用 GitHub 签发的 OIDC 身份向 npm 证明"我确实是这个仓库的这条工作流"。
@@ -1253,7 +1358,7 @@ npm view dsh-wechat-plugin versions --registry=https://registry.npmjs.org
 pnpm build              # 只编译，保留 @dsh-wechat/core 引用（pack 要靠它改写）
 pnpm run dist           # build + 内嵌 core：Git 安装要的可直接加载形态
 pnpm typecheck          # 含 examples/
-pnpm test               # 315 项
+pnpm test               # 316 项
 pnpm run check:install  # 两条安装路径的约束
 pnpm run pack           # 需要先 build，不能先 dist
 pnpm run verify-pack    # 解包、校验清单、按 DSH 的方式挂载一次
@@ -1292,6 +1397,9 @@ pnpm run verify-pack    # 解包、校验清单、按 DSH 的方式挂载一次
 2. **不假设环境。** 干净环境（没装可选依赖、目录不存在、没有历史状态）才是用户的环境。
 3. **不能靠概率通过，也不能靠概率失败。** 一条"失败路径"的测试，它的输入必须**不可能**命中成功路径。`plugin.test.ts` 里那条「切换失败要告诉用户」原本发 `/switch 99`，而 `99` 是**合法十六进制前缀**，短 id 有约 1/256 的概率以它开头——那一跑切换真的成功了，测试红得毫无道理，且没法复现。现在发的是一个含非十六进制字符的目标，不可能匹配任何 id：**同样的断言，从"大多数时候成立"变成"每次成立"**。
 
+   > **这条修了一半，`v0.43.0` 为剩下那一半付了账**：同文件里**说大白话**那条路仍是 `'99'`，
+   > 于是它以 1/256 的概率挡住了发布。**同一个行为有两个入口时，改一处不算改完**（§4.19）。
+
 ### 7.4 干净环境验证（重要）
 
 **本地开发机会掩盖一整类 bug**——目录已存在、编解码器已安装、缓存在、历史状态在。
@@ -1317,6 +1425,10 @@ node -e "import('dsh-wechat-plugin').then(p => console.log(p.name, typeof p.appl
 ### 7.5 永远不要"睡固定时间"
 
 **规则：等一个"迟早会发生"的效果，就用 `waitFor(条件, 说明)` 轮询，不要 `setTimeout` 一个猜出来的时长。**
+
+> **这条规则在 `v0.43.0` 又被违反了一次**（配额测试里的固定 80 ms），而且**第一版修法本身踩了另一个坑**：
+> 轮询去读状态文件，会在 Windows 上把被测的 `rename` 搞挂。**等，要等代码自己报出来的完成信号**——
+> 两次的来龙去脉都在 §4.19。
 
 **这条是被发布事故换来的。** 有两个测试这样写：
 

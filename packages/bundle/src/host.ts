@@ -529,6 +529,15 @@ interface RuntimeOptions {
    * recorder so the whole pipeline can run without touching the network.
    */
   send?: SendFunction
+  /**
+   * State store to use instead of opening {@link RuntimeOptions.stateFile}.
+   *
+   * A test seam, like {@link RuntimeOptions.send}. What it buys is a write failure that is the same
+   * failure on every platform, which is what a test of "a save that cannot be written" needs: the
+   * filesystem's own refusal differs by platform (the errno, where it is raised, and whether the
+   * write is refused at all), and a test built on it ends up asserting the operating system.
+   */
+  stateStore?: StateStore
 }
 
 /** One outbound text delivery. */
@@ -652,7 +661,7 @@ class WechatRuntime {
           text,
           ...(contextToken === undefined ? {} : { contextToken }),
         }))
-    this.#store = new StateStore(options.stateFile)
+    this.#store = options.stateStore ?? new StateStore(options.stateFile)
     this.#stateFilePath = options.stateFile
     /*
      * Built over the store rather than over a local map, so the count is read from the file on every
@@ -4141,7 +4150,7 @@ export interface WechatConfig {
 export function apply(
   ctx: WechatContext,
   config: WechatConfig = {},
-  internals: { send?: SendFunction } = {},
+  internals: { send?: SendFunction; stateStore?: StateStore } = {},
 ): void {
   const home = resolveHome(ctx)
   bootLog(home, 'apply: entered')
@@ -4154,6 +4163,7 @@ export function apply(
       workspace: paths.workspace,
       botAgent: config.botAgent ?? 'dsh-wechat-plugin/0.0.0',
       ...(internals.send === undefined ? {} : { send: internals.send }),
+      ...(internals.stateStore === undefined ? {} : { stateStore: internals.stateStore }),
     })
     // The settings surface reaches the runtime through this service.
     ctx.provide('wechatChannel', runtime)

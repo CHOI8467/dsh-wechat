@@ -22,7 +22,15 @@ import { test } from 'node:test'
 import { apply, recordClientFailure, type SendFunction } from '../src/host.ts'
 import { ROUTE_SETTINGS } from '../src/routes.ts'
 import type { WechatContext } from '../src/services.ts'
-import { DEFAULT_SETTINGS, SendRefusedError, aesKeyToBase64, encodeWorkspaceDir, isSameWorkspace, shortId } from '@dsh-wechat/core'
+import {
+  DEFAULT_SETTINGS,
+  SendRefusedError,
+  StateStore,
+  aesKeyToBase64,
+  encodeWorkspaceDir,
+  isSameWorkspace,
+  shortId,
+} from '@dsh-wechat/core'
 
 /**
  * Note on the core import: `host.ts` imports `@dsh-wechat/core`, which resolves
@@ -233,6 +241,13 @@ async function mountWith(options: {
    * refusal under test would never be reached.
    */
   failModelSelectionFrom?: number
+  /**
+   * State store to mount with, instead of the real one over the mounted home.
+   *
+   * A store whose writes fail is the only platform-independent way to reach the "a save could not be
+   * written" path: making the filesystem refuse instead asserts the operating system's errno.
+   */
+  stateStore?: StateStore
 }): Promise<Harness> {
   const created: Created[] = []
   const prompted: { sessionId: string; mode: 'queue' | 'steer'; text: string }[] = []
@@ -623,7 +638,14 @@ async function mountWith(options: {
     },
   }
 
-  apply(ctx as unknown as WechatContext, { autoStart: false, ...options.config }, { send })
+  apply(
+    ctx as unknown as WechatContext,
+    { autoStart: false, ...options.config },
+    {
+      send,
+      ...(options.stateStore === undefined ? {} : { stateStore: options.stateStore }),
+    },
+  )
   assert.ok(runtime, 'apply() must provide the wechatChannel service')
   return {
     runtime,
@@ -2490,7 +2512,15 @@ test('a switch to something unknown reports failure instead of a phantom move', 
   await withSettings(async (harness) => {
     await harness.runtime.ingest(inbound('第一条'))
 
-    const missed = await control(harness, 'switch', '99')
+    /*
+     * The same target the typed command is checked with, and for the same reason: `99` is a legal hex
+     * prefix, so on a run where a session's id happened to begin with those two digits the switch
+     * *succeeded* and this test failed for a reason that has nothing to do with what it checks —
+     * which is exactly what a CI run reported here (`ok` came back true). A character outside the hex
+     * alphabet cannot match an id at all, so the failure path is reached on every run instead of on
+     * about 255 of every 256.
+     */
+    const missed = await control(harness, 'switch', 'zzzzzzz')
     // The command answers with guidance rather than throwing, so the result has to be read rather
     // than assumed — otherwise the agent tells the user it switched when nothing happened.
     assert.equal(missed.ok, false)
@@ -2969,13 +2999,19 @@ test('the model tool refuses when the caller is not bound to a WeChat conversati
  * asserting the instant `ingest` returns — and polling with a deadline keeps a genuine hang
  * failing fast rather than holding the suite open.
  *
+ * The predicate may be asynchronous, because many of the effects worth waiting for are on disk: a
+ * charge written to the state file, a line appended to the boot log. A fixed sleep long enough for
+ * the author's machine is what a release was blocked by — see {@link deliverReply} — and
+ * waiting for the fact the assertion is about cannot be too short on a slow runner or too long on
+ * a fast one.
+ *
  * @param check - Condition that becomes true.
  * @param what - Description used in the failure message.
  */
-async function waitFor(check: () => boolean, what: string): Promise<void> {
+async function waitFor(check: () => boolean | Promise<boolean>, what: string): Promise<void> {
   const deadline = Date.now() + 3_000
   while (Date.now() < deadline) {
-    if (check()) return
+    if (await check()) return
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
   throw new Error(`timed out waiting for ${what}`)
@@ -3339,9 +3375,12 @@ test('a refused steer falls back to the queue rather than losing the message', a
   await withHarness(
     async (harness) => {
       await harness.runtime.ingest(inbound('改一下方向'))
-      // The submission runs detached from ingest, and the fallback adds a round trip, so the
-      // assertion waits rather than racing it.
-      await new Promise((resolve) => setTimeout(resolve, 60))
+      /*
+       * The submission runs detached from ingest and the fallback adds a round trip, so wait for the
+       * fallback to land instead of guessing how long it takes. A fixed wait here was the same bet
+       * the reply tests lost on a CI runner — see {@link deliverReply}.
+       */
+      await waitFor(() => harness.prompted.length === 1, 'the fallback to reach the queue')
 
       // A refused steer must still be submitted: a lost message cannot be reconstructed, while
       // a delayed one is merely late.
@@ -3363,7 +3402,8 @@ test('a message that cannot be submitted is handed back, not dropped', async () 
   await withHarness(
     async (harness) => {
       await harness.runtime.ingest(inbound('这句话不能丢'))
-      await new Promise((resolve) => setTimeout(resolve, 60))
+      // Handing the words back runs in the same detached task; wait for it to be sent.
+      await waitFor(() => harness.sent.length > 0, 'the message to be handed back')
 
       // Both attempts failed. The user's own text is the only copy that exists, so it is
       // returned rather than replaced by a generic apology.
@@ -3413,6 +3453,7 @@ test('case 1: a permission prompt is answered from WeChat', async () => {
     assert.ok(approval, 'the plugin claims approval requests')
 
     let delegated = false
+    const sentBefore = harness.sent.length
     // The harness hands the answerer a `next()` that another answerer (the desktop pane) owns.
     const outcomePromise = approval(
       {
@@ -3427,7 +3468,7 @@ test('case 1: a permission prompt is answered from WeChat', async () => {
     )
 
     // The prompt reaches the phone without the desktop being involved.
-    await new Promise((resolve) => setTimeout(resolve, 30))
+    await waitFor(() => harness.sent.length > sentBefore, 'the prompt to reach the phone')
     const prompt = harness.sent.at(-1)
     assert.ok(prompt, 'a prompt was sent')
     assert.match(prompt.text, /需要你确认/)
@@ -3452,11 +3493,13 @@ test('case 1: a refusal over WeChat is reported as rejected', async () => {
     const approval = harness.listeners.get('approval/request')
     assert.ok(approval)
 
+    const sentBefore = harness.sent.length
     const outcomePromise = approval(
       { agent: { session: { id: sessionId } }, toolName: 'shell' },
       () => Promise.resolve('delegated' as const),
     )
-    await new Promise((resolve) => setTimeout(resolve, 30))
+    // Answering before the prompt is out would settle nothing, so wait for it.
+    await waitFor(() => harness.sent.length > sentBefore, 'the prompt to reach the phone')
     await harness.runtime.ingest(inbound('拒绝'))
     // A denial must never be read as consent, and "不允许" in particular contains "允许".
     assert.equal(await outcomePromise, 'rejected')
@@ -3485,6 +3528,7 @@ test('case 2: a multiple-choice question is answered from WeChat by number', asy
     assert.ok(questions, 'the plugin claims structured questions')
 
     let delegated = false
+    const sentBefore = harness.sent.length
     const answerPromise = questions(
       {
         agent: { session: { id: sessionId } },
@@ -3506,7 +3550,7 @@ test('case 2: a multiple-choice question is answered from WeChat by number', asy
       },
     )
 
-    await new Promise((resolve) => setTimeout(resolve, 30))
+    await waitFor(() => harness.sent.length > sentBefore, 'the question to reach the phone')
     const prompt = harness.sent.at(-1)
     assert.ok(prompt, 'a prompt was sent')
     assert.match(prompt.text, /用哪个方案？/)
@@ -3530,6 +3574,7 @@ test('case 2: a free-form reply is carried through rather than refused', async (
     const questions = harness.listeners.get('user-questions/request')
     assert.ok(questions)
 
+    const sentBefore = harness.sent.length
     const answerPromise = questions(
       {
         agent: { session: { id: sessionId } },
@@ -3537,7 +3582,7 @@ test('case 2: a free-form reply is carried through rather than refused', async (
       },
       () => Promise.resolve({ answers: [] }),
     )
-    await new Promise((resolve) => setTimeout(resolve, 30))
+    await waitFor(() => harness.sent.length > sentBefore, 'the question to reach the phone')
     // No options were offered, so the reply is the answer. Refusing it would strand the user at
     // a prompt, which is the problem this feature exists to solve.
     await harness.runtime.ingest(inbound('就叫小助'))
@@ -3554,6 +3599,7 @@ test('an unrelated message during a prompt is not swallowed as an answer', async
     assert.ok(approval)
 
     let settled = false
+    const sentBefore = harness.sent.length
     const outcomePromise = approval(
       { agent: { session: { id: sessionId } }, toolName: 'shell' },
       () => Promise.resolve('delegated' as const),
@@ -3561,13 +3607,19 @@ test('an unrelated message during a prompt is not swallowed as an answer', async
       settled = true
       return value
     })
-    await new Promise((resolve) => setTimeout(resolve, 30))
+    await waitFor(() => harness.sent.length > sentBefore, 'the prompt to reach the phone')
 
     // Not a decision. It must route normally — losing a user's message because a prompt happened
     // to be open is worse than an unanswered prompt.
     const promptsBefore = harness.prompted.length
     await harness.runtime.ingest(inbound('顺便帮我查一下天气'))
-    await new Promise((resolve) => setTimeout(resolve, 30))
+    // Both facts the assertions below read: the words reached the agent, and the prompt was repeated.
+    await waitFor(
+      () =>
+        harness.prompted.length === promptsBefore + 1 &&
+        (harness.sent.at(-1)?.text ?? '').includes('请回复上一条提示'),
+      'the message to reach the agent and the prompt to be repeated',
+    )
 
     assert.equal(settled, false, 'the prompt is still open')
     assert.equal(harness.prompted.length, promptsBefore + 1, 'the message reached the agent')
@@ -3795,18 +3847,83 @@ test('a directory saved from the settings page reaches state.json and is used af
   }
 })
 
+/**
+ * A state store whose writes always fail.
+ *
+ * Injected rather than coaxed out of the filesystem, so the failure is byte-for-byte the same on
+ * every platform. Reads are inherited and still work, which is what the settings page does first —
+ * only the write is refused, which is the one thing the test is about.
+ */
+class RefusingStore extends StateStore {
+  /** How many writes were attempted, so the test can show the route really reached the store. */
+  attempts = 0
+
+  override async update(): Promise<void> {
+    this.attempts += 1
+    throw new Error('the state file is not writable (injected failure)')
+  }
+}
+
 test('a settings save that cannot be written is logged and reported as a failure', async () => {
   /*
    * The other half of the same line: a save that fails has to leave a mark, because the page's own
    * error dialog is gone the moment the tab is closed and the state file then looks exactly like a
    * save that was never attempted.
    *
-   * The failure is produced without touching permissions: an empty directory stands where the state
-   * file belongs, so the store's write cannot complete. The reason differs by platform (a rename
-   * over a directory is EPERM on Windows, EISDIR or ENOTDIR elsewhere), which is why only the
-   * marker and the patch are asserted rather than the errno.
+   * The failure is injected through the store, not produced by the filesystem, because the contract
+   * under test is ours: a store that refuses a write must make the route answer 500 and write one
+   * `settings: save FAILED` line naming the field. *How* a filesystem refuses belongs to the
+   * operating system — a rename over a directory is EPERM on Windows and EISDIR on Linux, and a
+   * chmod means nothing to a process running as root — so a test built on it grades the platform
+   * rather than the plugin, and passes or fails for reasons this code cannot control. The same
+   * scenario through a real filesystem is kept below, asserting only that no success is reported.
    */
   const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
+  try {
+    // A real, readable state file, so the page's own load works and only the save is refused.
+    await seedState(home, {})
+    const store = new RefusingStore(join(home, 'wechat', 'state.json'))
+    const harness = await mountWith({ home, seedAccount: false, stateStore: store })
+    try {
+      const chosen = join(home, 'picked-ws')
+      const answer = await callRoute(harness, ROUTE_SETTINGS, {
+        method: 'POST',
+        body: { workspacePath: chosen },
+      })
+      assert.equal(answer.status, 500, 'the page is told the save failed')
+      assert.equal(store.attempts, 1, 'the route reached the store, which is what refused the write')
+
+      const line = (await bootLogLines(harness)).find((entry) => entry.includes('settings: save FAILED'))
+      assert.ok(line, 'the failure reaches the boot log')
+      assert.match(line, /workspacePath/, 'and names the field that could not be stored')
+
+      /*
+       * And the file still says what it said. A route that answered 500 while the value had landed
+       * anyway would be worse than one that lied about the status: the page would report a failure
+       * for a save that took effect, and the user would change it again.
+       */
+      const stored = JSON.parse(await readFile(harness.stateFile, 'utf8')) as {
+        settings?: Record<string, unknown>
+      }
+      assert.notEqual(stored.settings?.workspacePath, chosen, 'nothing was written')
+    } finally {
+      harness.dispose()
+    }
+  } finally {
+    await removeHome(home)
+  }
+})
+
+test('a save the filesystem refuses is never reported as a success', async () => {
+  /*
+   * The same failure reached through a real filesystem, kept because it is the shape a user hits — a
+   * state file that cannot be replaced, here an empty directory standing where the file belongs. The
+   * assertions are deliberately weaker than the test above's: which error comes back and where it is
+   * raised is the operating system's business, so the shared, platform-independent claim is only
+   * that this is not reported to the page as a save that worked. The exact contract is pinned by the
+   * injected failure above, which does not depend on any errno.
+   */
+  const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-refused-'))
   try {
     await mkdir(join(home, 'wechat', 'state.json'), { recursive: true })
     const harness = await mount({ home, seedAccount: false })
@@ -3815,11 +3932,10 @@ test('a settings save that cannot be written is logged and reported as a failure
         method: 'POST',
         body: { workspacePath: join(home, 'picked-ws') },
       })
-      assert.equal(answer.status, 500, 'the page is told the save failed')
-
+      assert.notEqual(answer.status, 200, 'a save that did not happen must not look saved')
+      // Whatever the platform's reason, the refusal has to be findable after the tab is closed.
       const line = (await bootLogLines(harness)).find((entry) => entry.includes('settings: save FAILED'))
       assert.ok(line, 'the failure reaches the boot log')
-      assert.match(line, /workspacePath/, 'and names the field that could not be stored')
     } finally {
       harness.dispose()
     }
@@ -4081,8 +4197,9 @@ test('the merge window follows the setting', async () => {
       const harness = await mount({ home, seedAccount: false })
       try {
         await harness.runtime.ingest(await imageMessage(aesKey, '', reference))
-        await new Promise((resolve) => setTimeout(resolve, 120))
-        assert.equal(harness.prompted.length, 1, 'released without waiting out the default')
+        // A zero window means "answer at once", so wait for the answer rather than for a guess at
+        // how long the release takes.
+        await waitFor(() => harness.prompted.length === 1, 'the attachment to be released')
       } finally {
         harness.dispose()
       }
@@ -4104,6 +4221,8 @@ test('with auto-reply off an attachment waits for a caption instead of being ans
       const harness = await mount({ home, seedAccount: false })
       try {
         await harness.runtime.ingest(await imageMessage(aesKey, '', reference))
+        // This one is a *negative* claim, so the wait only gives the code a chance to be wrong: a
+        // slow machine cannot turn it red, which is why a fixed wait is safe here and not above.
         await new Promise((resolve) => setTimeout(resolve, 150))
         assert.equal(harness.prompted.length, 0, 'the attachment is held, not answered')
 
@@ -4156,7 +4275,18 @@ test('a reply longer than the limit is sent as a file instead of being cut short
         frame: { type: 'chunk', revision: 2, chunk: { type: 'text-delta', index: 0, text: long } },
       })
       listener({ agent: { session: { id: sessionId } }, frame: { type: 'end', revision: 3 } })
-      await new Promise((resolve) => setTimeout(resolve, 400))
+      /*
+       * The file is written, uploaded and then logged, so waiting for its log line is waiting for the
+       * whole path — rather than for a guess at how long an upload takes, which is the kind of bet
+       * that lost the reply tests a release.
+       */
+      await waitFor(
+        async () =>
+          (await readFile(join(home, 'wechat', 'boot.log'), 'utf8').catch(() => '')).includes(
+            'long reply',
+          ),
+        'the long reply to be sent as a file',
+      )
 
       const texts = harness.sent.map((entry) => entry.text)
       assert.ok(
@@ -4366,7 +4496,14 @@ test('every distinct stream chunk kind is written to the log once', async () => 
         frame: { type: 'start', revision: 30 },
       })
     }
-    await new Promise((resolve) => setTimeout(resolve, 50))
+    // Each kind is logged when it is first seen, so wait for the log to hold the last of them.
+    await waitFor(
+      async () =>
+        (await readFile(join(harness.bundleHome, 'wechat', 'boot.log'), 'utf8')).includes(
+          'stream frame shape:',
+        ),
+      'the frame shapes to reach the log',
+    )
 
     const log = await readFile(join(harness.bundleHome, 'wechat', 'boot.log'), 'utf8')
     for (const kind of kinds) {
@@ -4400,6 +4537,60 @@ function warningsSent(harness: Harness): number {
 /** The warning constant, matched by its own text rather than by a copy of it here. */
 const QUOTA_WARNING_PREFIX = '📮 微信这边一个回复窗口最多连发'
 
+/** The form the send path records a message under: whitespace collapsed, head only. */
+function recordedPreview(text: string): string {
+  return text.replace(/\s+/g, ' ').slice(0, 120)
+}
+
+/**
+ * A state store that remembers what it has successfully written.
+ *
+ * The reply-window tests have to know that a send's bookkeeping has reached the file before they
+ * assert on it: the charge that decides whether the ask for a new window is due, and the ask itself,
+ * both happen inside an asynchronous flush.
+ *
+ * Reading the state file in a poll answers that question and *breaks the thing it is watching* — on
+ * Windows a `rename` over a file that is open for reading fails with EPERM, which is not rare: with a
+ * reader polling every millisecond, 790 of 2000 renames failed here. The store then reports the send
+ * as failed, no record is written, and the poll times out — a test failing the code it was watching,
+ * for a reason that exists only because the test was watching. Observing the store's own completion
+ * cannot do that: nothing touches the file, and the write's own success is what is reported.
+ */
+class RecordingStore extends StateStore {
+  /** Every reply record and queued notification this store has written. */
+  readonly written = new Set<string>()
+
+  override async update(mutate: Parameters<StateStore['update']>[0]): Promise<void> {
+    await super.update(mutate)
+    // Read from the store's own cache: watching a write must not open the file it just wrote.
+    const state = await this.read()
+    for (const perConversation of Object.values(state.sentMessages)) {
+      for (const history of Object.values(perConversation)) {
+        for (const entry of history) this.written.add(recordedPreview(entry.preview))
+      }
+    }
+    for (const entry of state.pendingNotifications ?? []) {
+      this.written.add(recordedPreview(entry.text))
+    }
+  }
+}
+
+/**
+ * Mount a harness whose state store reports what it has written.
+ *
+ * @param home - DSH home the plugin resolves paths under.
+ * @param options.send - Sender to use, for a test that makes delivery fail.
+ * @returns The mounted plugin and the store it writes through.
+ */
+async function mountRecording(
+  home: string,
+  options: { send?: SendFunction } = {},
+): Promise<{ harness: Harness; store: RecordingStore }> {
+  const store = new RecordingStore(join(home, 'wechat', 'state.json'))
+  const harness = await mountWith({ home, seedAccount: false, stateStore: store, ...options })
+  return { harness, store }
+}
+
 /**
  * Deliver one complete assistant reply through the stream, the way the host does.
  *
@@ -4408,9 +4599,17 @@ const QUOTA_WARNING_PREFIX = '📮 微信这边一个回复窗口最多连发'
  * reply-window charge that follows it — has to drive that frame too.
  *
  * @param harness - Mounted plugin.
+ * @param store - The harness's store, watched for the reply's record.
  * @param text - The assistant's answer for this turn.
+ * @param until - Terminal condition for a reply that is not recorded as sent, such as one the service
+ *   refused: what to wait for instead of the reply's own record.
  */
-async function deliverReply(harness: Harness, text: string): Promise<void> {
+async function deliverReply(
+  harness: Harness,
+  store: RecordingStore,
+  text: string,
+  until?: () => Promise<boolean>,
+): Promise<void> {
   const sessionId = harness.prompted.at(-1)?.sessionId
   assert.ok(sessionId, 'the message must have reached the agent first')
   const listener = harness.listeners.get('agent/assistant-stream')
@@ -4423,8 +4622,28 @@ async function deliverReply(harness: Harness, text: string): Promise<void> {
     frame: { type: 'chunk', revision: 2, chunk: { type: 'text-delta', index: 0, text } },
   })
   listener({ agent: { session: { id: sessionId } }, frame: { type: 'end', revision: 3 } })
-  // The flush is asynchronous; give it the turns it needs to reach the state file.
-  await new Promise((resolve) => setTimeout(resolve, 80))
+  /*
+   * The flush is asynchronous, so the test waits for its end rather than guessing how long it takes.
+   *
+   * This used to sleep a fixed 80 ms. It passed on the author's machine and lost the race on a CI
+   * runner, where the assertion right after it — the eighth reply must carry the ask for a new
+   * window — reported `expected 1, actual 0` and blocked a release. The wait is for the reply's own
+   * record, which is the *last* thing the send path writes: the text goes out first, then the window
+   * is charged and the ask sent when it is due, and only then is the message recorded under the id
+   * the service assigned. So everything the assertions afterwards care about has already happened,
+   * a slow machine only makes the wait slower, and a flush that never finishes still fails, by name.
+   *
+   * A reply the service refuses is the exception, and the caller says so through `until`: the reply
+   * path records that as an error rather than queueing it, so there is no record to wait for.
+   */
+  if (until === undefined) {
+    await waitFor(
+      () => store.written.has(recordedPreview(text)),
+      `the reply "${text}" to be recorded as sent or queued`,
+    )
+  } else {
+    await waitFor(until, `the reply "${text}" to be accounted for`)
+  }
 }
 
 test('a reply is charged to the reply window, on disk, and the next one continues it', async () => {
@@ -4442,10 +4661,10 @@ test('a reply is charged to the reply window, on disk, and the next one continue
   const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
   try {
     await seedBoundConversation(home)
-    const harness = await mount({ home, seedAccount: false })
+    const { harness, store } = await mountRecording(home)
     try {
       await harness.runtime.ingest(inbound('第一条'))
-      await deliverReply(harness, '好的')
+      await deliverReply(harness, store, '好的')
       assert.deepEqual(
         await quotaOnDisk(harness.stateFile, 'test@im.bot:peer@im.wechat'),
         { token: 'ctx-token-1', used: 1, warned: false },
@@ -4453,7 +4672,7 @@ test('a reply is charged to the reply window, on disk, and the next one continue
       )
 
       await harness.runtime.ingest(inbound('第二条'))
-      await deliverReply(harness, '还是我')
+      await deliverReply(harness, store, '还是我')
       assert.equal(
         (await quotaOnDisk(harness.stateFile, 'test@im.bot:peer@im.wechat'))?.used,
         2,
@@ -4478,10 +4697,10 @@ test('a send already counted on disk is continued rather than replaced', async (
   const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
   try {
     await seedBoundConversation(home, {}, [], 6)
-    const harness = await mount({ home, seedAccount: false })
+    const { harness, store } = await mountRecording(home)
     try {
       await harness.runtime.ingest(inbound('接着发'))
-      await deliverReply(harness, '第七条')
+      await deliverReply(harness, store, '第七条')
 
       assert.equal(
         (await quotaOnDisk(harness.stateFile, 'test@im.bot:peer@im.wechat'))?.used,
@@ -4503,13 +4722,13 @@ test('a message from the user opens a new window and resets the count', async ()
   const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
   try {
     await seedBoundConversation(home)
-    const harness = await mount({ home, seedAccount: false })
+    const { harness, store } = await mountRecording(home)
     try {
       await harness.runtime.ingest(inbound('第一条'))
-      await deliverReply(harness, '好的')
+      await deliverReply(harness, store, '好的')
 
       await harness.runtime.ingest(inbound('第二条', { contextToken: 'ctx-token-2' }))
-      await deliverReply(harness, '又是我')
+      await deliverReply(harness, store, '又是我')
       assert.deepEqual(await quotaOnDisk(harness.stateFile, 'test@im.bot:peer@im.wechat'), {
         token: 'ctx-token-2',
         used: 1,
@@ -4536,12 +4755,12 @@ test('the eighth reply asks the user for a new window, once', async () => {
   const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
   try {
     await seedBoundConversation(home, {}, [], 7)
-    const harness = await mount({ home, seedAccount: false })
+    const { harness, store } = await mountRecording(home)
     try {
       assert.equal(warningsSent(harness), 0, 'nothing to warn about yet')
 
       await harness.runtime.ingest(inbound('第八条'))
-      await deliverReply(harness, '第八次回复')
+      await deliverReply(harness, store, '第八次回复')
       assert.equal(warningsSent(harness), 1, 'the eighth send carries the ask')
       assert.equal(
         harness.sent.at(-1)?.text.startsWith(QUOTA_WARNING_PREFIX),
@@ -4555,7 +4774,7 @@ test('the eighth reply asks the user for a new window, once', async () => {
       })
 
       await harness.runtime.ingest(inbound('第九条'))
-      await deliverReply(harness, '第九次回复')
+      await deliverReply(harness, store, '第九次回复')
       assert.equal(warningsSent(harness), 1, 'the ask is not repeated within the same window')
     } finally {
       harness.dispose()
@@ -4578,10 +4797,18 @@ test('a refused send does not charge the window it could not use', async () => {
     const refuse: SendFunction = async () => {
       throw new SendRefusedError('微信会话已超时（session timeout）。', -14)
     }
-    const harness = await mountWith({ home, seedAccount: false, send: refuse })
+    const { harness, store } = await mountRecording(home, { send: refuse })
     try {
       await harness.runtime.ingest(inbound('这条会被拒'))
-      await deliverReply(harness, '这条回复发不出去')
+      /*
+       * A refused reply is not queued: the reply path catches the refusal and records it, which is
+       * what this waits for. Waiting for the reply's own record — the condition the other tests use —
+       * would fail here, because a reply that was refused never gets one, and "the count did not
+       * move" is meaningless until the attempt has been made and refused.
+       */
+      await deliverReply(harness, store, '这条回复发不出去', async () =>
+        (await harness.runtime.status()).errors.some((entry) => entry.includes('发送失败')),
+      )
 
       assert.equal(
         (await quotaOnDisk(harness.stateFile, 'test@im.bot:peer@im.wechat'))?.used,
