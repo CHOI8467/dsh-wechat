@@ -4031,7 +4031,7 @@ class WechatRuntime {
  * one row that might not adopt.
  */
 async function dropDeadSessions(
-  ctx: Context,
+  ctx: WechatContext,
   home: string,
   sessions: readonly ListedSession[],
 ): Promise<ListedSession[]> {
